@@ -4115,7 +4115,7 @@ name = "texcraft-macos"
 version = "0.1.0"
 dependencies = [
  "block2 0.5.1",
- "objc2 0.5.3",
+ "objc2 0.6.5",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
  "raw-window-handle",
