@@ -1,0 +1,13 @@
+\documentclass{article}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\begin{document}
+\section{Introduction}\label{sec:intro}
+See Section~\ref{sec:missing} and \cite{knuth84} and \cite{nokey}.
+\input{chapters/intro}
+\include{chapter2}
+\input{a-rather-long-file-name-used-to-check-that-wrapped-file-names-in-the-log-are-joined}
+\input{"sub dir/with space"}
+\bibliographystyle{plain}
+\bibliography{refs}
+\end{document}

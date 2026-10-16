@@ -1,0 +1,45 @@
+# Dependency audit with cargo-deny and deny.toml: no crate with a known vulnerability (RustSec
+# advisories), yanked or unmaintained; permissive licences only; crates.io only. Runs on every
+# push and pull request, weekly (new advisories appear without any change here), and before a
+# release (release.yml calls it).
+
+name: Dependency audit
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to audit (default: the triggering one)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install cargo-deny (pinned, checksum checked)
+        env:
+          VERSION: 0.20.2
+          SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          name="cargo-deny-${VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL -o "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${VERSION}/${name}.tar.gz"
+          echo "${SHA256}  $RUNNER_TEMP/cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/cargo-deny.tar.gz" -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/${name}/cargo-deny" "$RUNNER_TEMP/cargo-deny"
+      - name: Check advisories, licences, bans and sources
+        run: |
+          "$RUNNER_TEMP/cargo-deny" --locked check

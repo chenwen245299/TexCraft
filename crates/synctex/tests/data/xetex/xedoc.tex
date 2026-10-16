@@ -1,0 +1,34 @@
+\documentclass[12pt]{article}
+\usepackage{fontspec}
+\usepackage{amsmath}
+
+\begin{document}
+
+\section{Compiled with XeLaTeX}
+This document is typeset by XeTeX through an \texttt{.xdv} file, so
+SyncTeX positions are recorded by a different engine than pdfTeX.
+Unicode text works directly: café, naïve, Straße, Ελληνικά.
+
+A paragraph with inline math $e^{i\pi} + 1 = 0$ and a display:
+\[
+  \lim_{n\to\infty} \left(1 + \frac{1}{n}\right)^n = e.
+\]
+More text after the display, long enough to wrap onto a second line
+of output so that inverse search has something to choose from.
+
+\begin{itemize}
+  \item First item.
+  \item Second item with \emph{emphasis}.
+\end{itemize}
+
+\begin{tabular}{rl}
+  1 & one \\
+  2 & two \\
+\end{tabular}
+
+\newpage
+\section{Second page}
+The second page has a short paragraph of its own, to test that the
+page number is reported correctly by both search directions.
+
+\end{document}

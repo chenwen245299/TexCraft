@@ -1,0 +1,10 @@
+\documentclass{article}
+\begin{document}
+Before the form.
+\setbox0\hbox{Inside the xform box}%
+\immediate\pdfxform0
+\noindent Use: \pdfrefxform\pdflastxform\ and again
+\pdfrefxform\pdflastxform.
+
+After.
+\end{document}

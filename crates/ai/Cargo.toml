@@ -1,0 +1,17 @@
+[package]
+name = "texcraft-ai"
+description = "AI Assistant providers: configuration, streaming chat requests (Anthropic Messages API, OpenAI-compatible chat completions) through the system curl, SSE parsing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+aes-gcm = "0.10"
+getrandom = "0.3"
+
+[lints]
+workspace = true

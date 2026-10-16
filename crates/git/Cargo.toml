@@ -1,0 +1,13 @@
+[package]
+name = "texcraft-git"
+description = "Git for the Source Control sidebar: runs the git command line (status, stage, commit, push, pull, log, diff) off the UI thread and parses its output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

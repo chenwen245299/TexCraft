@@ -1,0 +1,52 @@
+# Leak scanning with gitleaks (https://github.com/gitleaks/gitleaks), used by the pre-commit
+# hook (scripts/hooks/pre-commit, installed by scripts/install-hooks.sh) and by CI
+# (.github/workflows/secrets.yml), both also inside .gz/.zip files. gitleaks' built-in rules (API
+# keys and tokens of the common services, private keys, generic passwords and secrets) plus the
+# rules below: personal paths and private files.
+#
+# A false positive: put `gitleaks:allow` in a comment on that line, or add an allowlist entry
+# here with the reason.
+
+title = "TexCraft"
+
+[extend]
+useDefault = true
+
+# The AI Assistant's key store, if it is ever copied into the repository: the master key and the
+# encrypted keys belong together on one computer only (see crates/ai).
+[[rules]]
+id = "texcraft-ai-key-store"
+description = "TexCraft AI key store (.keymaster or api_keys.json)"
+path = '''(^|/)(\.keymaster|api_keys\.json)$'''
+
+# Environment files with credentials (an `.example` template is fine).
+[[rules]]
+id = "env-file"
+description = "Environment file (.env)"
+path = '''(^|/)\.env(\.[A-Za-z0-9_-]+)?$'''
+[[rules.allowlists]]
+paths = ['''(^|/)\.env\.(example|sample|template)$''']
+
+# Code-signing certificates and provisioning profiles (signing a release would need these).
+[[rules]]
+id = "signing-certificate"
+description = "Certificate or key bundle (.p12, .pfx, .keystore, .mobileprovision)"
+path = '''\.(p12|pfx|keystore|jks|mobileprovision)$'''
+
+# Absolute paths into a home folder name the user (and often a machine or session): test data,
+# logs and SyncTeX files generated locally carry them. Use relative paths or a placeholder.
+[[rules]]
+id = "home-directory-path"
+description = "Absolute path into a home folder (names the user)"
+regex = '''(?i)(?:/Users/|/home/|[a-z]:[\\/]{1,2}Users[\\/]{1,2}|-Users-)([a-z0-9._-]{2,})'''
+secretGroup = 1
+[[rules.allowlists]]
+description = "Placeholders"
+regexes = ['''(?i)^(me|you|user|username|name|runner|shared|someone|alice|bob|example|foo|bar|guest|public|x+)$''']
+
+# Private data that has no place in a source repository.
+[[rules]]
+id = "private-data-file"
+description = "Private data file (database, keychain, password store, SSH key, credentials)"
+path = '''(?i)(\.(sqlite3?|db|kdbx|keychain(-db)?|gpg|pgp)$|(^|/)(id_(rsa|dsa|ecdsa|ed25519)|\.netrc|\.git-credentials|\.npmrc|\.pypirc|credentials\.json|\.htpasswd)$)'''
+

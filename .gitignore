@@ -1,0 +1,32 @@
+/target
+/target-*
+**/.texcraft/
+/corpus-local/out/
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+.DS_Store
+/plan/
+/log/
+/dist/
+# Typeset output beside the example sources
+/examples/**/*.pdf
+# Secrets never belong in the repository (gitleaks also blocks them: .gitleaks.toml)
+.env
+.env.*
+!.env.example
+.keymaster
+api_keys.json
+*.p12
+*.pfx
+*.mobileprovision
+# Personal notes that stay on this machine
+*.local.md
+# Local caches and editor files
+__pycache__/
+*.pyc
+*.swp
+*.orig
+.idea/
+.vscode/

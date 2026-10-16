@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- TexCraft app icon (original artwork, in the flat ink-outline style of the Craft family).
+       Rendered to texcraft-1024.png by scripts/render-icon.sh. -->
+  <defs>
+    <clipPath id="tile"><rect x="100" y="100" width="824" height="824" rx="186"/></clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#D2364E"/>
+  <g clip-path="url(#tile)">
+    <!-- the page, tilted, with a soft shadow -->
+    <g transform="rotate(-6 470 500)">
+      <path d="M250 190 H610 L700 280 V790 H250 Z" transform="translate(16 18)" fill="#000" opacity="0.22"/>
+      <path d="M250 190 H610 L700 280 V790 H250 Z" fill="#F4EFDE" stroke="#151515" stroke-width="18" stroke-linejoin="round"/>
+      <path d="M610 190 V280 H700 Z" fill="#E1D7BB" stroke="#151515" stroke-width="18" stroke-linejoin="round"/>
+      <rect x="300" y="248" width="232" height="32" rx="9" fill="#151515"/>
+      <line x1="300" y1="324" x2="560" y2="324" stroke="#151515" stroke-width="16" stroke-linecap="round"/>
+      <!-- a sum over a fraction -->
+      <path d="M472 398 H326 L408 474 L326 550 H472" fill="none" stroke="#151515" stroke-width="32" stroke-linejoin="round" stroke-linecap="round"/>
+      <line x1="526" y1="436" x2="618" y2="436" stroke="#D2364E" stroke-width="20" stroke-linecap="round"/>
+      <line x1="512" y1="474" x2="634" y2="474" stroke="#151515" stroke-width="12" stroke-linecap="round"/>
+      <line x1="530" y1="512" x2="614" y2="512" stroke="#151515" stroke-width="18" stroke-linecap="round"/>
+      <line x1="300" y1="616" x2="652" y2="616" stroke="#151515" stroke-width="16" stroke-linecap="round"/>
+      <line x1="300" y1="658" x2="610" y2="658" stroke="#151515" stroke-width="16" stroke-linecap="round"/>
+      <line x1="300" y1="700" x2="512" y2="700" stroke="#151515" stroke-width="16" stroke-linecap="round"/>
+    </g>
+    <!-- the backslash key -->
+    <rect x="590" y="604" width="236" height="236" rx="46" transform="translate(12 14)" fill="#000" opacity="0.22"/>
+    <rect x="590" y="604" width="236" height="236" rx="46" fill="#E9A92C" stroke="#151515" stroke-width="18"/>
+    <rect x="612" y="620" width="192" height="180" rx="34" fill="#FFCF5A" stroke="#151515" stroke-width="10"/>
+    <line x1="664" y1="656" x2="752" y2="764" stroke="#151515" stroke-width="30" stroke-linecap="round"/>
+  </g>
+</svg>

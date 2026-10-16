@@ -1,0 +1,167 @@
+# Builds TexCraft for macOS (universal) and Windows (x64) when a version tag is pushed, and
+# publishes a GitHub release with the archives and latest.json (the manifest the app's updater
+# reads from releases/latest/download/latest.json).
+#
+#   git tag -a v0.2.0 -m "What changed (shown in the app's update window)"
+#   git push origin v0.2.0
+#
+# Tags with a suffix (v0.2.0-beta.1) become pre-releases, which the updater does not offer.
+#
+# Hardening: nothing is built before the leak scan and the dependency audit pass; only the
+# publishing job can write to the repository (the build jobs run dependencies' build scripts);
+# actions are pinned to commits (Dependabot proposes updates); no build cache (a poisoned cache
+# could slip into a release); the checkout does not keep the token.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build again, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        env:
+          # Through the environment, never pasted into the script (it may come from the form).
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $TAG is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  secrets:
+    needs: version
+    uses: ./.github/workflows/secrets.yml
+    with:
+      ref: ${{ needs.version.outputs.tag }}
+
+  audit:
+    needs: version
+    uses: ./.github/workflows/audit.yml
+    with:
+      ref: ${{ needs.version.outputs.tag }}
+
+  macos:
+    needs: [version, secrets, audit]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Use the tag's version
+        run: perl -pi -e 's/^version = "[^"]*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+      - name: Build (Apple silicon + Intel)
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$t" -p texcraft -p texcraft-cli
+          done
+          mkdir -p target/release
+          for b in texcraft texcraft-cli; do
+            lipo -create -output "target/release/$b" \
+              "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+          done
+      - name: Bundle, sign (ad hoc) and zip
+        env:
+          TEXCRAFT_SKIP_BUILD: "1"
+        run: |
+          sh scripts/bundle-macos.sh
+          codesign --force --deep --sign - target/macos/TexCraft.app
+          ditto -c -k --keepParent target/macos/TexCraft.app \
+            "TexCraft-${{ needs.version.outputs.version }}-macos.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos
+          path: TexCraft-*-macos.zip
+          if-no-files-found: error
+
+  windows:
+    needs: [version, secrets, audit]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Use the tag's version
+        shell: bash
+        run: perl -pi -e 's/^version = "[^"]*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+      - name: Build
+        run: cargo build --release -p texcraft -p texcraft-cli
+      - name: Zip
+        shell: pwsh
+        run: |
+          $v = "${{ needs.version.outputs.version }}"
+          New-Item -ItemType Directory -Force TexCraft | Out-Null
+          Copy-Item target/release/texcraft.exe, target/release/texcraft-cli.exe, README.md, ATTRIBUTION.md TexCraft
+          Compress-Archive -Path TexCraft -DestinationPath "TexCraft-$v-windows-x64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows
+          path: TexCraft-*-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    needs: [version, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading its files.
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from the tag message
+        shell: bash
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          # An annotated tag's message (a lightweight tag gives the commit message).
+          git tag -l --format='%(contents)' "$TAG" | sed '/-----BEGIN PGP SIGNATURE-----/,$d' > dist/notes.md
+          cat dist/notes.md
+      - name: Write latest.json
+        run: |
+          python3 scripts/ci/latest_json.py "${{ needs.version.outputs.version }}" \
+            "${{ needs.version.outputs.tag }}" "${{ github.repository }}" dist dist/notes.md
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: TexCraft ${{ needs.version.outputs.version }}
+          body_path: dist/notes.md
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          files: |
+            dist/*.zip
+            dist/latest.json

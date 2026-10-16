@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Workspace crates (layer in brackets, see AGENTS.md)
+texcraft-syntax = { path = "crates/syntax" }   # L0
+texcraft-log = { path = "crates/log" }         # L0
+texcraft-synctex = { path = "crates/synctex" } # L0
+texcraft-pdf = { path = "crates/pdf" }         # L1
+texcraft-project = { path = "crates/project" } # L1
+texcraft-typeset = { path = "crates/typeset" } # L2
+texcraft-update = { path = "crates/update" }   # L2 update checks and installs
+texcraft-git = { path = "crates/git" }         # L2 Source Control (git command line)
+texcraft-ai = { path = "crates/ai" }           # L2 AI Assistant providers (curl, SSE)
+texcraft-engine = { path = "crates/engine" }   # L3
+texcraft-ui = { path = "crates/ui" }           # L4
+texcraft-spell = { path = "crates/spell" }     # L1 spell checking
+texcraft-macos = { path = "crates/macos" }     # app helper (macOS chrome, the only unsafe)
+
+# Third-party
+egui = "0.36.2"
+eframe = { version = "0.36.2", features = ["persistence"] }
+egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }
+hayro = "0.8.0"
+flate2 = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rfd = "0.17"
+notify = "8.2"
+muda = "0.21"
+arboard = { version = "3.6", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+egui_extras = { version = "0.36.2", default-features = false, features = ["svg"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+[profile.dev.package."*"]
+opt-level = 2   # hayro and egui are slow unoptimized; keep our own crates fast to rebuild
+
+[profile.release]
+debug = "line-tables-only"

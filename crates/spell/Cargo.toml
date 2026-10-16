@@ -1,0 +1,14 @@
+[package]
+name = "texcraft-spell"
+description = "LaTeX-aware spell checking: prose word extraction and a word-list checker with inflection rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+texcraft-syntax.workspace = true
+
+[lints]
+workspace = true

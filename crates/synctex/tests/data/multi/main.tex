@@ -1,0 +1,20 @@
+\documentclass{article}
+\usepackage{amsmath}
+
+\begin{document}
+
+\section*{Multi-file project}
+The main file contains a short paragraph before including the
+sections that live in a subdirectory.
+
+\input{sections/intro}
+
+Back in the main file between two inputs, with a little more text so
+that this paragraph is longer than a single line.
+
+\input{sections/results}
+
+\section*{Conclusion}
+The main file ends with this conclusion.
+
+\end{document}

@@ -1,0 +1,29 @@
+\documentclass{article}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\ClassWarning{article}{A class warning}
+\newcommand*{\shortarg}[1]{#1}
+\makeatletter
+\@latex@warning{A LaTeX warning\MessageBreak continued on a second line}
+\makeatother
+\begin{document}
+\section{One $x$}\label{sec:one}
+See \ref{sec:one} and \ref{sec:two} and \cite{nobody}.
+And \ref{sec:a-very-long-label-name-that-makes-the-warning-wrap-around}.
+Some text \undefinedcommand\ here.
+Text with x_1 outside math.
+\input{parts/part-one}
+\shortarg{This is never closed (really.
+
+{\fontshape{scit}\selectfont Small caps italic.}
+\noindent\hbox to 1cm{Wide box contents here (unbalanced}
+\vbox to 0pt{\hrule height 50cm}
+Ends with a forced break.\\
+
+\clearpage
+\setcounter{page}{1}
+\flushbottom
+Short page.\pagebreak
+\noindent\rule{1pt}{30cm}
+\clearpage
+\end{document}

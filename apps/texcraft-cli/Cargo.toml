@@ -1,0 +1,24 @@
+[package]
+name = "texcraft-cli"
+description = "Headless TexCraft: typeset, outline, issues, SyncTeX and the command list, for scripts and agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "texcraft-cli"
+path = "src/main.rs"
+
+[dependencies]
+texcraft-engine.workspace = true
+texcraft-syntax.workspace = true
+texcraft-log.workspace = true
+texcraft-synctex.workspace = true
+texcraft-project.workspace = true
+texcraft-typeset.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

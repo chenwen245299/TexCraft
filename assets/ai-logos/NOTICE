@@ -1,0 +1,18 @@
+AI provider and model logos
+
+The SVG files in providers/ and models/ come from LobeHub Icons
+(https://github.com/lobehub/lobe-icons), copied by way of Argus (whose NOTICE
+records the same source), unmodified.
+
+Copyright (c) 2023 LobeHub (https://github.com/lobehub)
+Licensed under the Apache License, Version 2.0 (LICENSE-Apache-2.0.txt in this
+folder; https://www.apache.org/licenses/LICENSE-2.0).
+
+At run time TexCraft recolours the monochrome logos (currentColor -> the text
+colour); the files are not changed.
+
+The logos are trademarks or registered trademarks of their respective owners
+(Anthropic, OpenAI, Google, DeepSeek, OpenRouter, Ollama, Microsoft, ByteDance,
+Alibaba, Tencent, Baidu, xAI, and others). They are used only to identify the
+corresponding AI services and do not imply endorsement by or affiliation with
+those companies.

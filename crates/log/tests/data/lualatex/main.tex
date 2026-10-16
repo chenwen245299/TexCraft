@@ -1,0 +1,8 @@
+\documentclass{article}
+\usepackage{fontspec}
+\begin{document}
+\tracinglostchars=1
+Latin text and a CJK character 中 that the font lacks.
+\undefinedinluatex
+\directlua{error("deliberate lua error")}
+\end{document}

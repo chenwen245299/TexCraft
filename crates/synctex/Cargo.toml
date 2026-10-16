@@ -1,0 +1,15 @@
+[package]
+name = "texcraft-synctex"
+description = "SyncTeX parser: forward (source -> PDF) and inverse (PDF -> source) search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

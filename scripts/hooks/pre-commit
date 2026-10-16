@@ -1,0 +1,57 @@
+#!/bin/sh
+# Checks a commit before it is made, so nothing private reaches the repository:
+#
+#  1. gitleaks (.gitleaks.toml) on the staged version of every added or changed file, inside
+#     .gz/.zip files too: API keys, tokens, private keys, passwords, key stores, private data
+#     files (databases, SSH keys, credentials) and absolute paths into a home folder (they name
+#     the user);
+#  2. no staged file over 5 MB (binaries, data sets, videos and the like belong elsewhere;
+#     TEXCRAFT_MAX_FILE_KB changes the limit).
+#
+# Installed by scripts/install-hooks.sh. Without gitleaks the commit is refused too, so nothing
+# goes in unchecked:  macOS: brew install gitleaks    Windows: winget install Gitleaks.Gitleaks
+# A false positive: `gitleaks:allow` in a comment on that line, or an allowlist entry in
+# .gitleaks.toml. Skipping the checks once (think twice): git commit --no-verify
+set -eu
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed, so this commit could not be checked for leaks." >&2
+  echo "  macOS: brew install gitleaks    Windows: winget install Gitleaks.Gitleaks" >&2
+  exit 1
+fi
+
+root=$(git rev-parse --show-toplevel)
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/texcraft-pre-commit.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# The staged versions of the added, copied, modified and renamed files.
+git diff --cached --name-only -z --diff-filter=ACMR > "$tmp/files"
+[ -s "$tmp/files" ] || exit 0
+mkdir "$tmp/staged"
+git checkout-index -z --stdin --prefix="$tmp/staged/" < "$tmp/files"
+
+failed=0
+
+# 2. Size.
+max_kb=${TEXCRAFT_MAX_FILE_KB:-5120}
+big=$(cd "$tmp/staged" && find . -type f -size +"${max_kb}"k | sed 's|^\./||')
+if [ -n "$big" ]; then
+  echo "pre-commit: these files are over $max_kb KB:" >&2
+  echo "$big" | sed 's/^/  /' >&2
+  failed=1
+fi
+
+# 1. Leaks (paths in the report are relative to the repository).
+if ! (cd "$tmp/staged" && gitleaks dir --redact --verbose --no-banner --max-archive-depth 3 \
+  --config "$root/.gitleaks.toml" .); then
+  echo "" >&2
+  echo "pre-commit: gitleaks found something private in the staged files (above)." >&2
+  echo "  Remove it (git restore --staged <file>, then edit), or mark a false positive with" >&2
+  echo "  a gitleaks:allow comment on that line." >&2
+  failed=1
+fi
+
+if [ "$failed" -ne 0 ]; then
+  echo "pre-commit: the commit was stopped." >&2
+  exit 1
+fi

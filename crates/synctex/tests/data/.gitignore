@@ -1,0 +1,2 @@
+# The workspace .gitignore ignores *.synctex.gz; these are committed fixtures.
+!*.synctex.gz
