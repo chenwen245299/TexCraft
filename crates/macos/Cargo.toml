@@ -14,7 +14,7 @@ raw-window-handle = "0.6"
 block2 = "0.5.1"
 objc2 = "0.5.2"
 objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSWindow", "NSView", "NSVisualEffectView", "NSColor", "NSGraphics", "NSResponder", "NSButton", "NSControl", "NSSpellChecker"] }
-objc2-foundation = { version = "0.2.2", features = ["NSGeometry", "NSThread", "NSString", "NSRange", "NSArray", "NSEnumerator", "NSFileManager", "NSURL", "NSError", "NSNotification", "NSOperation", "block2"] }
+objc2-foundation = { version = "0.3.2", features = ["NSGeometry", "NSThread", "NSString", "NSRange", "NSArray", "NSEnumerator", "NSFileManager", "NSURL", "NSError", "NSNotification", "NSOperation", "block2"] }
 
 # Not `lints.workspace`: this crate needs `unsafe_code = "deny"` (overridable per module) instead
 # of the workspace's `forbid`. Everything else matches the workspace.
