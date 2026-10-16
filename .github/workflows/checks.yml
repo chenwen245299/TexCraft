@@ -1,0 +1,32 @@
+# The repository's checks, one run per event: the leak scan (secrets.yml) and the dependency
+# audit (audit.yml) as two jobs of a single run.
+#
+#   push to main      both
+#   pull request      both (Dependabot's too)
+#   weekly (Monday)   the dependency audit only: new advisories appear without any change here
+#   by hand           both (Actions › Checks › Run workflow)
+#
+# Version tags are not checked here: release.yml runs the same two workflows before it builds.
+
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  leaks:
+    name: Leak scan
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/secrets.yml
+
+  dependencies:
+    name: Dependency audit
+    uses: ./.github/workflows/audit.yml

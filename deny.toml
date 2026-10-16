@@ -1,5 +1,5 @@
 # Dependency checks with cargo-deny (https://github.com/EmbarkStudios/cargo-deny), run by CI
-# (.github/workflows/audit.yml) on every push, pull request and weekly:
+# (.github/workflows/audit.yml, run by checks.yml) on pushes to main, pull requests and weekly:
 #
 #   advisories  no dependency with a known vulnerability (RustSec), or yanked or unmaintained
 #   licenses    permissive licences only (AGENTS.md: open source, clean-room)

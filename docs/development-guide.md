@@ -45,8 +45,9 @@
 
   输出里写明文件、行号和规则（密钥本身打码）。误报就在那一行加注释 `gitleaks:allow`，或者在
   `.gitleaks.toml` 里加 allowlist 并写明原因。没装 gitleaks 时提交也会被拦下。
-  CI 在每次 push 和 PR 时再扫一遍整个历史和当前文件（`secrets.yml`），并用 cargo-deny 检查依赖
-  （`audit.yml`、`deny.toml`：没有已知漏洞、只用宽松许可证、只从 crates.io 来），每周一也会跑一次。
+  CI 在每次 push 到 `main` 和每个 PR 时跑一次 Checks（`checks.yml`）：再扫一遍整个历史和当前文件
+  （`secrets.yml`），并用 cargo-deny 检查依赖（`audit.yml`、`deny.toml`：没有已知漏洞、只用宽松许可证、
+  只从 crates.io 来）；依赖审查每周一也会跑一次。推 tag 不会触发 Checks，Release 自己会先跑这两项。
   **注意**：密钥一旦 push 上去，删提交也不算安全，要去对应服务把它作废、换新的。
 - **macOS**：原生能力（红绿灯位置、毛玻璃、拼写检查）只在 macOS 上生效；其他平台能编译，但未经测试。
 
@@ -416,7 +417,7 @@ git push origin v0.2.0
 - 带后缀的 tag（`v0.3.0-beta.1`）会发成 pre-release，**不会推送给用户**（`releases/latest` 不指向 pre-release）。
 - 在 Actions 页面可以用 `workflow_dispatch` 输入一个已有的 tag 重新构建。
 - 安全措施：泄漏扫描和依赖审查（`secrets.yml`、`audit.yml`）通过之后才开始编译；只有最后发布的那一步
-  有写仓库的权限（编译会跑依赖的 build script）；action 都钉在 commit hash 上（Dependabot 每周提更新）；
+  有写仓库的权限（编译会跑依赖的 build script）；action 都钉在 commit hash 上（Dependabot 每月提更新）；
   发布构建不用缓存（防缓存投毒）；checkout 不保留 token；手动输入的 tag 走环境变量，不直接拼进脚本。
 
 ### 12.2 自动更新

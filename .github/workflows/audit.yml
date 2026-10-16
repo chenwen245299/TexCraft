@@ -1,16 +1,11 @@
 # Dependency audit with cargo-deny and deny.toml: no crate with a known vulnerability (RustSec
-# advisories), yanked or unmaintained; permissive licences only; crates.io only. Runs on every
-# push and pull request, weekly (new advisories appear without any change here), and before a
-# release (release.yml calls it).
+# advisories), yanked or unmaintained; permissive licences only; crates.io only. Never runs on
+# its own: checks.yml calls it on pushes to main, pull requests and weekly (new advisories
+# appear without any change here), release.yml before a release.
 
 name: Dependency audit
 
 on:
-  push:
-  pull_request:
-  schedule:
-    - cron: "17 6 * * 1"
-  workflow_dispatch:
   workflow_call:
     inputs:
       ref:

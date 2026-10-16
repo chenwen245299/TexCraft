@@ -25,9 +25,9 @@ possible; fixes are released as a new version, which the app's updater offers.
 
 - A gitleaks pre-commit hook (`scripts/install-hooks.sh`, `.gitleaks.toml`) refuses secrets,
   private files, absolute home-folder paths and files over 5 MB; CI repeats the scan on every
-  push (`.github/workflows/secrets.yml`).
+  push to `main` and every pull request (`.github/workflows/checks.yml` runs `secrets.yml`).
 - cargo-deny (`deny.toml`, `.github/workflows/audit.yml`) fails on dependencies with known
-  vulnerabilities (RustSec), non-permissive licences or sources other than crates.io, on every
-  push and weekly; Dependabot proposes updates.
+  vulnerabilities (RustSec), non-permissive licences or sources other than crates.io, in the same
+  `checks.yml` runs and weekly; Dependabot proposes updates.
 - Releases are built only after both checks pass, with pinned actions, no build cache and
   write access only for the publishing step (`.github/workflows/release.yml`).

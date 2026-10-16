@@ -380,3 +380,17 @@ From the user's screenshots of the target's Preferences and Typeset Configuratio
 - The overlay scroll bar covered the status letters and the count badge: the list reserves
   14 pt for it while it scrolls (`floating_allocated_width`), full width otherwise.
 
+
+## CI: one run per event (2026-10-16)
+
+- The first push of `main` plus `v0.1.0` showed 11 runs: `secrets.yml` and `audit.yml` ran on
+  every push (tags and Dependabot branches included) and again on pull requests, so a tag gave
+  three runs and each Dependabot PR four. New `checks.yml` ("Checks") runs both as jobs of one
+  run on pushes to `main`, pull requests, Mondays (audit only) and by hand; the two are now
+  `workflow_call` only. Tags run only Release, which already calls both before building.
+- Release runs are named after their tag (`run-name: Release v0.1.0`) and its jobs read Check
+  tag → Leak scan / Dependency audit → Build macOS / Build Windows → Publish release.
+- Now: push to `main` 1 run, PR 1, tag 1, weekly 1, plus Dependabot's own 2 a month. Checked: the
+  YAML parses; not yet run on GitHub (takes effect with the next push).
+- Dependabot version updates (actions, cargo) weekly → monthly: fewer pull requests for a
+  one-person repository. New advisories still fail the Monday Checks run and block releases.

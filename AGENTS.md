@@ -79,7 +79,8 @@ Then add a terse entry to `docs/devlog.md` (what landed, numbers, what is still 
 
 Never commit secrets or personal data. `scripts/install-hooks.sh` installs a gitleaks
 pre-commit hook (`.gitleaks.toml`: keys, private files, home-folder paths, files over 5 MB) and
-CI scans every push and audits dependencies (`deny.toml`). Fake keys in tests must not look
+CI (`.github/workflows/checks.yml`) scans every push to `main` and every pull request and audits
+dependencies (`deny.toml`). Fake keys in tests must not look
 real; generated fixtures must not carry absolute local paths.
 
 ## 5. Parallel agents

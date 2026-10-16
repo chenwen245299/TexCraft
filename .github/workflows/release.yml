@@ -13,6 +13,7 @@
 # could slip into a release); the checkout does not keep the token.
 
 name: Release
+run-name: Release ${{ github.event.inputs.tag || github.ref_name }}
 
 on:
   push:
@@ -31,6 +32,7 @@ env:
 
 jobs:
   version:
+    name: Check tag
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.v.outputs.tag }}
@@ -51,18 +53,21 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   secrets:
+    name: Leak scan
     needs: version
     uses: ./.github/workflows/secrets.yml
     with:
       ref: ${{ needs.version.outputs.tag }}
 
   audit:
+    name: Dependency audit
     needs: version
     uses: ./.github/workflows/audit.yml
     with:
       ref: ${{ needs.version.outputs.tag }}
 
   macos:
+    name: Build macOS
     needs: [version, secrets, audit]
     runs-on: macos-14
     steps:
@@ -101,6 +106,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    name: Build Windows
     needs: [version, secrets, audit]
     runs-on: windows-latest
     steps:
@@ -130,6 +136,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    name: Publish release
     needs: [version, macos, windows]
     runs-on: ubuntu-latest
     permissions:

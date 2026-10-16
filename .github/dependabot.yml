@@ -1,14 +1,14 @@
 # Dependabot keeps the pinned GitHub Actions (commit hashes in .github/workflows) and the Rust
-# dependencies (Cargo.lock) current with weekly pull requests; security fixes come as soon as an
+# dependencies (Cargo.lock) current with monthly pull requests; security fixes come as soon as an
 # advisory is published (turn on "Dependabot security updates" in the repository settings).
-# Every pull request runs the leak scan and the dependency audit.
+# Every pull request gets one Checks run (checks.yml): the leak scan and the dependency audit.
 
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       actions:
         patterns: ["*"]
@@ -16,7 +16,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       # Minor and patch updates in one pull request; major ones each on their own.
