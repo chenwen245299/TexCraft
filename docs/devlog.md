@@ -394,3 +394,20 @@ From the user's screenshots of the target's Preferences and Typeset Configuratio
   YAML parses; not yet run on GitHub (takes effect with the next push).
 - Dependabot version updates (actions, cargo) weekly → monthly: fewer pull requests for a
   one-person repository. New advisories still fail the Monday Checks run and block releases.
+
+## Installers: .dmg and Setup.exe (2026-10-16)
+
+- Releases now carry what people install from, beside the update zips: `TexCraft-<v>-macos.dmg`
+  (`scripts/make-dmg.sh`: the app plus an Applications link, UDZO, verified) and
+  `TexCraft-<v>-windows-x64-setup.exe` (`scripts/windows-installer.iss`, Inno Setup 6, which
+  GitHub's Windows images include). The installer is per user (`%LOCALAPPDATA%\Programs\TexCraft`,
+  no administrator prompt) so the updater can still replace its own files; Start menu entry,
+  optional desktop shortcut, uninstaller; fixed `AppId` for in-place upgrades.
+- The release page shows the tag's notes followed by `scripts/ci/download.md` (which file, how
+  to install, how to get past Gatekeeper/SmartScreen once); `latest.json` and the update window
+  keep the notes alone. `fail_on_unmatched_files` stops a release with a missing file.
+- Checked: a DMG from the local app (13 MB; app and Applications link inside, signature valid);
+  YAML parses. Not checked: the Inno Setup compile and install, which only run on Windows (first
+  run in CI with the next tag). Open: unsigned builds still need one manual approval on first
+  launch (Apple notarisation and Windows code signing need paid certificates); Settings › Apps
+  keeps showing the installed version after a self-update until the next Setup run.

@@ -8,6 +8,11 @@ templates, demo paper) are MIT OR Apache-2.0.
   Copyright (c) 2023 LobeHub, Apache-2.0 (licence text and NOTICE in `assets/ai-logos/`), copied
   unmodified by way of Argus. They are trademarks of their owners, used only to identify the
   services, and imply no endorsement or affiliation.
+- **Windows installer.** `TexCraft-<version>-windows-x64-setup.exe` is built with
+  [Inno Setup](https://jrsoftware.org/isinfo.php) (Copyright (C) 1997-2026 Jordan Russell and
+  Martijn Laan, [licence](https://jrsoftware.org/files/is/license.txt)), whose setup and uninstall
+  programs it contains. Free of charge for any use; the authors ask only commercial users to buy a
+  licence, and TexCraft is not commercial.
 - **No other third-party assets are bundled.** The UI and editor fonts (SF Pro, SF Mono, Hiragino Sans GB,
   Apple Symbols, STIX Two Math on macOS; Segoe UI/Consolas on Windows; DejaVu on Linux) are loaded
   from the operating system at run time when present, with egui's built-in fonts as fallback.

@@ -1,6 +1,8 @@
 # Builds TexCraft for macOS (universal) and Windows (x64) when a version tag is pushed, and
-# publishes a GitHub release with the archives and latest.json (the manifest the app's updater
-# reads from releases/latest/download/latest.json).
+# publishes a GitHub release with what people install from (a .dmg, scripts/make-dmg.sh; a
+# Setup .exe, scripts/windows-installer.iss), the archives the app's updater downloads, and
+# latest.json (the manifest it reads from releases/latest/download/latest.json). The release
+# page shows the tag's notes followed by scripts/ci/download.md.
 #
 #   git tag -a v0.2.0 -m "What changed (shown in the app's update window)"
 #   git push origin v0.2.0
@@ -91,18 +93,23 @@ jobs:
             lipo -create -output "target/release/$b" \
               "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
           done
-      - name: Bundle, sign (ad hoc) and zip
+      - name: Bundle, sign (ad hoc), zip and disk image
         env:
           TEXCRAFT_SKIP_BUILD: "1"
         run: |
           sh scripts/bundle-macos.sh
           codesign --force --deep --sign - target/macos/TexCraft.app
+          # The zip is what the updater downloads, the disk image what people install from.
           ditto -c -k --keepParent target/macos/TexCraft.app \
             "TexCraft-${{ needs.version.outputs.version }}-macos.zip"
+          sh scripts/make-dmg.sh target/macos/TexCraft.app \
+            "TexCraft-${{ needs.version.outputs.version }}-macos.dmg"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos
-          path: TexCraft-*-macos.zip
+          path: |
+            TexCraft-*-macos.zip
+            TexCraft-*-macos.dmg
           if-no-files-found: error
 
   windows:
@@ -129,10 +136,22 @@ jobs:
           New-Item -ItemType Directory -Force TexCraft | Out-Null
           Copy-Item target/release/texcraft.exe, target/release/texcraft-cli.exe, README.md, ATTRIBUTION.md TexCraft
           Compress-Archive -Path TexCraft -DestinationPath "TexCraft-$v-windows-x64.zip"
+      - name: Installer
+        shell: pwsh
+        run: |
+          # The zip is what the updater downloads, the installer what people install from.
+          # Inno Setup comes with GitHub's Windows images.
+          $v = "${{ needs.version.outputs.version }}"
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe" }
+          & $iscc "/DAppVersion=$v" "/DFileVersion=$($v.Split('-')[0])" "/O$PWD" scripts\windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows
-          path: TexCraft-*-windows-x64.zip
+          path: |
+            TexCraft-*-windows-x64.zip
+            TexCraft-*-windows-x64-setup.exe
           if-no-files-found: error
 
   release:
@@ -159,6 +178,9 @@ jobs:
           # An annotated tag's message (a lightweight tag gives the commit message).
           git tag -l --format='%(contents)' "$TAG" | sed '/-----BEGIN PGP SIGNATURE-----/,$d' > dist/notes.md
           cat dist/notes.md
+          # The release page adds which file to download and how to install it; the app's
+          # update window (latest.json) shows the notes alone.
+          { cat dist/notes.md; echo; sed "s/{{VERSION}}/${{ needs.version.outputs.version }}/g" scripts/ci/download.md; } > dist/body.md
       - name: Write latest.json
         run: |
           python3 scripts/ci/latest_json.py "${{ needs.version.outputs.version }}" \
@@ -167,8 +189,11 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: TexCraft ${{ needs.version.outputs.version }}
-          body_path: dist/notes.md
+          body_path: dist/body.md
           prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          fail_on_unmatched_files: true
           files: |
+            dist/*.dmg
+            dist/*-setup.exe
             dist/*.zip
             dist/latest.json
