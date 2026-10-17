@@ -74,9 +74,10 @@ pub fn request(
          get the document around the cursor, marked {CURSOR}, and reply with only the text to \
          insert there: no explanation, no Markdown or code fences, nothing repeated from before \
          or after the cursor. Continue naturally in the document's language and style, with \
-         valid LaTeX (close what you open unless the text after the cursor already does). At \
-         most {lines} line{}; stop at a natural end (a word, sentence, line or environment). \
-         When nothing useful fits, reply with nothing.",
+         valid LaTeX (close what you open unless the text after the cursor already does). \
+         Finish the sentence or line the cursor is in and stop there; begin with a line break \
+         only when the LaTeX calls for new lines (the items of a list, an environment's body), \
+         and then write at most {lines} line{}. When nothing useful fits, reply with nothing.",
         if lines == 1 { "" } else { "s" }
     );
     let user = format!(
@@ -91,8 +92,10 @@ pub fn request(
             role: Role::User,
             text: user,
             blocks: Vec::new(),
+            images: Vec::new(),
         }],
         max_tokens: Some(settings.max_tokens()),
+        no_reasoning: true,
     }
 }
 
@@ -130,8 +133,15 @@ pub fn clean(answer: &str, before: &str, after: &str, max_lines: u32) -> String 
     if line_start.trim().chars().count() >= 3 && text.starts_with(line_start) {
         text = text.get(line_start.len()..).unwrap_or("").to_string();
     }
-    // At most `max_lines` lines.
-    let keep = usize::try_from(max_lines.max(1)).unwrap_or(1);
+    // The rest of the line, like an IDE's completion (no line breaks of its own): several lines
+    // (at most `max_lines`) only when the answer itself starts a new line (the items of a list,
+    // an environment's body).
+    let multi = text.starts_with('\n');
+    let keep = if multi {
+        usize::try_from(max_lines.max(1)).unwrap_or(1)
+    } else {
+        1
+    };
     let mut lines: Vec<&str> = text.split('\n').collect();
     lines.truncate(keep);
     let mut text = lines.join("\n").trim_end().to_string();
@@ -149,6 +159,43 @@ pub fn clean(answer: &str, before: &str, after: &str, max_lines: u32) -> String 
     } else {
         text
     }
+}
+
+/// The first sentence of a suggestion (⌘→ accepts it): up to its end (。！？, or . ! ? before a
+/// space) and the spaces after it, else to the end of the line. A line break it starts with
+/// goes along.
+pub fn first_sentence(suggestion: &str) -> &str {
+    let mut seen = false;
+    let mut chars = suggestion.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\n' {
+            if seen {
+                return suggestion.get(..i).unwrap_or(suggestion);
+            }
+            continue;
+        }
+        if !c.is_whitespace() {
+            seen = true;
+        }
+        let ends = match c {
+            '。' | '！' | '？' => true,
+            '.' | '!' | '?' => chars.peek().is_none_or(|(_, n)| n.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            let mut end = i + c.len_utf8();
+            while let Some((j, n)) = chars.peek().copied() {
+                if n == ' ' || n == '\t' {
+                    end = j + n.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            return suggestion.get(..end).unwrap_or(suggestion);
+        }
+    }
+    suggestion
 }
 
 /// The first word of a suggestion, with the spaces before it (⌘→ accepts it): up to and
@@ -198,7 +245,7 @@ mod tests {
             "} B",
             &s,
         );
-        assert!(r.system.contains("At most 2 lines"));
+        assert!(r.system.contains("at most 2 lines"));
         assert!(r.turns[0].text.contains("A \\textbf{<cursor/>} B"));
         assert_eq!(r.max_tokens, Some(96));
         let (_, _, body) = crate::build(&r);
@@ -223,8 +270,25 @@ mod tests {
         // The closing brace after the caret is not doubled.
         assert_eq!(clean("bold}", "\\textbf{", "}", 3), "bold");
         assert_eq!(clean("}", "\\textbf{x", "}", 3), "");
-        // Line limit, trailing blanks, empty answers.
-        assert_eq!(clean("a\nb\nc\nd", "", "", 2), "a\nb");
+        // One line and one sentence; several lines (up to the limit) only when the answer
+        // starts a new line.
+        assert_eq!(clean("a\nb\nc\nd", "", "", 2), "a");
+        assert_eq!(clean("\na\nb\nc", "\\begin{itemize}", "", 2), "\na");
+        assert_eq!(
+            clean("\n  \\item One\n  \\item Two\n  \\item Three", "", "", 3),
+            "\n  \\item One\n  \\item Two"
+        );
+        // SoCLaaS's qwen3.5:9b after "南京是" (2026-10-17): the line, not a paragraph.
+        assert_eq!(
+            clean(
+                "，中国东部一座历史文化名城。本文介绍了一种方案。\n\n\\noindent 其中",
+                "南京是",
+                "",
+                3
+            ),
+            "，中国东部一座历史文化名城。本文介绍了一种方案。"
+        );
+        // Trailing blanks, empty answers.
         assert_eq!(clean("  \n ", "", "", 3), "");
         assert_eq!(clean("x<cursor/>", "", "", 3), "x");
     }
@@ -241,6 +305,17 @@ mod tests {
         assert_eq!(first_word("hi\nthere"), "hi");
         assert_eq!(first_word("\nthere"), "\n");
         assert_eq!(first_word("end"), "end");
+        // ⌘→: sentence by sentence, then the rest of the line.
+        let s = "，中国东部一座历史文化名城。本文介绍了一种方案。";
+        assert_eq!(first_sentence(s), "，中国东部一座历史文化名城。");
+        assert_eq!(first_sentence("a lovely city. It has"), "a lovely city. ");
+        assert_eq!(
+            first_sentence("width=0.5\\textwidth] text"),
+            "width=0.5\\textwidth] text"
+        );
+        assert_eq!(first_sentence("the end."), "the end.");
+        assert_eq!(first_sentence("one line\nnext."), "one line");
+        assert_eq!(first_sentence("\n  \\item One. Two"), "\n  \\item One. ");
         let mut s = InlineSettings {
             delay_ms: 1,
             max_lines: 99,

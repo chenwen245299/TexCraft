@@ -424,6 +424,7 @@ impl App {
                         "trafficLights": texcraft_macos::traffic_light_frames(frame),
                         "windows": texcraft_macos::windows(),
                         "welcome": { "open": self.bench.welcome.open, "glass": self.bench.welcome.glass() },
+                        "modelPicker": self.bench.prefs.model_picker_info(),
                         "updateWindow": self.bench.update_window,
                         // Why the last frame asked for another one (idle CPU diagnostics).
                         "repaintCauses": ctx.repaint_causes().iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
@@ -484,7 +485,8 @@ impl App {
                 }
                 "ui.prefs" => {
                     // {open?: bool, pane?: "general"|"sidebar"|"editor"|"viewer"|"typesetting",
-                    //  editorTab?: n, sheet?: bool, sheetTab?: n, inline?: bool}
+                    //  editorTab?: n, sheet?: bool, sheetTab?: n, inline?: bool, models?: bool,
+                    //  modelGroup?: "text"|"vision"|"other"|null}
                     let prefs = &mut self.bench.prefs;
                     if let Some(inline) = p.params.get("inline").and_then(Value::as_bool) {
                         prefs.inline = inline;
@@ -506,6 +508,18 @@ impl App {
                     }
                     if let Some(n) = p.params.get("sheetTab").and_then(Value::as_u64) {
                         prefs.sheet_tab = n.min(3) as usize;
+                    }
+                    // models: open (true) or close the model picker for the selected provider.
+                    if let Some(models) = p.params.get("models").and_then(Value::as_bool) {
+                        if models {
+                            prefs.open_model_picker(ctx, &self.session);
+                        } else {
+                            prefs.model_picker().close();
+                        }
+                    }
+                    // modelGroup: the picker's tab ("text", "vision", "other"; anything else: all).
+                    if let Some(g) = p.params.get("modelGroup") {
+                        prefs.model_picker().set_group(g.as_str());
                     }
                     if let Some(sheet) = p.params.get("sheet").and_then(Value::as_bool) {
                         self.bench.dialog = if sheet {
@@ -771,8 +785,36 @@ fn reveal(path: &std::path::Path) {
         .spawn();
 }
 
+/// A clipboard picture as PNG, at most 2048 pixels on its longer side (chat APIs scale larger
+/// ones down anyway, and a Retina screenshot is several megabytes).
+fn png_from_clipboard(img: &arboard::ImageData<'_>) -> Option<Vec<u8>> {
+    const LONGEST: u32 = 2048;
+    let (w, h) = (
+        u32::try_from(img.width).ok()?,
+        u32::try_from(img.height).ok()?,
+    );
+    let mut rgba = image::RgbaImage::from_raw(w, h, img.bytes.to_vec())?;
+    let longest = w.max(h);
+    if longest > LONGEST {
+        let scale = LONGEST as f32 / longest as f32;
+        let size = |n: u32| ((n as f32 * scale).round() as u32).max(1);
+        rgba = image::imageops::resize(
+            &rgba,
+            size(w),
+            size(h),
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .ok()?;
+    Some(out.into_inner())
+}
+
 impl eframe::App for App {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let mut edits = Vec::new();
         for n in std::mem::take(&mut self.native) {
             let key = |key: Key, shift: bool| Event::Key {
                 key,
@@ -786,18 +828,41 @@ impl eframe::App for App {
                 },
             };
             match n {
-                NativeEdit::Undo => raw.events.push(key(Key::Z, false)),
-                NativeEdit::Redo => raw.events.push(key(Key::Z, true)),
-                NativeEdit::SelectAll => raw.events.push(key(Key::A, false)),
-                NativeEdit::Copy => raw.events.push(Event::Copy),
-                NativeEdit::Cut => raw.events.push(Event::Cut),
+                NativeEdit::Undo => edits.push(key(Key::Z, false)),
+                NativeEdit::Redo => edits.push(key(Key::Z, true)),
+                NativeEdit::SelectAll => edits.push(key(Key::A, false)),
+                NativeEdit::Copy => edits.push(Event::Copy),
+                NativeEdit::Cut => edits.push(Event::Cut),
                 NativeEdit::Paste => {
-                    if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                        raw.events.push(Event::Paste(text));
+                    let mut clip = arboard::Clipboard::new().ok();
+                    match clip
+                        .as_mut()
+                        .and_then(|c| c.get_text().ok())
+                        .filter(|t| !t.is_empty())
+                    {
+                        Some(text) => edits.push(Event::Paste(text)),
+                        // A copied picture (a screenshot) goes with the Assistant's question
+                        // when its box has focus.
+                        None if texcraft_ui::ai_panel::composer_focused(ctx) => {
+                            if let Some(png) = clip
+                                .as_mut()
+                                .and_then(|c| c.get_image().ok())
+                                .and_then(|img| png_from_clipboard(&img))
+                            {
+                                self.session.ai.notice = self
+                                    .session
+                                    .ai_attach_image("Pasted Image.png", png)
+                                    .err()
+                                    .map(|e| e.to_string());
+                            }
+                        }
+                        None => {}
                     }
                 }
             }
         }
+        // The focused Settings or welcome window gets its own (its text fields: API keys…).
+        raw.events.extend(self.bench.route_edit_events(ctx, edits));
         if let Some(batch) = self.pending_pointer.pop_front() {
             raw.events.extend(batch);
             if !self.pending_pointer.is_empty() {

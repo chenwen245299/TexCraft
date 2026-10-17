@@ -1140,6 +1140,7 @@ dependencies = [
  "ahash",
  "egui",
  "enum-map",
+ "image",
  "itertools",
  "log",
  "profiling",
@@ -2224,6 +2225,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4101,6 +4104,7 @@ name = "texcraft-ai"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64",
  "getrandom 0.4.3",
  "serde",
  "serde_json",

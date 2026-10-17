@@ -8,6 +8,14 @@ templates, demo paper) are MIT OR Apache-2.0.
   Copyright (c) 2023 LobeHub, Apache-2.0 (licence text and NOTICE in `assets/ai-logos/`), copied
   unmodified by way of Argus. They are trademarks of their owners, used only to identify the
   services, and imply no endorsement or affiliation.
+- **NUS crest** (`assets/nus/nus.png`, the SoCLaaS provider's logo) is the National University of
+  Singapore's favicon, copied by way of Argus. It is NUS's mark and not openly licensed: the one
+  exception to permissive-only assets, included at the maintainer's request only to identify the
+  NUS School of Computing's SoCLaaS service. It implies no endorsement or affiliation.
+- **AI Suggestions icon** (`assets/icons/copilot.svg`): drawn for TexCraft, at the maintainer's
+  request, after the look of GitHub Copilot's mark (a pilot in goggles). GitHub Copilot is
+  GitHub's trademark; the icon only marks the editor's AI suggestions and implies no endorsement
+  or affiliation.
 - **Windows installer.** `TexCraft-<version>-windows-x64-setup.exe` is built with
   [Inno Setup](https://jrsoftware.org/isinfo.php) (Copyright (C) 1997-2026 Jordan Russell and
   Martijn Laan, [licence](https://jrsoftware.org/files/is/license.txt)), whose setup and uninstall

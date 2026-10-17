@@ -262,6 +262,32 @@ pub fn separator(ui: &mut Ui, t: &Tokens) {
 }
 
 /// A small grey heading over a group of items ("Select Page Mode").
+/// A section heading with a logo before it (an [`crate::ai_logos`] key): a provider over its
+/// models.
+pub fn heading_with_logo(ui: &mut Ui, t: &Tokens, text: &str, logo: Option<&str>) {
+    let Some(key) = logo else {
+        heading(ui, t, text);
+        return;
+    };
+    let side = 13.0;
+    let natural = INDENT + side + 6.0 + text_width(ui, text, &semibold(11.0)) + TRAILING;
+    let (r, _) = ui.allocate_exact_size(vec2(row_width(ui, natural), 24.0), Sense::hover());
+    let cy = r.center().y + 1.0;
+    crate::ai_logos::paint(
+        ui,
+        key,
+        Rect::from_min_size(pos2(r.left() + INDENT, cy - side / 2.0), vec2(side, side)),
+        t.text_weak,
+    );
+    ui.painter().text(
+        pos2(r.left() + INDENT + side + 6.0, cy),
+        Align2::LEFT_CENTER,
+        text,
+        semibold(11.0),
+        t.text_weak,
+    );
+}
+
 pub fn heading(ui: &mut Ui, t: &Tokens, text: &str) {
     let natural = INDENT + text_width(ui, text, &semibold(11.0)) + TRAILING;
     let (r, _) = ui.allocate_exact_size(vec2(row_width(ui, natural), 22.0), Sense::hover());

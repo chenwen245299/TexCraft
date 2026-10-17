@@ -5,7 +5,6 @@ use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Align2, Color32, FontId, Id, Key, Rect, Sense, Stroke, Ui, pos2, vec2};
 use texcraft_engine::Session;
 
-use crate::icons;
 use crate::prefs::{Pal, check_control, pal, popup_control};
 use crate::theme::Tokens;
 
@@ -62,42 +61,56 @@ pub fn splice_ghost(job: &mut LayoutJob, at: usize, ghost: &str, font: &FontId, 
     job.sections = out;
 }
 
-/// The suggestion button in the editor header (`r`): sparkles, filled while suggestions are on,
-/// with a dot while one is on its way. Toggles the settings popover.
+/// The suggestion button in the editor header (`r`): the copilot while suggestions are on;
+/// dimmed and struck through while they are off (or no provider is set up), so the state shows
+/// at a glance. While a suggestion is on its way a rainbow runs round the button. Toggles the
+/// settings popover.
 pub fn header_button(ui: &mut Ui, t: &Tokens, session: &Session, open: &mut bool, r: Rect) {
     let on = session.ai.config.inline.enabled;
     let available = session.inline_available();
     let tip = if !available {
         "AI Suggestions: set up a provider in Settings → AI"
     } else if on {
-        "AI Suggestions: on (Tab accepts, Esc dismisses)"
+        "AI Suggestions: on (Tab accepts, ⌘→ next sentence, Esc dismisses)"
     } else {
         "AI Suggestions: off (⌥\\ asks once)"
     };
     let resp = ui
         .interact(r, Id::new("ai-inline-button"), Sense::click())
         .on_hover_text(tip);
-    if *open || resp.hovered() {
+    let lit = *open || resp.hovered();
+    if lit {
         ui.painter().rect_filled(r, 4.0, t.row_hover);
+    }
+    let active = on && available;
+    let busy = session.inline.is_busy();
+    let time = ui.input(|i| i.time) as f32;
+    if busy {
+        rainbow_outline(ui.painter(), r, 4.0, time);
+        ui.ctx().request_repaint();
     }
     let ink = if *open {
         t.accent
-    } else if on && available {
+    } else if active {
         t.pdf_icon
     } else {
-        t.pdf_icon.gamma_multiply(0.55)
+        t.pdf_icon.gamma_multiply(0.5)
     };
-    let icon = Rect::from_center_size(r.center(), vec2(15.0, 15.0));
-    icons::sparkles(ui.painter(), icon, ink, on && available);
-    if session.inline.is_busy() {
-        let phase = (ui.input(|i| i.time) * 4.0).sin() as f32 * 0.5 + 0.5;
-        ui.painter().circle_filled(
-            pos2(r.right() - 5.0, r.top() + 5.0),
-            2.2,
-            t.accent.gamma_multiply(0.45 + 0.55 * phase),
-        );
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(50));
+    let icon = copilot_rect(r.center(), 15.0);
+    crate::ai_logos::paint(ui, COPILOT, icon, ink);
+    if !active {
+        // Struck through: a band of the background cuts the pilot, then the slash.
+        let bg = if lit {
+            over(t.header_bg, t.row_hover)
+        } else {
+            t.header_bg
+        };
+        let ends = [
+            pos2(icon.left() + 1.5, icon.top() - 0.5),
+            pos2(icon.right() - 1.5, icon.bottom() + 0.5),
+        ];
+        ui.painter().line_segment(ends, Stroke::new(4.2, bg));
+        ui.painter().line_segment(ends, Stroke::new(1.6, ink));
     }
     if resp.clicked() {
         *open = !*open;
@@ -105,6 +118,75 @@ pub fn header_button(ui: &mut Ui, t: &Tokens, session: &Session, open: &mut bool
 }
 
 const POP_W: f32 = 320.0;
+
+/// A bright colour of hue `h` (turns, any number).
+fn rainbow(h: f32, saturation: f32, value: f32) -> Color32 {
+    egui::ecolor::Hsva::new(h.rem_euclid(1.0), saturation, value, 1.0).into()
+}
+
+/// A rainbow running round the outline of `r` (corners of `radius`) over a soft glow of itself;
+/// `time` turns it.
+fn rainbow_outline(p: &egui::Painter, r: Rect, radius: f32, time: f32) {
+    const STEPS: usize = 48;
+    let at = |k: usize| outline_point(r, radius, k as f32 / STEPS as f32);
+    for (width, alpha) in [(4.5, 0.16), (1.6, 1.0)] {
+        for k in 0..STEPS {
+            let hue = k as f32 / STEPS as f32 - time * 0.5;
+            let c = rainbow(hue, 0.7, 1.0).gamma_multiply(alpha);
+            p.line_segment([at(k), at(k + 1)], Stroke::new(width, c));
+        }
+    }
+}
+
+/// The point at `f` (turns, clockwise from the left end of the top edge) along the outline of
+/// `r` with corners of `radius`.
+fn outline_point(r: Rect, radius: f32, f: f32) -> egui::Pos2 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let rad = radius.min(r.width() / 2.0).min(r.height() / 2.0).max(0.0);
+    let (w, h) = (r.width() - 2.0 * rad, r.height() - 2.0 * rad);
+    let arc = FRAC_PI_2 * rad;
+    let mut d = f.rem_euclid(1.0) * (2.0 * (w + h) + 4.0 * arc);
+    let corner = |cx: f32, cy: f32, a0: f32, s: f32| {
+        let a = a0 + if arc > 0.0 { s / arc } else { 0.0 } * FRAC_PI_2;
+        pos2(cx + rad * a.cos(), cy + rad * a.sin())
+    };
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    // Edge, corner, edge, corner…: (length, the point `s` along it).
+    let parts: [(f32, &dyn Fn(f32) -> egui::Pos2); 8] = [
+        (w, &|s| pos2(l + rad + s, t)),
+        (arc, &|s| corner(rt - rad, t + rad, -FRAC_PI_2, s)),
+        (h, &|s| pos2(rt, t + rad + s)),
+        (arc, &|s| corner(rt - rad, b - rad, 0.0, s)),
+        (w, &|s| pos2(rt - rad - s, b)),
+        (arc, &|s| corner(l + rad, b - rad, FRAC_PI_2, s)),
+        (h, &|s| pos2(l, b - rad - s)),
+        (arc, &|s| corner(l + rad, t + rad, PI, s)),
+    ];
+    for (len, point) in parts {
+        if d <= len {
+            return point(d);
+        }
+        d -= len;
+    }
+    pos2(l + rad, t)
+}
+
+/// `top` (with its alpha) laid over the opaque `base`.
+fn over(base: Color32, top: Color32) -> Color32 {
+    let a = f32::from(top.a()) / 255.0;
+    let mix = |b: u8, t: u8| (f32::from(b) * (1.0 - a) + f32::from(t) * a).round() as u8;
+    let [tr, tg, tb, _] = top.to_srgba_unmultiplied();
+    Color32::from_rgb(mix(base.r(), tr), mix(base.g(), tg), mix(base.b(), tb))
+}
+
+/// The copilot icon's logo key, and its width over its height.
+const COPILOT: &str = "icons/copilot";
+const COPILOT_ASPECT: f32 = 622.0 / 465.0;
+
+/// Where the copilot icon goes: `height` tall, centred on `center`.
+fn copilot_rect(center: egui::Pos2, height: f32) -> Rect {
+    Rect::from_center_size(center, vec2(height * COPILOT_ASPECT, height))
+}
 
 /// The settings popover under the header button `button`.
 pub fn popover(ui: &mut Ui, t: &Tokens, session: &mut Session, open: &mut bool, button: Rect) {
@@ -161,11 +243,11 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
     let p = ui.painter().clone();
     // Title.
     let (r, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
-    icons::sparkles(
-        &p,
-        Rect::from_min_size(pos2(r.left(), r.center().y - 7.5), vec2(15.0, 15.0)),
+    crate::ai_logos::paint(
+        ui,
+        COPILOT,
+        copilot_rect(pos2(r.left() + 9.0, r.center().y), 14.0),
         t.accent,
-        true,
     );
     p.text(
         pos2(r.left() + 22.0, r.center().y),
@@ -207,16 +289,18 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         "",
     );
     let assistant = session
-        .ai
-        .config
-        .selection()
-        .map(|(_, m)| format!("Same as the Assistant ({m})"))
+        .ai_model()
+        .map(|m| format!("Same as the Assistant ({})", m.label()))
         .unwrap_or_else(|| "Same as the Assistant".into());
     let mut options: Vec<((String, String), String)> =
         vec![((String::new(), String::new()), assistant)];
+    // Chat models only, by their display names.
     for prov in session.ai.config.providers.iter().filter(|p| p.enabled) {
-        for m in &prov.models {
-            options.push(((prov.id.clone(), m.clone()), format!("{} · {m}", prov.name)));
+        for m in prov.models.iter().filter(|m| m.chats()) {
+            options.push((
+                (prov.id.clone(), m.id.clone()),
+                format!("{} · {}", prov.name, m.label()),
+            ));
         }
     }
     let current_known = options.iter().any(|((p, m), _)| {
@@ -352,7 +436,7 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         ui.add_space(4.0);
     }
     ui.label(
-        egui::RichText::new("Tab accepts · ⌘→ next word · Esc dismisses · ⌥\\ suggests now")
+        egui::RichText::new("Tab accepts · ⌘→ next sentence · Esc dismisses · ⌥\\ suggests now")
             .size(11.0)
             .color(pal.note),
     );
@@ -461,6 +545,33 @@ fn slider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rainbow follows the button's rounded outline all the way round.
+    #[test]
+    fn rainbow_runs_round_the_outline() {
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(26.0, 20.0));
+        let start = outline_point(r, 4.0, 0.0);
+        assert!((start.x - 4.0).abs() < 1e-3 && start.y.abs() < 1e-3);
+        // Half way round: opposite the start (the outline is symmetric).
+        let half = outline_point(r, 4.0, 0.5);
+        assert!((half.x - 22.0).abs() < 1e-3 && (half.y - 20.0).abs() < 1e-3);
+        for k in 0..=200 {
+            let p = outline_point(r, 4.0, k as f32 / 200.0);
+            let on_edge = p.x.abs() < 1e-3
+                || (p.x - 26.0).abs() < 1e-3
+                || p.y.abs() < 1e-3
+                || (p.y - 20.0).abs() < 1e-3;
+            let corners = [
+                pos2(4.0, 4.0),
+                pos2(22.0, 4.0),
+                pos2(22.0, 16.0),
+                pos2(4.0, 16.0),
+            ];
+            let on_corner = corners.iter().any(|c| (p.distance(*c) - 4.0).abs() < 1e-3);
+            assert!(on_edge || on_corner, "{p:?} at {k}");
+        }
+        assert_eq!(outline_point(r, 4.0, 1.0), start);
+    }
 
     fn job(text: &str, cuts: &[usize]) -> LayoutJob {
         let mut j = LayoutJob {

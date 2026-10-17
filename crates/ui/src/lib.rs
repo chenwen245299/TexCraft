@@ -20,6 +20,7 @@ pub mod editor;
 pub mod git_panel;
 pub mod icons;
 pub mod menu;
+pub mod model_picker;
 pub mod pdf_view;
 pub mod prefs;
 pub mod sidebar;
@@ -55,6 +56,9 @@ pub enum Request {
     /// Quit.
     Quit,
 }
+
+/// How long the sidebar takes to slide open or shut.
+const SIDEBAR_SLIDE_SECONDS: f32 = 0.22;
 
 /// The window's UI state.
 pub struct Workbench {
@@ -113,11 +117,47 @@ impl Workbench {
         }
     }
 
+    /// Hands edit events from the native Edit menu to the window with keyboard focus. The menu
+    /// bar takes ⌘V and co. before any window sees the keys, and the app's input hook reaches only
+    /// the main window, so the Settings and welcome windows get theirs here, on their next frame.
+    /// Returns the events for the main window: all of them when neither has focus.
+    pub fn route_edit_events(
+        &mut self,
+        ctx: &Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Event> {
+        if events.is_empty() {
+            return events;
+        }
+        let focused =
+            |id: egui::ViewportId| ctx.input_for(id, |i| i.viewport().focused == Some(true));
+        if !self.prefs.inline
+            && self.prefs.model_picker().is_open()
+            && focused(model_picker::picker_viewport())
+        {
+            self.prefs.model_picker().edit_events.extend(events);
+            Vec::new()
+        } else if self.prefs.open && !self.prefs.inline && focused(prefs::settings_viewport()) {
+            self.prefs.edit_events.extend(events);
+            Vec::new()
+        } else if self.welcome.open && !self.welcome.inline && focused(welcome::welcome_viewport())
+        {
+            self.welcome.edit_events.extend(events);
+            Vec::new()
+        } else {
+            events
+        }
+    }
+
     /// Closes the Settings or PDF window if it has keyboard focus (⌘W from the menu bar).
     /// Returns whether one was closed.
     pub fn close_focused_window(&mut self, ctx: &Context) -> bool {
         let focused =
             |id: egui::ViewportId| ctx.input_for(id, |i| i.viewport().focused == Some(true));
+        if self.prefs.model_picker().is_open() && focused(model_picker::picker_viewport()) {
+            self.prefs.model_picker().close();
+            return true;
+        }
         if self.prefs.open && focused(prefs::settings_viewport()) {
             self.prefs.open = false;
             return true;
@@ -326,22 +366,28 @@ impl Workbench {
                     toolbar::tabs(ui, &t, session, rect);
                 });
         }
-        // Sidebar.
-        if session.view.sidebar {
-            egui::Panel::left("sidebar")
-                .resizable(true)
-                .default_size(SIDEBAR_WIDTH)
-                .size_range(170.0..=380.0)
-                .frame(egui::Frame::NONE.fill(t.sidebar_bg))
-                .show_separator_line(true)
-                .show(root, |ui| {
-                    let rect = ui.max_rect();
-                    // egui keeps the width the contents occupy: claim all of it, or the panel
-                    // falls back to its minimum and every drag of the divider is undone.
-                    ui.expand_to_include_rect(rect);
-                    sidebar::show(ui, &t, session, &mut self.sidebar, rect);
-                });
-        }
+        // Sidebar: slides open and shut, the editor following (egui's collapsible panel, at
+        // a pace the eye can follow rather than its quick default). Dragging the divider past
+        // the narrowest width closes it, as in Finder.
+        let mut open = session.view.sidebar;
+        let quick = ctx.global_style().animation_time;
+        ctx.global_style_mut(|s| s.animation_time = SIDEBAR_SLIDE_SECONDS);
+        egui::Panel::left("sidebar")
+            .resizable(true)
+            .default_size(SIDEBAR_WIDTH)
+            .size_range(170.0..=380.0)
+            .frame(egui::Frame::NONE.fill(t.sidebar_bg))
+            .show_separator_line(true)
+            .drag_to_open(false)
+            .show_collapsible(root, &mut open, |ui| {
+                let rect = ui.max_rect();
+                // egui keeps the width the contents occupy: claim all of it, or the panel
+                // falls back to its minimum and every drag of the divider is undone.
+                ui.expand_to_include_rect(rect);
+                sidebar::show(ui, &t, session, &mut self.sidebar, rect);
+            });
+        ctx.global_style_mut(|s| s.animation_time = quick);
+        session.view.sidebar = open;
         // The PDF in its own window (e.g. on an external display): the main window shows only
         // the editor meanwhile.
         if self.pdf.window {
@@ -519,5 +565,52 @@ pub fn key_matches(name: &str, key: egui::Key) -> bool {
         "Escape" => key == K::Escape,
         "Backspace" => key == K::Backspace,
         other => K::from_name(other).is_some_and(|k| k == key),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn focus(ctx: &Context, id: egui::ViewportId) {
+        ctx.input_mut_for(id, |i| {
+            i.raw.viewport_id = id;
+            i.raw.viewports.insert(
+                id,
+                egui::ViewportInfo {
+                    focused: Some(true),
+                    ..Default::default()
+                },
+            );
+        });
+    }
+
+    /// Edit events from the menu bar go to the focused Settings or welcome window, else to the
+    /// main window.
+    #[test]
+    fn menu_edit_events_go_to_the_focused_window() {
+        let ctx = Context::default();
+        let mut bench = Workbench::new(&ctx);
+        let paste = || vec![egui::Event::Paste("text".into())];
+        // Nothing else open: the main window.
+        assert_eq!(bench.route_edit_events(&ctx, paste()).len(), 1);
+        // Settings open but not focused: still the main window.
+        bench.prefs.open = true;
+        assert_eq!(bench.route_edit_events(&ctx, paste()).len(), 1);
+        assert!(bench.prefs.edit_events.is_empty());
+        // Settings focused: its own.
+        focus(&ctx, prefs::settings_viewport());
+        assert!(bench.route_edit_events(&ctx, paste()).is_empty());
+        assert_eq!(bench.prefs.edit_events.len(), 1);
+        // Drawn inside the main window (control channel): the main window.
+        bench.prefs.edit_events.clear();
+        bench.prefs.inline = true;
+        assert_eq!(bench.route_edit_events(&ctx, paste()).len(), 1);
+        // The welcome window's filter field.
+        bench.prefs.open = false;
+        bench.welcome.open = true;
+        focus(&ctx, welcome::welcome_viewport());
+        assert!(bench.route_edit_events(&ctx, paste()).is_empty());
+        assert_eq!(bench.welcome.edit_events.len(), 1);
     }
 }

@@ -41,6 +41,10 @@ pub struct Tokens {
     pub filter_bg: Color32,
     /// Sidebar filter field border.
     pub filter_border: Color32,
+    /// The Assistant's question box: a shade lighter than the sidebar it sits in.
+    pub composer_bg: Color32,
+    /// Its hairline border.
+    pub composer_border: Color32,
     /// Count badge outline.
     pub badge_border: Color32,
     /// Separators inside the toolbar capsule.
@@ -216,6 +220,8 @@ impl Tokens {
             sidebar_icon: hex(0x7D7D7D),
             filter_bg: hex(0xCBCBCB),
             filter_border: hex(0xB4B4B4),
+            composer_bg: hex(0xEFEFEF),
+            composer_border: hex(0xCDCDCD),
             badge_border: hex(0xB7B7B7),
             toolbar_separator: hex(0x8C8C8C),
             badge_fill: Color32::from_black_alpha(8),
@@ -303,6 +309,8 @@ impl Tokens {
             sidebar_icon: hex(0xA0A0A2),
             filter_bg: hex(0x3A3A3C),
             filter_border: hex(0x505052),
+            composer_bg: hex(0x313133),
+            composer_border: hex(0x444446),
             badge_border: hex(0x5A5A5C),
             toolbar_separator: hex(0x6A6A6E),
             badge_fill: Color32::from_white_alpha(10),

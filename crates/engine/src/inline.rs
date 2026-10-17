@@ -32,8 +32,21 @@ struct Pending {
     before: String,
     after: String,
     answer: String,
+    /// The model reasoned (sent thinking) on the way.
+    thought: bool,
     started: Instant,
     job: texcraft_ai::Job,
+}
+
+/// How much of a suggestion to accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accept {
+    /// All of it (Tab).
+    All,
+    /// Its next sentence (⌘→).
+    Sentence,
+    /// Its next word.
+    Word,
 }
 
 /// Inline suggestion state of a session.
@@ -42,7 +55,7 @@ pub struct InlineState {
     suggestion: Option<Suggestion>,
     pending: Option<Pending>,
     /// When to ask (a pause in typing ends then).
-    due: Option<Instant>,
+    pub(crate) due: Option<Instant>,
     /// What went wrong with the last request (shown in the settings popover).
     pub last_error: Option<String>,
     /// How long the last answer took.
@@ -136,15 +149,15 @@ impl Session {
         self.inline.due = None;
     }
 
-    /// Inserts the suggestion (Tab), or its next word (⌘→, `word`).
-    pub fn inline_accept(&mut self, word: bool) -> Result<(), CommandError> {
+    /// Inserts the suggestion (Tab), its next sentence (⌘→) or its next word.
+    pub fn inline_accept(&mut self, part: Accept) -> Result<(), CommandError> {
         let Some(s) = self.inline_suggestion().cloned() else {
             return Err(CommandError::Failed("no suggestion to accept".into()));
         };
-        let take = if word {
-            ai_inline::first_word(&s.text).to_string()
-        } else {
-            s.text.clone()
+        let take = match part {
+            Accept::All => s.text.clone(),
+            Accept::Sentence => ai_inline::first_sentence(&s.text).to_string(),
+            Accept::Word => ai_inline::first_word(&s.text).to_string(),
         };
         let rest = s.text.get(take.len()..).unwrap_or("").to_string();
         self.run("edit.insertText", &serde_json::json!({ "text": take }))?;
@@ -154,13 +167,26 @@ impl Session {
             .map_or((0, 0), |d| (d.revision, d.selection.cursor));
         self.cancel_inline_request();
         self.inline.due = None;
-        self.inline.suggestion = (!rest.is_empty()).then_some(Suggestion {
+        let done = rest.is_empty();
+        self.inline.suggestion = (!done).then_some(Suggestion {
             doc: s.doc,
             revision,
             at,
             text: rest,
         });
+        // All of it taken: ask for what comes next straight away, so Tab, Tab, … keeps writing.
+        if done && self.ai.config.inline.enabled && self.inline_available() {
+            self.inline.due = Some(Instant::now());
+        }
         Ok(())
+    }
+
+    /// The caret moved without an edit (a click, the arrow keys): suggestions follow typing only,
+    /// so the suggestion goes and nothing is asked for until the next pause in typing.
+    pub fn inline_after_caret_move(&mut self) {
+        self.cancel_inline_request();
+        self.inline.suggestion = None;
+        self.inline.due = None;
     }
 
     fn cancel_inline_request(&mut self) {
@@ -224,6 +250,7 @@ impl Session {
             before,
             after,
             answer: String::new(),
+            thought: false,
             started: Instant::now(),
             job: texcraft_ai::start(&req, Arc::clone(&self.waker)),
         });
@@ -255,11 +282,15 @@ impl Session {
             };
             match e {
                 Event::Text(t) => p.answer.push_str(&t),
-                Event::Thinking | Event::Fallback(_) => {}
+                Event::Thinking => p.thought = true,
+                Event::Fallback(_) => {}
                 Event::Done { .. } => {
                     if let Some(p) = self.inline.pending.take() {
                         self.inline.last_latency = Some(p.started.elapsed());
-                        self.inline.last_error = None;
+                        // A reasoning model can spend the whole small budget thinking: say so
+                        // rather than show nothing.
+                        self.inline.last_error = (p.thought && p.answer.trim().is_empty())
+                            .then(|| only_thought(&self.ai.config));
                         let text = ai_inline::clean(
                             &p.answer,
                             &p.before,
@@ -315,4 +346,15 @@ impl Session {
             "lastLatencyMs": self.inline.last_latency.map(|d| d.as_millis() as u64),
         })
     }
+}
+
+/// Why a suggestion did not come: the model reasoned and wrote nothing.
+fn only_thought(config: &texcraft_ai::Config) -> String {
+    let model = config
+        .inline_selection()
+        .map_or_else(|| "The model".to_string(), |(_, m)| m.to_string());
+    format!(
+        "{model} spent the suggestion on reasoning and wrote nothing. Pick a model that \
+         answers without reasoning for suggestions."
+    )
 }

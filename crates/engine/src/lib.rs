@@ -584,7 +584,6 @@ pub struct Session {
     /// Moves files to the Trash (the macOS app installs AppKit's; tests install a fake).
     pub trash: files::TrashFn,
     waker: Arc<dyn Fn() + Send + Sync>,
-    untitled_counter: u32,
 }
 
 /// Errors from commands.
@@ -635,7 +634,6 @@ impl Session {
             index_built: None,
             trash: files::system_trash,
             waker,
-            untitled_counter: 0,
         };
         s.new_untitled(texcraft_project::templates::TEMPLATES[1].source.to_string());
         s
@@ -693,13 +691,12 @@ impl Session {
 
     /// Adds a new untitled document with `text` and makes it active.
     pub fn new_untitled(&mut self, text: String) -> usize {
-        self.untitled_counter += 1;
+        // Numbered across the process, not the session: sessions side by side (tests) must not
+        // typeset into one folder.
+        static UNTITLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = UNTITLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let scratch = std::env::temp_dir()
-            .join(format!(
-                "texcraft-{}-untitled-{}",
-                std::process::id(),
-                self.untitled_counter
-            ))
+            .join(format!("texcraft-{}-untitled-{n}", std::process::id()))
             .join("Untitled.tex");
         self.docs.push(Document::untitled(text, scratch));
         self.active = self.docs.len() - 1;
@@ -1589,9 +1586,14 @@ impl Session {
                 "includeDocument": self.ai.config.include_document,
                 "inline": self.inline_inspect(),
                 "busy": self.ai.is_busy(),
+                "readsImages": self.ai_reads_images(),
+                "draftImages": self.ai.draft_images.iter().map(|i| serde_json::json!({
+                    "name": i.name, "type": i.media_type, "bytes": i.data.len(),
+                })).collect::<Vec<_>>(),
                 "messages": self.ai.messages.iter().map(|m| serde_json::json!({
                     "role": if m.role == texcraft_ai::Role::User { "user" } else { "assistant" },
                     "text": m.text, "error": m.error, "pending": m.pending, "model": m.model,
+                    "images": m.images.len(),
                 })).collect::<Vec<_>>(),
             },
             "git": {

@@ -113,8 +113,29 @@ fn view_commands_toggle_state() {
     s.pdf_fit_scale = Some(1.3);
     s.run("pdf.zoomIn", &Value::Null).unwrap();
     assert_eq!(s.view.zoom, Zoom::Fixed(1.5));
-    s.run("typeset.engine.xelatex", &Value::Null).unwrap();
+}
+
+#[test]
+fn auto_sense_locks_the_engine_choice() {
+    let mut s = session();
+    let text = "\\documentclass{article}\n\\begin{document}\n这是一个测试\n\\end{document}\n";
+    s.run("edit.setText", &json!({ "text": text })).unwrap();
+    // Auto-Sense on: the engine commands are off and tick the engine in use.
+    assert!(s.settings.auto_sense);
+    assert!(!s.is_enabled("typeset.engine.pdflatex"));
+    assert!(matches!(
+        s.run("typeset.engine.pdflatex", &Value::Null),
+        Err(CommandError::Disabled(_))
+    ));
+    assert_eq!(s.settings.engine, Engine::PdfLatex);
     assert!(s.is_checked("typeset.engine.xelatex"));
+    assert!(!s.is_checked("typeset.engine.pdflatex"));
+    // Auto-Sense off: the engine is chosen by hand.
+    s.settings.auto_sense = false;
+    assert!(s.is_checked("typeset.engine.pdflatex"));
+    s.run("typeset.engine.lualatex", &Value::Null).unwrap();
+    assert!(s.is_checked("typeset.engine.lualatex"));
+    assert_eq!(s.effective_engine(), Engine::LuaLatex);
 }
 
 #[test]
@@ -145,6 +166,16 @@ fn opens_a_project_folder_and_finds_the_root() {
     s.run("nav.back", &Value::Null).unwrap();
     assert_eq!(s.doc().unwrap().display_name(), "thesis.tex");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Sessions side by side (parallel tests) never typeset untitled documents into one folder: a
+/// per-session count gave both `texcraft-<pid>-untitled-1`, and their runs clashed.
+#[test]
+fn untitled_documents_of_two_sessions_have_their_own_folders() {
+    let a = session();
+    let b = session();
+    let dir = |s: &Session| s.doc().and_then(|d| d.scratch.clone()).unwrap();
+    assert_ne!(dir(&a), dir(&b));
 }
 
 #[test]
@@ -850,6 +881,11 @@ fn source_control_stages_commits_and_discards() {
 /// A local OpenAI-compatible server that answers one request with `answer` (streamed) and
 /// returns the request it saw.
 fn fake_ai_server(answer: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+    fake_ai_stream(serde_json::json!({ "content": answer }))
+}
+
+/// [`fake_ai_server`] streaming one chunk whose `delta` is `delta`.
+fn fake_ai_stream(delta: Value) -> (u16, std::thread::JoinHandle<String>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -879,7 +915,7 @@ fn fake_ai_server(answer: &'static str) -> (u16, std::thread::JoinHandle<String>
                 break;
             }
         }
-        let chunk = serde_json::json!({"choices": [{"delta": {"content": answer}}]});
+        let chunk = serde_json::json!({"choices": [{"delta": delta}]});
         let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
         let _ = write!(
             s,
@@ -889,6 +925,115 @@ fn fake_ai_server(answer: &'static str) -> (u16, std::thread::JoinHandle<String>
         String::from_utf8_lossy(&req).to_string()
     });
     (port, handle)
+}
+
+/// A 1×1 PNG.
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0,
+    0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99, 0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// Images go with questions to models with Vision, in the request, and stay in the conversation;
+/// a model without Vision is refused them, with the reason.
+#[test]
+fn images_attach_to_vision_models_and_go_with_the_question() {
+    let mut s = session();
+    let (port, server) = fake_ai_server("A red dot.");
+    let ollama = texcraft_ai::PRESETS
+        .iter()
+        .find(|p| p.id == "ollama")
+        .unwrap();
+    let i = s.ai.config.add(ollama);
+    s.ai.config.providers[i].base_url = format!("http://127.0.0.1:{port}/v1");
+    s.ai.config.providers[i].models = vec![
+        "plain-text".into(),
+        texcraft_ai::Model {
+            id: "eyes".into(),
+            name: "Eyes 1".into(),
+            capabilities: vec![texcraft_ai::Capability::Vision],
+            ..Default::default()
+        },
+    ];
+    s.ai.config.normalize();
+    let pid = s.ai.config.providers[i].id.clone();
+    // Without Vision: refused, and why.
+    s.run(
+        "ai.selectModel",
+        &json!({"provider": pid, "model": "plain-text"}),
+    )
+    .unwrap();
+    assert!(!s.ai_reads_images());
+    let e = s
+        .ai_attach_image("dot.png", PNG.to_vec())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("plain-text") && e.contains("Vision"), "{e}");
+    // With Vision: PNG yes, anything else no; ten at most.
+    s.run("ai.selectModel", &json!({"provider": pid, "model": "eyes"}))
+        .unwrap();
+    assert_eq!(s.ai_model().map(texcraft_ai::Model::label), Some("Eyes 1"));
+    assert!(s.ai_attach_image("notes.txt", b"hello".to_vec()).is_err());
+    s.ai_attach_image("dot.png", PNG.to_vec()).unwrap();
+    for _ in 1..crate::ai::MAX_IMAGES {
+        s.ai_attach_image("dot.png", PNG.to_vec()).unwrap();
+    }
+    assert!(s.ai_attach_image("dot.png", PNG.to_vec()).is_err());
+    s.ai.draft_images.truncate(1);
+    // Switching to a model without Vision keeps them but will not send them.
+    s.run(
+        "ai.selectModel",
+        &json!({"provider": pid, "model": "plain-text"}),
+    )
+    .unwrap();
+    assert!(s.run("ai.send", &json!({"text": "What is it?"})).is_err());
+    assert_eq!(s.ai.draft_images.len(), 1);
+    s.run("ai.selectModel", &json!({"provider": pid, "model": "eyes"}))
+        .unwrap();
+    s.run("ai.send", &json!({"text": "What is it?"})).unwrap();
+    assert!(s.ai.draft_images.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while s.ai.is_busy() && Instant::now() < deadline {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let seen = server.join().unwrap();
+    assert!(seen.contains("\"image_url\""), "{seen}");
+    assert!(seen.contains("data:image/png;base64,iVBORw0KGgo"), "{seen}");
+    assert_eq!(s.ai.messages[0].images.len(), 1);
+    assert_eq!(s.inspect()["ai"]["messages"][0]["images"], 1);
+}
+
+/// A reasoning model that spends the whole budget thinking: no suggestion, and the popover says
+/// why instead of nothing happening.
+#[test]
+fn a_suggestion_lost_to_reasoning_is_explained() {
+    let mut s = session();
+    let (port, server) = fake_ai_stream(json!({ "reasoning_content": "Let me think about..." }));
+    let ollama = texcraft_ai::PRESETS
+        .iter()
+        .find(|p| p.id == "ollama")
+        .unwrap();
+    let i = s.ai.config.add(ollama);
+    s.ai.config.providers[i].base_url = format!("http://127.0.0.1:{port}/v1");
+    s.ai.config.providers[i].models = vec!["thinker".into()];
+    s.ai.config.normalize();
+    let text = "\\documentclass{article}\n\\begin{document}\nNanjing is\n\\end{document}\n";
+    s.run("edit.setText", &json!({ "text": text })).unwrap();
+    let at = text.find(" is").unwrap() + 3;
+    s.run("edit.select", &json!({ "anchor": at })).unwrap();
+    s.run("ai.inline.trigger", &Value::Null).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while s.inline.last_error.is_none() && Instant::now() < deadline {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.join().unwrap();
+    assert!(s.inline_suggestion().is_none());
+    let e = s.inline.last_error.clone().unwrap_or_default();
+    assert!(e.contains("thinker") && e.contains("reasoning"), "{e}");
 }
 
 #[test]
@@ -933,8 +1078,14 @@ fn inline_suggestions_follow_typing_and_are_accepted_with_tab() {
     // ⌘→: the next word; Tab: the rest.
     s.run("ai.inline.acceptWord", &Value::Null).unwrap();
     assert_eq!(s.inline_suggestion().unwrap().text, "brown fox");
+    assert!(s.is_enabled("ai.inline.acceptSentence"));
     s.run("ai.inline.accept", &Value::Null).unwrap();
     assert!(s.inline_suggestion().is_none());
+    // Tab took all of it: the next suggestion is asked for straight away (Tab, Tab, …).
+    assert!(s.inline.due.is_some_and(|d| d <= Instant::now()));
+    // Moving the caret asks for nothing.
+    s.inline_after_caret_move();
+    assert!(s.inline.due.is_none() && s.inline_suggestion().is_none());
     assert!(
         s.doc()
             .unwrap()

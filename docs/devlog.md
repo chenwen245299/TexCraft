@@ -411,3 +411,165 @@ From the user's screenshots of the target's Preferences and Typeset Configuratio
   run in CI with the next tag). Open: unsigned builds still need one manual approval on first
   launch (Apple notarisation and Windows code signing need paid certificates); Settings › Apps
   keeps showing the installed version after a self-update until the next Setup run.
+
+## Auto-Sense owns the engine (2026-10-17)
+
+- With Auto-Sense on, the engine can no longer be chosen by hand: the Typeset Configuration ›
+  General "Typesetting Engine" pop-up is greyed out and shows the engine in use (e.g. XeLaTeX for
+  Chinese text), and `typeset.engine.*` are disabled (`CommandError::Disabled` over the control
+  channel) and tick the engine in use instead of the stored fallback. Turning Auto-Sense off
+  unlocks both. Before, picking pdfLaTeX there changed nothing visible on a Chinese document,
+  since Auto-Sense still chose XeLaTeX.
+- `Form::popup_enabled` and a disabled `popup_control` variant (grey title and text, no hover,
+  no menu). Test: `auto_sense_locks_the_engine_choice`. Checked by screenshot with Auto-Sense
+  on; the Auto-Sense-off sheet was not captured (dev window not drawing), only its state
+  (`engine: pdflatex`). Open: `ui.pointer` clicks do not reach the Typeset Configuration sheet.
+
+## SoCLaaS shows the NUS crest; paste in Settings and welcome fields (2026-10-17)
+
+- SoCLaaS now shows the NUS crest (`assets/nus/nus.png`, 192 px, from Argus) in Settings → AI,
+  the + menu, the Assistant's model menu and its answers. It is NUS's mark, not openly licensed:
+  the maintainer asked for it, and ATTRIBUTION.md records it as the one exception to
+  permissive-only assets. `ai_logos` takes PNGs beside the SVGs (egui_extras `image` loader; the
+  `image` crate was already in the tree via hayro). Tests: `every_png_logo_loads` (through egui's
+  loaders), SoCLaaS by preset and by name.
+- ⌘V (and ⌘X/⌘C/⌘A/⌘Z) did nothing in the Settings and welcome windows' text fields: the menu bar
+  takes the keys, and the app's input hook only reaches the main window, so the paste went to the
+  main window (into the editor, if it had focus). `Workbench::route_edit_events` now hands them to
+  whichever of those windows has focus, which feeds them to its widgets first thing in its frame.
+  The six native edit commands are enabled with no document open (the welcome window's filter).
+  Tests: `menu_edit_events_go_to_the_focused_window`, `fed_edit_events_reach_the_focused_field`.
+- Not checked in the running app: `ui.screenshot` timed out (dev window not drawing), and the
+  control channel cannot press menu-bar shortcuts, so a real ⌘V in Settings is still to be tried.
+
+## Model picker with Text/Vision groups, copilot icon, code blocks (2026-10-17)
+
+- Settings → AI: Fetch Models no longer pours every model into the provider (hundreds from
+  OpenRouter). **Add Models…** opens a picker window (`model_picker.rs`; native window, inline for
+  the control channel): search by every word of the filter, tabs All / Text / Vision / Other with
+  counts, group headings in All, ticks, Select All on what is shown, "Add N Models". An id the
+  list lacks is typed into the search and added from a last row ("Add “x” by its id"), so the
+  manual Model id field is gone. The added models list scrolls past six rows, rows stopping short
+  of the bar. ⌘V reaches the picker's search field, ⌘W closes it.
+- `texcraft_ai::models`: `fetch_models` returns `ModelInfo {id, kind}` (Text, Vision, Embedding,
+  Speech, Image). The provider's word first: `capabilities` / `soclaas.capabilities`, OpenRouter
+  `architecture` modalities, OpenAI-style `modalities`, LiteLLM `mode`/`supports_vision`, Ollama
+  `/api/show` (one call per model, up to 200); then the families ids show. SoCLaaS ids are aliases,
+  so only its catalogue counts: its `soclaas.capabilities` say chat / embeddings /
+  audio-transcription and vision appears only in the operator's description ("Vision-capable",
+  "multimodal") or display name ("Qwen 3 VL 32B"). Live SoCLaaS (17 models): Text 8, Vision 7,
+  Other 2 (bge-m3, whisper-large-v3), checked against its catalogue. Fake 300-model server: 109/83/108.
+- AI answers: code blocks reserve room for their sideways scroll bar under the last line (it
+  floated over it); the Insert chips are gone (the `ai.insert` command stays for agents).
+- Editor header: the AI Suggestions button is a pilot in goggles (`assets/icons/copilot.svg`,
+  drawn after GitHub Copilot's mark at the maintainer's request, tinted like the mono logos); the
+  divider on its left is gone.
+- Tests: picker search/groups/lines/typed ids/adding, kinds from ids and items, SoCLaaS catalogue
+  shapes. `typesets_an_untitled_document_when_tex_is_installed` failed once when four crates'
+  tests ran alongside the dev app, then passed 3/3: a flake to watch. Open: the Assistant's model
+  menu does not use the kinds yet (it could hide embedding/speech models or mark vision ones).
+
+## AI suggestions that show up: no reasoning, one line, ⌘→ by sentence, on/off at a glance (2026-10-17)
+
+- Suggestions never appeared with SoCLaaS's qwen3.5:9b: it reasoned first and spent the whole
+  144-token budget thinking (124 thinking chunks, empty answer, no error; probed live). Inline
+  requests now set `ChatRequest::no_reasoning`: SoCLaaS gets `reasoning_effort: "none"` (x-test-1
+  accepts no lower than "low"), Qwen's DashScope `enable_thinking: false`; others are sent
+  nothing a strict validator could reject. With it the same request answered in ~3 s. When a
+  model still only thinks, the popover says so (`only_thought`) instead of nothing happening.
+- A suggestion is the rest of the line (no line breaks of its own); several lines, up to the
+  limit, only when the answer itself starts one (list items, an environment's body). The prompt
+  says the same. Tab accepts all of it, ⌘→ the next sentence (`ai.inline.acceptSentence`,
+  。！？ or . ! ? before a space, else the line); `ai.inline.acceptWord` stays as a command.
+- The copilot button: struck through and dimmed while suggestions are off (or no provider), plain
+  while on; while a request runs a rainbow (with a soft glow) runs round the button, the pilot
+  staying in its ink.
+- Fixed a test flake: untitled scratch folders were numbered per session, so parallel tests'
+  sessions shared `texcraft-<pid>-untitled-1` and their typesets clashed
+  (`typesets_an_untitled_document_when_tex_is_installed` failed now and then). Numbered across
+  the process now; engine suite 4/4 green.
+- Checked live in the dev app: on/off icons, the rainbow mid-request, a one-line SoCLaaS
+  suggestion. Not checked live: ⌘→ (the user was typing in the dev window).
+
+## Hanging indent with full first rows; Tab keeps suggesting; caret moves ask nothing (2026-10-17)
+
+- Soft wrap with a hanging indent laid every row out at the wrap width less the indent and then
+  shifted continuation rows right, so each wrapped line's first row stopped about four
+  characters short (ragged right edge, most visible in CJK text and in ghost text). The editor
+  now lays out each wrapped line as its first row at the full width plus the rest at the narrower
+  width, shifted (`layout_hanging`, `Galley::concat`; unwrapped runs stay one part, and the
+  sections are cut in one walk). Test: rows, characters and a cursor round trip checked against
+  an unindented layout.
+- Accepting the whole suggestion (Tab, or ⌘→ through its last sentence) asks for the next one
+  at once, so Tab, Tab, … keeps writing. Moving the caret without typing (clicks, arrow keys)
+  drops the suggestion and any queued or running request (`inline_after_caret_move`): only a
+  pause in typing asks.
+- Checked in a second isolated instance (long CJK and English lines). Not checked live: Tab
+  chains with SoCLaaS (the user was typing in the main dev window).
+
+## Models with names and capabilities; images for vision models (2026-10-17)
+
+- Ported Argus's model shape: `texcraft_ai::Model {id, name, capabilities, context_length}`,
+  capabilities by Argus's tags (`vision`, `reasoning`, `tool_calling`, `embedding`, `audio`,
+  `image_gen`). Settings written with plain ids still read (capabilities from the id); unknown
+  tags are dropped instead of failing the file. Fetched lists bring display names (SoCLaaS
+  `soclaas.display_name`, Anthropic `display_name`, OpenRouter `name`), context lengths
+  (`context_length`, `context_window`, `max_model_len`, Gemini `inputTokenLimit`, …) and
+  capabilities: stated modalities first (OpenRouter `architecture`, `modalities`, `capabilities`,
+  SoCLaaS `soclaas.capabilities`, LiteLLM `model_info`), tools/reasoning from
+  `supported_parameters` or flags, then names (SoCLaaS: its display names and descriptions, never
+  the alias ids), Ollama `/api/show`. Read once on adding; from then on the user's (re-fetching
+  never overwrites, as in Argus).
+- Settings → AI: rows show the display name, the id and capability badges; a click (or the
+  pencil) edits a model below the list: display name, id (renames follow into the chosen chat and
+  suggestion models), context length ("128K", "1M"), capability chips. The picker shows names,
+  ids and "Vision · Reasoning · 128K".
+- Chat menus (Assistant, AI Suggestions) list chat models only (Argus's rule: no capability, or
+  any besides embedding/audio/image generation), by display name with capabilities and context
+  under them; answers name their model by display name.
+- Images for models with Vision: the photo button (open panel, PNG/JPEG/GIF/WebP), ⌘V of a
+  copied picture into the question box (PNG, longest side capped at 2048 px), or dropping files
+  on the window while the Assistant shows. Thumbnails in the question box (× to remove, "+N"
+  past what fits) and over the sent question; images go with every later question, as in
+  Argus. Requests: OpenAI-compatible `image_url` data URLs; Anthropic `image` base64 blocks
+  before the text; an image alone goes without an empty text block. Models without Vision: the
+  button is greyed, attaching and sending say why (`ai.attachImage {path}`, `ai.removeImage
+  {index}`; inspect `ai.readsImages`, `ai.draftImages`). Up to 10 images of 20 MB a question.
+  `image` gets JPEG decoding (zune-jpeg, already in the tree via hayro) and arboard its image
+  clipboard (already enabled by egui-winit): no new crates.
+- Tests: model parsing (SoCLaaS catalogue shapes, OpenRouter, Anthropic, Gemini, LiteLLM),
+  migration and serialisation, context lengths, chat filtering, image parts per wire format,
+  magic-byte formats, attach/refuse/send with the request checked at a fake server, picker
+  grouping by capabilities. Checked in an isolated instance: the menu, the editor, thumbnails
+  in the box and the sent question, the greyed button. Not checked: ⌘V of a real screenshot and
+  drag-and-drop (no way to drive either from the control channel).
+
+## Paste-only images, a sidebar-coloured question box, sliding sidebar (2026-10-17)
+
+- Images reach the Assistant by ⌘V (or a drop) only: the photo button, its open-panel request and
+  the app's file dialog for it are gone (`ai.attachImage {path}` stays for agents).
+- The question box and the answers' code blocks take the sidebar's own colours (`composer_bg`,
+  `composer_border` tokens, a shade lighter than the sidebar, light and dark) instead of a white
+  card with a shadow and the editor's yellow paper; the focused box gets a pale accent border.
+- The conversation's floating scroll bar gets its own strip (`floating_allocated_width`), so
+  bubbles, cards and text stop short of it instead of running under it.
+- The sidebar slides open and shut (egui's collapsible panel, 0.22 s cubic ease-out instead of
+  egui's 1/12 s; the global animation time is changed only around that call). Dragging its divider
+  past the narrowest width closes it; no grab strip is left at the window edge. Measured in an
+  isolated instance: 184 pt → 46 pt → 0 over consecutive captures.
+- The Assistant's model menu lists models only (Include the Open Document and AI Settings… were
+  the document chip and the gear again); Settings → AI lost its paragraph about where keys live.
+
+## Provider and model icons; leftover request bodies swept (2026-10-17)
+
+- The Assistant's selector shows the provider's icon; its menu heads each provider with its icon
+  (`menu::heading_with_logo`) and gives each model its maker's (`ai_logos::for_entry`): from the
+  id, then the display name, else the provider's. SoCLaaS ids are aliases, so there only the
+  display names count ("Testing GLM 5.3 Flash" → GLM, "Testing DeepSeek V4.1 Flash" → DeepSeek);
+  the picker and answers use the same lookup.
+- Request bodies (question, document, images) are written to the temp folder for curl and removed
+  when the request ends; a crash or a forced quit could leave one. `sweep_request_files` removes
+  `texcraft-ai-*.json` older than a minute (curl has read a body long before), at start-up and,
+  at most once a minute, as requests go out. Test: old bodies go; fresh ones and other files stay.
+- The Assistant's empty states (setup and "Ask about your document") show the TexCraft icon
+  (`assets/icon/texcraft.svg`, 52 pt) instead of the sparkles glyph.

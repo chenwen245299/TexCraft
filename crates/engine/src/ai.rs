@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use texcraft_ai::{ChatRequest, Config, Event, Job, KeyStore, Role, Turn};
+use texcraft_ai::{ChatRequest, Config, Event, Image, Job, KeyStore, Model, Role, Turn};
 
 use crate::{CommandError, Effect, Session, edit};
 
@@ -29,11 +29,14 @@ pub struct ChatMessage {
     pub error: Option<String>,
     /// A note such as "declined, answered by …".
     pub note: Option<String>,
+    /// Images attached to a question (sent again with every later question).
+    pub images: Vec<Image>,
 }
 
 impl ChatMessage {
-    fn user(text: String) -> Self {
+    fn user(text: String, images: Vec<Image>) -> Self {
         Self {
+            images,
             role: Role::User,
             text,
             blocks: Vec::new(),
@@ -60,8 +63,16 @@ pub struct AiState {
     pub messages: Vec<ChatMessage>,
     /// The question being written.
     pub draft: String,
+    /// Images attached to the question being written.
+    pub draft_images: Vec<Image>,
+    /// Why an image could not be attached (shown over the question box until the next try).
+    pub notice: Option<String>,
     job: Option<Job>,
 }
+
+/// The most images one question takes, and the largest image (the chat APIs refuse more).
+pub const MAX_IMAGES: usize = 10;
+pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 impl AiState {
     /// A request is running.
@@ -73,13 +84,82 @@ impl AiState {
 /// What the model is told about its role.
 const SYSTEM: &str = "You are the assistant built into TexCraft, a LaTeX editor. Help the user \
 write, fix and explain LaTeX documents. When you suggest LaTeX, put it in a fenced code block \
-marked `latex` so it can be inserted into the document with one click; keep explanations short \
-and to the point. If the open document is included below, refer to it by line numbers when \
+marked `latex` so it can be copied with one click; keep explanations short and to the point. \
+When the user attaches images (figures, plots, photos of formulas or tables), read them and \
+answer with LaTeX where it helps. If the open document is included below, refer to it by line numbers when \
 helpful and keep its packages and conventions.";
 
 impl Session {
+    /// The model the Assistant talks to, with its name and capabilities.
+    pub fn ai_model(&self) -> Option<&Model> {
+        let (p, id) = self.ai.config.selection()?;
+        p.models.iter().find(|m| m.id == id)
+    }
+
+    /// Whether the Assistant's model reads images (its Vision capability).
+    pub fn ai_reads_images(&self) -> bool {
+        self.ai_model()
+            .is_some_and(|m| m.has(texcraft_ai::Capability::Vision))
+    }
+
+    /// Attaches an image (`bytes`, from a file named `name` or the clipboard) to the question
+    /// being written. PNG, JPEG, GIF and WebP up to 20 MB, ten to a question, for models with
+    /// Vision.
+    pub fn ai_attach_image(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), CommandError> {
+        if !self.ai_reads_images() {
+            let label = self
+                .ai_model()
+                .map_or_else(|| "This model".to_string(), |m| m.label().to_string());
+            return Err(CommandError::Failed(format!(
+                "{label} does not read images: pick a model with Vision (Settings → AI)."
+            )));
+        }
+        let Some(media_type) = texcraft_ai::image_media_type(&bytes) else {
+            return Err(CommandError::Failed(format!(
+                "{name} is not a PNG, JPEG, GIF or WebP image."
+            )));
+        };
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(CommandError::Failed(format!(
+                "{name} is larger than {} MB.",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            )));
+        }
+        if self.ai.draft_images.len() >= MAX_IMAGES {
+            return Err(CommandError::Failed(format!(
+                "A question takes at most {MAX_IMAGES} images."
+            )));
+        }
+        self.ai.draft_images.push(Image {
+            media_type: media_type.to_string(),
+            data: Arc::from(bytes),
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Attaches the image file at `path` (see [`Self::ai_attach_image`]).
+    pub fn ai_attach_file(&mut self, path: &std::path::Path) -> Result<(), CommandError> {
+        let name = path
+            .file_name()
+            .map_or_else(|| "image".to_string(), |n| n.to_string_lossy().into_owned());
+        let meta =
+            std::fs::metadata(path).map_err(|e| CommandError::Failed(format!("{name}: {e}")))?;
+        if meta.len() > MAX_IMAGE_BYTES as u64 {
+            return Err(CommandError::Failed(format!(
+                "{name} is larger than {} MB.",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            )));
+        }
+        let bytes =
+            std::fs::read(path).map_err(|e| CommandError::Failed(format!("{name}: {e}")))?;
+        self.ai_attach_image(&name, bytes)
+    }
+
     /// Reads the AI configuration from `path` (called once by the app).
     pub fn load_ai_config(&mut self, path: PathBuf) {
+        // Request bodies a crash or a forced quit left in the temp folder go first.
+        texcraft_ai::sweep_stale_request_files();
         self.ai.config = Config::load(&path);
         if let Some(dir) = path.parent() {
             let keys = KeyStore::new(dir);
@@ -180,7 +260,7 @@ impl Session {
     /// Asks the chosen model `text` (the conversation so far goes along).
     pub fn ai_send(&mut self, text: &str) -> Result<(), CommandError> {
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() && self.ai.draft_images.is_empty() {
             return Err(CommandError::Failed("Type a question first.".into()));
         }
         if self.ai.job.is_some() {
@@ -203,7 +283,19 @@ impl Session {
                 provider.name
             )));
         }
-        self.ai.messages.push(ChatMessage::user(text.to_string()));
+        let images = std::mem::take(&mut self.ai.draft_images);
+        if !images.is_empty() && !self.ai_reads_images() {
+            let label = self
+                .ai_model()
+                .map_or_else(|| model.clone(), |m| m.label().to_string());
+            self.ai.draft_images = images;
+            return Err(CommandError::Failed(format!(
+                "{label} does not read images: pick a model with Vision, or remove the images."
+            )));
+        }
+        self.ai
+            .messages
+            .push(ChatMessage::user(text.to_string(), images));
         // The conversation: answered questions only (failed or declined ones are left out).
         let mut turns = Vec::new();
         let msgs = &self.ai.messages;
@@ -219,6 +311,7 @@ impl Session {
                             role: Role::User,
                             text: m.text.clone(),
                             blocks: Vec::new(),
+                            images: m.images.clone(),
                         });
                         turns.push(Turn {
                             role: Role::Assistant,
@@ -229,6 +322,7 @@ impl Session {
                             } else {
                                 Vec::new()
                             },
+                            images: Vec::new(),
                         });
                         i += 2;
                         continue;
@@ -237,6 +331,7 @@ impl Session {
                         role: Role::User,
                         text: m.text.clone(),
                         blocks: Vec::new(),
+                        images: m.images.clone(),
                     }),
                     _ => {}
                 }
@@ -251,8 +346,10 @@ impl Session {
             api_key,
             turns,
             max_tokens: None,
+            no_reasoning: false,
         };
         self.ai.messages.push(ChatMessage {
+            images: Vec::new(),
             role: Role::Assistant,
             text: String::new(),
             blocks: Vec::new(),

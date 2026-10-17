@@ -113,6 +113,26 @@ pub struct Prefs {
     height: f32,
     /// The AI pane.
     ai: AiPaneState,
+    /// Edit events from the menu bar (⌘V and co.) for the window's text fields.
+    pub(crate) edit_events: Vec<egui::Event>,
+}
+
+impl Prefs {
+    /// The model picker window (Settings → AI → Add Models…).
+    pub fn model_picker(&mut self) -> &mut crate::model_picker::ModelPicker {
+        &mut self.ai.picker
+    }
+
+    /// Opens the model picker for the provider selected in the AI pane.
+    pub fn open_model_picker(&mut self, ctx: &Context, session: &Session) {
+        let i = self.ai.selected;
+        self.ai.picker.open(ctx, session, i);
+    }
+
+    /// What the model picker shows, for `state.inspect`.
+    pub fn model_picker_info(&self) -> serde_json::Value {
+        self.ai.picker.info()
+    }
 }
 
 /// Colours of the preference forms (from the design tokens).
@@ -296,6 +316,17 @@ impl Form<'_> {
         value: &mut T,
         options: &[(T, String)],
     ) -> bool {
+        self.popup_enabled(desc, title, value, options, true)
+    }
+
+    fn popup_enabled<T: PartialEq + Clone>(
+        &mut self,
+        desc: &str,
+        title: &str,
+        value: &mut T,
+        options: &[(T, String)],
+        enabled: bool,
+    ) -> bool {
         let top = self.y;
         let dh = self.desc(desc, top);
         let p = self.ui.painter();
@@ -304,13 +335,17 @@ impl Form<'_> {
             Align2::LEFT_CENTER,
             title,
             semibold(self.style.label_size),
-            self.pal.label,
+            if enabled {
+                self.pal.label
+            } else {
+                self.pal.note
+            },
         );
         let r = Rect::from_min_max(
             pos2(self.ctrl, top + self.style.popup_dy),
             pos2(self.right, top + self.style.popup_dy + self.style.popup_h),
         );
-        let changed = popup_control(
+        let changed = popup_control_enabled(
             self.ui,
             self.pal,
             self.row_id(title),
@@ -318,6 +353,7 @@ impl Form<'_> {
             value,
             options,
             self.style.control_size,
+            enabled,
         );
         self.y += self.style.popup_step.max(dh + 15.0);
         changed
@@ -404,31 +440,14 @@ pub(crate) fn check_control(
         pos2(left_center.x + side / 2.0, left_center.y),
         vec2(side, side),
     );
-    if *value {
-        let fill = if enabled {
-            pal.accent
-        } else {
-            pal.accent.gamma_multiply(0.45)
-        };
-        p.rect_filled(bx, 3.5, fill);
-        icons::check_mark(&p, bx.center(), side, Color32::WHITE);
-    } else {
-        p.rect_filled(
-            bx,
-            3.5,
-            if resp.is_pointer_button_down_on() {
-                pal.control_hover
-            } else {
-                pal.off
-            },
-        );
-        p.rect_stroke(
-            bx,
-            3.5,
-            Stroke::new(0.6, pal.off_border),
-            StrokeKind::Inside,
-        );
-    }
+    check_box(
+        &p,
+        pal,
+        bx,
+        *value,
+        enabled,
+        resp.is_pointer_button_down_on(),
+    );
     p.galley(
         pos2(label_x, left_center.y - g.size().y / 2.0),
         g,
@@ -439,6 +458,35 @@ pub(crate) fn check_control(
         true
     } else {
         false
+    }
+}
+
+/// Paints a checkbox in `bx`: accent with a white tick when on (paler when disabled), grey when
+/// off.
+pub(crate) fn check_box(
+    p: &egui::Painter,
+    pal: &Pal,
+    bx: Rect,
+    value: bool,
+    enabled: bool,
+    pressed: bool,
+) {
+    if value {
+        let fill = if enabled {
+            pal.accent
+        } else {
+            pal.accent.gamma_multiply(0.45)
+        };
+        p.rect_filled(bx, 3.5, fill);
+        icons::check_mark(p, bx.center(), bx.width(), Color32::WHITE);
+    } else {
+        p.rect_filled(bx, 3.5, if pressed { pal.control_hover } else { pal.off });
+        p.rect_stroke(
+            bx,
+            3.5,
+            Stroke::new(0.6, pal.off_border),
+            StrokeKind::Inside,
+        );
     }
 }
 
@@ -463,12 +511,32 @@ pub(crate) fn popup_control<T: PartialEq + Clone>(
     options: &[(T, String)],
     size: f32,
 ) -> bool {
-    let resp = ui.interact(r, id, Sense::click());
+    popup_control_enabled(ui, pal, id, r, value, options, size, true)
+}
+
+/// [`popup_control`]; a disabled one shows `value` greyed out and does not open.
+#[allow(clippy::too_many_arguments)]
+fn popup_control_enabled<T: PartialEq + Clone>(
+    ui: &mut Ui,
+    pal: &Pal,
+    id: Id,
+    r: Rect,
+    value: &mut T,
+    options: &[(T, String)],
+    size: f32,
+    enabled: bool,
+) -> bool {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let resp = ui.interact(r, id, sense);
     let p = ui.painter();
     p.rect_filled(
         r,
         5.5,
-        if resp.hovered() {
+        if enabled && resp.hovered() {
             pal.control_hover
         } else {
             pal.control
@@ -480,14 +548,18 @@ pub(crate) fn popup_control<T: PartialEq + Clone>(
         .map_or("—", |(_, s)| s.as_str());
     let font = FontId::proportional(size);
     let text = crate::widgets::elide(p, current, &font, r.width() - 36.0);
+    let text_color = if enabled { pal.control_text } else { pal.note };
     p.text(
         pos2(r.left() + 11.5, r.center().y),
         Align2::LEFT_CENTER,
         text,
         font,
-        pal.control_text,
+        text_color,
     );
-    icons::updown(p, pos2(r.right() - 13.0, r.center().y), pal.control_text);
+    icons::updown(p, pos2(r.right() - 13.0, r.center().y), text_color);
+    if !enabled {
+        return false;
+    }
     let mut changed = false;
     egui::Popup::menu(&resp).width(r.width()).show(|ui| {
         crate::menu::begin(ui, r.width());
@@ -535,7 +607,7 @@ pub(crate) fn push_button(ui: &mut Ui, pal: &Pal, id: Id, r: Rect, label: &str, 
 
 /// Text tabs: the selected one filled with the accent colour. Returns the clicked index.
 #[allow(clippy::too_many_arguments)]
-fn text_tabs(
+pub(crate) fn text_tabs(
     ui: &mut Ui,
     pal: &Pal,
     id: Id,
@@ -602,8 +674,35 @@ pub fn settings_window(
     outline_depth: &mut u8,
 ) -> bool {
     if !prefs.open {
+        if prefs.ai.picker.is_open() {
+            prefs.ai.picker.close();
+        }
         return false;
     }
+    let open_sheet = settings_contents(ctx, t, session, prefs, outline_depth);
+    // The model picker (Add Models…), over the Settings window.
+    let pal = pal(t);
+    if let Some(n) =
+        crate::model_picker::show(ctx, &pal, session, &mut prefs.ai.picker, prefs.inline)
+    {
+        let msg = match n {
+            0 => "Those models were already added.".to_string(),
+            1 => "Added 1 model.".to_string(),
+            n => format!("Added {n} models."),
+        };
+        prefs.ai.message = Some((msg, true));
+    }
+    open_sheet
+}
+
+/// The Settings window itself (or its stand-in inside the main window).
+fn settings_contents(
+    ctx: &Context,
+    t: &Tokens,
+    session: &mut Session,
+    prefs: &mut Prefs,
+    outline_depth: &mut u8,
+) -> bool {
     if prefs.inline {
         let mut open_sheet = false;
         let pal = pal(t);
@@ -645,6 +744,7 @@ pub fn settings_window(
     let mut open_sheet = false;
     ctx.show_viewport_immediate(settings_viewport(), builder, |ui, _class| {
         let ctx = ui.ctx().clone();
+        crate::widgets::feed_edit_events(&ctx, &mut prefs.edit_events);
         if ctx.input(|i| i.viewport().close_requested()) {
             prefs.open = false;
         }
@@ -1381,6 +1481,7 @@ fn summary_tab(f: &mut Form<'_>, session: &mut Session) {
 
 fn general_tab(f: &mut Form<'_>, session: &mut Session) {
     let tc = session.toolchain.clone();
+    let sensed = session.settings.auto_sense;
     let engines: Vec<(Engine, String)> = Engine::ALL
         .iter()
         .map(|e| {
@@ -1392,12 +1493,24 @@ fn general_tab(f: &mut Form<'_>, session: &mut Session) {
             (*e, name)
         })
         .collect();
-    f.popup(
-        "The engine used when the document has no % !TEX program comment and Auto-Sense finds nothing to go on.",
-        "Typesetting Engine",
-        &mut session.settings.engine,
-        &engines,
-    );
+    if sensed {
+        // Auto-Sense picks the engine: show the one in use, locked.
+        let mut used = session.effective_engine();
+        f.popup_enabled(
+            "Auto-Sense picks the engine from the document. Turn Auto-Sense off to choose it yourself.",
+            "Typesetting Engine",
+            &mut used,
+            &engines,
+            false,
+        );
+    } else {
+        f.popup(
+            "The engine used when the document has no % !TEX program comment.",
+            "Typesetting Engine",
+            &mut session.settings.engine,
+            &engines,
+        );
+    }
     f.checkbox(
         "Lets packages such as minted and gnuplot run programs. Only enable it for documents you trust.",
         "Allow shell escape",
@@ -1408,28 +1521,32 @@ fn general_tab(f: &mut Form<'_>, session: &mut Session) {
 // ---------------------------------------------------------------------------------------------
 // AI: providers and their models.
 
-/// A model list being fetched in the background.
-type ModelList = std::sync::mpsc::Receiver<Result<Vec<String>, String>>;
-
 /// State of the AI pane.
 #[derive(Default)]
 pub(crate) struct AiPaneState {
     /// The provider shown on the right.
     selected: usize,
-    /// The model id being typed.
-    new_model: String,
     /// A new API key being typed (cleared once saved; a saved key is never shown again).
     key_input: String,
     /// Replacing a saved key.
     editing_key: bool,
-    /// A model list being fetched: provider index and the answer.
-    fetch: Option<(usize, ModelList)>,
-    /// The outcome of the last fetch.
+    /// The model being edited (index into the provider's models), and its fields as typed.
+    editing: Option<usize>,
+    edit_name: String,
+    edit_id: String,
+    edit_context: String,
+    /// The outcome of the last action (key saved, models added, …).
     message: Option<(String, bool)>,
+    /// The model picker window (Add Models…).
+    pub(crate) picker: crate::model_picker::ModelPicker,
 }
 
+/// Added models shown before their list scrolls, and their row height.
+const MODEL_ROWS: usize = 6;
+const MODEL_ROW_H: f32 = 26.0;
+
 /// A rounded text field in the preference style.
-fn text_field(
+pub(crate) fn text_field(
     ui: &mut Ui,
     pal: &Pal,
     id: Id,
@@ -1479,6 +1596,166 @@ fn field_title(ui: &Ui, pal: &Pal, x: f32, y: f32, title: &str) {
     );
 }
 
+/// The editor of model `k` of `p` at (`x`, `y`), `w` wide: display name, id, context length and
+/// capability chips. Returns its height, whether the model changed, and whether Done was pressed.
+#[allow(clippy::too_many_arguments)]
+fn model_editor(
+    ui: &mut Ui,
+    pal: &Pal,
+    p: &mut texcraft_ai::Provider,
+    k: usize,
+    st: &mut AiPaneState,
+    x: f32,
+    top: f32,
+    w: f32,
+) -> (f32, bool, bool) {
+    use texcraft_ai::Capability;
+    let mut changed = false;
+    let selected = st.selected;
+    let id = move |s: &str| Id::new(("ai-model-edit", s, selected, k));
+    let panel_top = top;
+    let (x, w) = (x + 10.0, w - 20.0);
+    let mut y = top + 10.0;
+    // Name and id side by side.
+    let half = (w - 10.0) / 2.0;
+    field_title(ui, pal, x, y + 8.0, "Display Name");
+    field_title(ui, pal, x + half + 10.0, y + 8.0, "Model ID");
+    y += 18.0;
+    let nr = Rect::from_min_size(pos2(x, y), vec2(half, 24.0));
+    let hint = p.models.get(k).map(|m| m.id.clone()).unwrap_or_default();
+    if text_field(ui, pal, id("name"), nr, &mut st.edit_name, false, &hint).changed()
+        && let Some(m) = p.models.get_mut(k)
+    {
+        m.name = st.edit_name.trim().to_string();
+        changed = true;
+    }
+    let ir = Rect::from_min_size(pos2(x + half + 10.0, y), vec2(half, 24.0));
+    if text_field(ui, pal, id("id"), ir, &mut st.edit_id, false, "Model id").changed() {
+        // A new id only when it is one and no other model has it.
+        let new_id = st.edit_id.trim().to_string();
+        let taken = p
+            .models
+            .iter()
+            .enumerate()
+            .any(|(j, m)| j != k && m.id == new_id);
+        if !new_id.is_empty()
+            && !taken
+            && let Some(m) = p.models.get_mut(k)
+        {
+            m.id = new_id;
+            changed = true;
+        }
+    }
+    y += 32.0;
+    // Context length.
+    field_title(ui, pal, x, y + 8.0, "Context Length");
+    y += 18.0;
+    let cr = Rect::from_min_size(pos2(x, y), vec2(120.0, 24.0));
+    if text_field(
+        ui,
+        pal,
+        id("context"),
+        cr,
+        &mut st.edit_context,
+        false,
+        "e.g. 128K",
+    )
+    .changed()
+        && let Some(m) = p.models.get_mut(k)
+    {
+        m.context_length = texcraft_ai::models::parse_context(&st.edit_context);
+        changed = true;
+    }
+    let known = p.models.get(k).and_then(|m| m.context_length);
+    ui.painter().text(
+        pos2(cr.right() + 10.0, cr.center().y),
+        Align2::LEFT_CENTER,
+        match known {
+            Some(n) => format!("{n} tokens"),
+            None if st.edit_context.trim().is_empty() => "Unknown".to_string(),
+            None => "Write a number of tokens, 128K or 1M".to_string(),
+        },
+        FontId::proportional(11.0),
+        pal.note,
+    );
+    y += 32.0;
+    // Capabilities: chips that switch on and off.
+    field_title(ui, pal, x, y + 8.0, "Capabilities");
+    y += 20.0;
+    let mut cx = x;
+    for cap in Capability::ALL {
+        let on = p.models.get(k).is_some_and(|m| m.has(cap));
+        let font = FontId::proportional(11.5);
+        let g = ui
+            .painter()
+            .layout_no_wrap(cap.label().to_string(), font.clone(), pal.label);
+        let cw = g.size().x + 22.0;
+        if cx + cw > x + w {
+            cx = x;
+            y += 28.0;
+        }
+        let r = Rect::from_min_size(pos2(cx, y), vec2(cw, 22.0));
+        let resp = ui
+            .interact(r, id(cap.label()), Sense::click())
+            .on_hover_text(match cap {
+                Capability::Vision => "Reads images: the Assistant can attach them",
+                Capability::Reasoning => "Reasons before it answers",
+                Capability::ToolCalling => "Calls tools",
+                Capability::Embedding => "Makes embeddings (not for chat)",
+                Capability::Audio => "Hears or speaks (not for chat unless it does more)",
+                Capability::ImageGen => "Makes images (not for chat unless it does more)",
+            });
+        let (fill, text) = if on {
+            (pal.accent, Color32::WHITE)
+        } else if resp.hovered() {
+            (pal.control_hover, pal.label)
+        } else {
+            (pal.control, pal.label)
+        };
+        ui.painter().rect_filled(r, 11.0, fill);
+        ui.painter()
+            .text(r.center(), Align2::CENTER_CENTER, cap.label(), font, text);
+        if resp.clicked()
+            && let Some(m) = p.models.get_mut(k)
+        {
+            if on {
+                m.capabilities.retain(|c| *c != cap);
+            } else {
+                m.capabilities.push(cap);
+                m.capabilities.sort();
+            }
+            changed = true;
+        }
+        cx += cw + 6.0;
+    }
+    y += 30.0;
+    let chats = p.models.get(k).is_none_or(texcraft_ai::Model::chats);
+    let note = if chats {
+        "With Vision the Assistant can attach images to questions."
+    } else {
+        "Not offered for chat: it only embeds, hears or speaks, or makes images."
+    };
+    ui.painter().text(
+        pos2(x, y + 6.0),
+        Align2::LEFT_CENTER,
+        note,
+        FontId::proportional(11.0),
+        pal.note,
+    );
+    let dr = Rect::from_min_size(pos2(x + w - 70.0, y - 4.0), vec2(70.0, 22.0));
+    let done = push_button(ui, pal, id("done"), dr, "Done", 11.5);
+    y += 24.0;
+    let h = y - panel_top;
+    // The panel behind (painted after, under the controls' layer order is the same: a frame).
+    ui.painter().rect_stroke(
+        Rect::from_min_size(pos2(x - 10.0, panel_top), vec2(w + 20.0, h)),
+        7.0,
+        Stroke::new(0.5, pal.hairline_strong),
+        StrokeKind::Inside,
+    );
+    (h, changed, done)
+}
+
 fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     let ui = &mut *f.ui;
     let pal = f.pal;
@@ -1487,37 +1764,6 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     let left = f.left + 7.0;
     let right = f.right - 7.0;
     let mut changed = false;
-
-    // Fetched model lists.
-    if let Some((i, rx)) = &st.fetch {
-        match rx.try_recv() {
-            Ok(res) => {
-                let i = *i;
-                match res {
-                    Ok(models) if !models.is_empty() => {
-                        if let Some(p) = session.ai.config.providers.get_mut(i) {
-                            let n = models.len();
-                            for m in models {
-                                if !p.models.contains(&m) {
-                                    p.models.push(m);
-                                }
-                            }
-                            st.message = Some((format!("{n} models available"), true));
-                            changed = true;
-                        }
-                    }
-                    Ok(_) => st.message = Some(("The provider listed no models.".into(), false)),
-                    Err(e) => st.message = Some((e, false)),
-                }
-                st.fetch = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            Err(_) => st.fetch = None,
-        }
-    }
 
     // ---- Provider list.
     let list = Rect::from_min_size(pos2(left, top), vec2(196.0, 262.0));
@@ -1622,6 +1868,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             st.message = None;
             st.key_input.clear();
             st.editing_key = false;
+            st.editing = None;
         }
     }
     // + / − under the list.
@@ -1670,7 +1917,6 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             if crate::menu::item(ui, t, preset.name, opts).clicked() {
                 st.selected = session.ai.config.add(preset);
                 st.message = None;
-                st.new_model.clear();
                 changed = true;
             }
         }
@@ -1688,13 +1934,16 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     // Key and fetch actions wait until the provider is no longer borrowed.
     let mut save_key: Option<(String, String)> = None;
     let mut remove_key: Option<String> = None;
-    let mut fetch_for: Option<texcraft_ai::Provider> = None;
+    let mut open_picker: Option<usize> = None;
+    // A model's id changed: (provider, old id, new id), for the choices that name it.
+    let mut renamed: Option<(String, String, String)> = None;
 
     // ---- The selected provider.
     let x = list.right() + 22.0;
     let w = right - x;
     let mut y = top + 4.0;
-    let id = |k: &str| Id::new(("ai-field", k, st.selected));
+    let selected = st.selected;
+    let id = move |k: &str| Id::new(("ai-field", k, selected));
     if let Some(p) = session.ai.config.providers.get_mut(st.selected) {
         field_title(ui, pal, x, y + 8.0, "Name");
         let r = Rect::from_min_size(pos2(x, y + 18.0), vec2(w, 24.0));
@@ -1786,97 +2035,182 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         }
         y += 54.0;
 
-        // Models.
+        // Models: display name, id and capabilities, in a list that scrolls past MODEL_ROWS
+        // rows. A click edits one below the list (name, id, context length, capabilities, as in
+        // Argus); more come from the picker window.
         field_title(ui, pal, x, y + 8.0, "Models");
         y += 18.0;
-        let mut remove = None;
-        for (k, m) in p.models.iter().enumerate() {
-            let row = Rect::from_min_size(pos2(x, y), vec2(w, 22.0));
-            let resp = ui.interact(
-                row,
-                Id::new(("ai-model-row", st.selected, k)),
-                Sense::hover(),
-            );
-            if resp.hovered() {
-                ui.painter().rect_filled(row, 5.0, pal.control);
-            }
-            ui.painter().text(
-                pos2(row.left() + 9.0, row.center().y),
-                Align2::LEFT_CENTER,
-                m,
-                crate::theme::editor_font(11.5),
-                pal.label,
-            );
-            let xr =
-                Rect::from_center_size(pos2(row.right() - 11.0, row.center().y), vec2(18.0, 18.0));
-            let xresp = ui
-                .interact(xr, Id::new(("ai-model-x", st.selected, k)), Sense::click())
-                .on_hover_text("Remove");
-            if resp.hovered() || xresp.hovered() {
-                icons::close(ui.painter(), xr.shrink(4.5), pal.note);
-            }
-            if xresp.clicked() {
-                remove = Some(k);
-            }
-            y += 23.0;
+        if st.editing.is_some_and(|k| k >= p.models.len()) {
+            st.editing = None;
         }
+        let mut remove = None;
+        let mut edit = None;
         if p.models.is_empty() {
             ui.painter().text(
                 pos2(x + 9.0, y + 10.0),
                 Align2::LEFT_CENTER,
-                "No models yet: add one by id or fetch the list.",
+                "No models yet: add some from the provider's list.",
                 FontId::proportional(11.5),
                 pal.note,
             );
             y += 23.0;
+        } else {
+            let rows = p.models.len().min(MODEL_ROWS);
+            let list_r = Rect::from_min_size(pos2(x, y), vec2(w, rows as f32 * MODEL_ROW_H));
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(list_r));
+            c.set_clip_rect(list_r.intersect(ui.clip_rect()));
+            c.spacing_mut().item_spacing.y = 0.0;
+            // Rows stop short of the scroll bar.
+            let room = if p.models.len() > MODEL_ROWS {
+                16.0
+            } else {
+                0.0
+            };
+            let sel = st.selected;
+            let editing = st.editing;
+            egui::ScrollArea::vertical()
+                .id_salt(("ai-models", sel))
+                .auto_shrink([false, false])
+                .show_rows(&mut c, MODEL_ROW_H, p.models.len(), |ui, range| {
+                    for k in range {
+                        let Some(m) = p.models.get(k) else { continue };
+                        let rw = (ui.available_width() - room).max(0.0);
+                        let (row, resp) =
+                            ui.allocate_exact_size(vec2(rw, MODEL_ROW_H), Sense::click());
+                        let row = row.shrink2(vec2(0.0, 1.0));
+                        let on = editing == Some(k);
+                        // Edit and remove at the right, while hovered or edited.
+                        let xr = Rect::from_center_size(
+                            pos2(row.right() - 11.0, row.center().y),
+                            vec2(18.0, 18.0),
+                        );
+                        let er = Rect::from_center_size(
+                            pos2(row.right() - 31.0, row.center().y),
+                            vec2(18.0, 18.0),
+                        );
+                        let xresp = ui
+                            .interact(xr, Id::new(("ai-model-x", sel, k)), Sense::click())
+                            .on_hover_text("Remove");
+                        let eresp = ui
+                            .interact(er, Id::new(("ai-model-e", sel, k)), Sense::click())
+                            .on_hover_text("Edit");
+                        let hot = resp.hovered() || xresp.hovered() || eresp.hovered();
+                        let painter = ui.painter();
+                        if on {
+                            painter.rect_filled(row, 5.0, pal.item_selected);
+                        } else if hot {
+                            painter.rect_filled(row, 5.0, pal.control);
+                        }
+                        let icons_w = if hot || on {
+                            icons::close(painter, xr.shrink(4.5), pal.note);
+                            icons::prefs_editor(painter, er.shrink(3.0), pal.note);
+                            44.0
+                        } else {
+                            4.0
+                        };
+                        // Capability badges from the right.
+                        let badge_font = FontId::proportional(9.5);
+                        let mut bx = row.right() - icons_w;
+                        let mut badges_w = 0.0;
+                        for cap in m.capabilities.iter().rev() {
+                            let g = painter.layout_no_wrap(
+                                cap.label().to_string(),
+                                badge_font.clone(),
+                                pal.accent,
+                            );
+                            let bw = g.size().x + 10.0;
+                            if badges_w + bw > row.width() * 0.45 {
+                                break;
+                            }
+                            let br = Rect::from_min_size(
+                                pos2(bx - bw, row.center().y - 8.0),
+                                vec2(bw, 16.0),
+                            );
+                            painter.rect_filled(br, 8.0, pal.accent.gamma_multiply(0.12));
+                            painter.galley(
+                                pos2(br.left() + 5.0, br.center().y - g.size().y / 2.0),
+                                g,
+                                pal.accent,
+                            );
+                            bx -= bw + 4.0;
+                            badges_w += bw + 4.0;
+                        }
+                        // The display name, then the id when it differs.
+                        let text_room = (bx - row.left() - 14.0).max(0.0);
+                        let label_font = FontId::proportional(12.0);
+                        let label =
+                            crate::widgets::elide(painter, m.label(), &label_font, text_room);
+                        let lg = painter.layout_no_wrap(label, label_font, pal.label);
+                        let lw = lg.size().x;
+                        painter.galley(
+                            pos2(row.left() + 9.0, row.center().y - lg.size().y / 2.0),
+                            lg,
+                            pal.label,
+                        );
+                        if !m.name.is_empty() && text_room - lw > 36.0 {
+                            let id_font = crate::theme::editor_font(10.5);
+                            let id_text = crate::widgets::elide(
+                                painter,
+                                &m.id,
+                                &id_font,
+                                text_room - lw - 8.0,
+                            );
+                            painter.text(
+                                pos2(row.left() + 9.0 + lw + 8.0, row.center().y),
+                                Align2::LEFT_CENTER,
+                                id_text,
+                                id_font,
+                                pal.note,
+                            );
+                        }
+                        if xresp.clicked() {
+                            remove = Some(k);
+                        } else if eresp.clicked() || resp.clicked() {
+                            edit = Some(k);
+                        }
+                    }
+                });
+            y += list_r.height();
         }
         if let Some(k) = remove {
             p.models.remove(k);
+            st.editing = None;
             changed = true;
-        }
-        y += 4.0;
-        let fetch_w = 104.0;
-        let add_w = 52.0;
-        let r = Rect::from_min_size(pos2(x, y), vec2(w - add_w - fetch_w - 12.0, 24.0));
-        let model_resp = text_field(
-            ui,
-            pal,
-            id("new-model"),
-            r,
-            &mut st.new_model,
-            false,
-            "Model id",
-        );
-        let enter = model_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        let ar = Rect::from_min_size(pos2(r.right() + 6.0, y), vec2(add_w, 24.0));
-        if (push_button(ui, pal, id("add-model"), ar, "Add", 11.5) || enter)
-            && !st.new_model.trim().is_empty()
-        {
-            let m = st.new_model.trim().to_string();
-            if !p.models.contains(&m) {
-                p.models.push(m);
-                changed = true;
+        } else if let Some(k) = edit {
+            if st.editing == Some(k) {
+                st.editing = None;
+            } else if let Some(m) = p.models.get(k) {
+                st.editing = Some(k);
+                st.edit_name = m.name.clone();
+                st.edit_id = m.id.clone();
+                st.edit_context = m
+                    .context_length
+                    .map(texcraft_ai::models::format_context)
+                    .unwrap_or_default();
             }
-            st.new_model.clear();
         }
-        let fr = Rect::from_min_size(pos2(ar.right() + 6.0, y), vec2(fetch_w, 24.0));
-        let fetching = st.fetch.is_some();
-        if push_button(
-            ui,
-            pal,
-            id("fetch"),
-            fr,
-            if fetching {
-                "Fetching…"
-            } else {
-                "Fetch Models"
-            },
-            11.5,
-        ) && !fetching
-        {
-            fetch_for = Some(p.clone());
+        y += 6.0;
+        let ar = Rect::from_min_size(pos2(x, y), vec2(112.0, 24.0));
+        if push_button(ui, pal, id("add-models"), ar, "Add Models…", 11.5) {
+            open_picker = Some(st.selected);
         }
-        y += 30.0;
+        y += 32.0;
+        // The model being edited.
+        if let Some(k) = st.editing {
+            let before = p.models.get(k).map(|m| m.id.clone());
+            let (h, edited, done) = model_editor(ui, pal, p, k, st, x, y, w);
+            let after = p.models.get(k).map(|m| m.id.clone());
+            if let (Some(old), Some(new)) = (before, after)
+                && old != new
+            {
+                renamed = Some((p.id.clone(), old, new));
+            }
+            changed |= edited;
+            if done {
+                st.editing = None;
+            }
+            y += h + 10.0;
+        }
         if let Some((msg, ok)) = &st.message {
             let g = ui.painter().layout(
                 msg.clone(),
@@ -1927,18 +2261,17 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     {
         st.message = Some((e.to_string(), false));
     }
-    if let Some(provider) = fetch_for {
-        // Decrypted only for this request, on its own thread.
-        let key = session.ai_key_for(&provider);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = ui.ctx().clone();
-        let _ = std::thread::Builder::new()
-            .name("texcraft-ai-models".into())
-            .spawn(move || {
-                let _ = tx.send(texcraft_ai::fetch_models(&provider, &key).map_err(|e| e.0));
-                ctx.request_repaint();
-            });
-        st.fetch = Some((st.selected, rx));
+    if let Some((pid, old, new)) = renamed {
+        let c = &mut session.ai.config;
+        if c.provider == pid && c.model == old {
+            c.model = new.clone();
+        }
+        if c.inline.provider == pid && c.inline.model == old {
+            c.inline.model = new;
+        }
+    }
+    if let Some(i) = open_picker {
+        st.picker.open(ui.ctx(), session, i);
         st.message = None;
     }
 
@@ -1962,26 +2295,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         changed = true;
     }
     y += 24.0;
-    let where_ = session
-        .ai
-        .config_path
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map_or_else(
-            || "the app's settings folder".to_string(),
-            |d| d.join("api_keys.json").display().to_string(),
-        );
-    let g = ui.painter().layout(
-        format!(
-            "API keys are encrypted (AES-256-GCM) in {where_}, readable only by you, and are never shown again once saved. They go only to the provider they belong to, straight from this computer: TexCraft has no server of its own."
-        ),
-        FontId::proportional(11.0),
-        pal.note,
-        right - left,
-    );
-    let h = g.size().y;
-    ui.painter().galley(pos2(left, y + 4.0), g, pal.note);
-    f.y = y + h + 16.0;
+    f.y = y + 12.0;
 
     if changed && let Err(e) = session.save_ai_config() {
         st.message = Some((e.to_string(), false));

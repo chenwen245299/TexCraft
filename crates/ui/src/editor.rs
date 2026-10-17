@@ -421,41 +421,161 @@ fn paint_selection(
     ui.painter().set(sel_idx, egui::Shape::Vec(shapes));
 }
 
-/// Shifts the continuation rows of wrapped lines right by `indent` (a hanging indent). Cursor
-/// placement and hit-testing follow, since they use each row's own position.
-fn hanging_indent(galley: Arc<Galley>, indent: f32) -> Arc<Galley> {
-    if galley.rows.len() < 2 || indent <= 0.0 {
-        return galley;
+/// Lays `job` out with a hanging indent (the target's "soft wrap with hanging indent"): each
+/// line's first row as wide as the wrap width, its continuation rows `indent` narrower and
+/// shifted right by it. (Shifting the rows of one layout made every first row `indent` short.)
+/// Lines that wrap are laid out as their first row plus the rest; everything else in runs.
+/// Cursor placement and hit-testing follow, since they use each row's own position and glyphs.
+fn layout_hanging(ui: &Ui, job: LayoutJob, indent: f32) -> Arc<Galley> {
+    let width = job.wrap.max_width;
+    let whole = ui.fonts_mut(|f| f.layout_job(job.clone()));
+    if indent <= 0.0 || !width.is_finite() || whole.rows.len() < 2 {
+        return whole;
     }
-    let mut prev_newline = true;
-    let mut any = false;
-    for row in &galley.rows {
-        if !prev_newline {
-            any = true;
+    // (first row's end, line's end) of every line that wraps, in characters.
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let (mut at, mut first_row, mut open) = (0usize, true, None);
+    let last = whole.rows.len().saturating_sub(1);
+    for (i, row) in whole.rows.iter().enumerate() {
+        let end = at.saturating_add(row.glyphs.len());
+        if first_row && !row.ends_with_newline && i < last {
+            open = Some(end);
+        }
+        if row.ends_with_newline || i == last {
+            if let Some(c) = open.take() {
+                cuts.push((c, end));
+            }
+            at = end.saturating_add(1);
+            first_row = true;
+        } else {
+            at = end;
+            first_row = false;
+        }
+    }
+    if cuts.is_empty() {
+        return whole;
+    }
+    // The cuts in bytes.
+    let text = job.text.as_str();
+    let wanted: Vec<usize> = cuts.iter().flat_map(|&(a, b)| [a, b]).collect();
+    let mut bytes = Vec::with_capacity(wanted.len());
+    let mut next = wanted.iter().peekable();
+    for (ci, (bi, _)) in text.char_indices().chain([(text.len(), ' ')]).enumerate() {
+        while next.peek().is_some_and(|&&c| c == ci) {
+            bytes.push(bi);
+            next.next();
+        }
+        if next.peek().is_none() {
             break;
         }
-        prev_newline = row.ends_with_newline;
     }
-    if !any {
-        return galley;
+    if bytes.len() != wanted.len() {
+        return whole;
     }
-    let mut g = (*galley).clone();
-    let mut prev_newline = true;
-    for row in &mut g.rows {
-        if !prev_newline {
-            row.pos.x += indent;
+    // Parts: text up to a wrapped line's first row end, then that line's rest (indented).
+    let mut parts: Vec<(Range<usize>, bool)> = Vec::new();
+    let mut from = 0;
+    for pair in bytes.chunks(2) {
+        let (Some(&b1), Some(&be)) = (pair.first(), pair.get(1)) else {
+            return whole;
+        };
+        parts.push((from..b1, false));
+        parts.push((b1..be, true));
+        from = be.saturating_add(1);
+    }
+    if from <= text.len() {
+        parts.push((from..text.len(), false));
+    }
+    let mut sections = SectionCursor::default();
+    let galleys: Vec<Arc<Galley>> = parts
+        .iter()
+        .map(|(range, rest)| {
+            let w = if *rest {
+                (width - indent).max(20.0)
+            } else {
+                width
+            };
+            let sub = sections.sub_job(&job, range.clone(), w);
+            ui.fonts_mut(|f| f.layout_job(sub))
+        })
+        .collect();
+    let mut g = Galley::concat(Arc::new(job), &galleys, ui.ctx().pixels_per_point());
+    // A part that ends at a first row is no line's end; a line's rest is indented.
+    let mut row = 0;
+    for (i, ((_, rest), part)) in parts.iter().zip(&galleys).enumerate() {
+        let n = part.rows.len();
+        for r in g.rows.iter_mut().skip(row).take(n) {
+            if *rest {
+                r.pos.x += indent;
+            }
         }
-        prev_newline = row.ends_with_newline;
+        let ends_first_row = !*rest
+            && parts
+                .get(i.saturating_add(1))
+                .is_some_and(|(_, next)| *next);
+        if ends_first_row && let Some(r) = g.rows.get_mut(row.saturating_add(n).saturating_sub(1)) {
+            r.ends_with_newline = false;
+        }
+        row = row.saturating_add(n);
     }
-    let mut rect = g.rect;
-    let mut mesh = g.mesh_bounds;
-    for row in &g.rows {
-        rect = rect.union(row.rect());
-        mesh = mesh.union(row.visuals.mesh_bounds.translate(row.pos.to_vec2()));
+    let mut rect = Rect::NOTHING;
+    let mut mesh = Rect::NOTHING;
+    for r in &g.rows {
+        rect = rect.union(r.rect());
+        mesh = mesh.union(r.visuals.mesh_bounds.translate(r.pos.to_vec2()));
     }
     g.rect = rect;
     g.mesh_bounds = mesh;
     Arc::new(g)
+}
+
+/// Cuts a [`LayoutJob`] into consecutive byte ranges, walking its sections once.
+#[derive(Default)]
+struct SectionCursor {
+    next: usize,
+}
+
+impl SectionCursor {
+    /// The part of `job` in `range` (after every earlier range), wrapped at `width`.
+    fn sub_job(&mut self, job: &LayoutJob, range: Range<usize>, width: f32) -> LayoutJob {
+        let mut out = LayoutJob {
+            text: job.text.get(range.clone()).unwrap_or("").to_string(),
+            wrap: job.wrap.clone(),
+            first_row_min_height: job.first_row_min_height,
+            break_on_newline: job.break_on_newline,
+            halign: job.halign,
+            justify: job.justify,
+            round_output_to_gui: job.round_output_to_gui,
+            ..Default::default()
+        };
+        out.wrap.max_width = width;
+        let span = |s: &egui::text::LayoutSection| s.byte_range.start.0..s.byte_range.end.0;
+        // Sections wholly before this range are done with (the last one may still give an
+        // empty final line its font).
+        while job.sections.get(self.next).map(span).is_some_and(|r| {
+            r.end <= range.start && self.next.saturating_add(1) < job.sections.len()
+        }) {
+            self.next += 1;
+        }
+        for s in job.sections.iter().skip(self.next) {
+            let r = span(s);
+            if r.start >= range.end && !out.sections.is_empty() {
+                break;
+            }
+            let a = r.start.max(range.start);
+            let b = r.end.min(range.end);
+            if a < b || (range.is_empty() && out.sections.is_empty()) {
+                let (a, b) = (a.min(range.end), b.max(a).min(range.end));
+                out.sections.push(egui::text::LayoutSection {
+                    leading_space: if a == r.start { s.leading_space } else { 0.0 },
+                    byte_range: egui::text::ByteIndex(a.saturating_sub(range.start))
+                        ..egui::text::ByteIndex(b.saturating_sub(range.start)),
+                    format: s.format.clone(),
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Byte ranges of `query` in `text`.
@@ -578,14 +698,12 @@ fn jump_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
     let g = p.layout_no_wrap(label, font, t.jump_text);
     p.galley(pos(x, cy - g.size().y / 2.0), g, t.jump_text);
 
-    // Dividers around the AI suggestion button, then √x (symbols).
+    // A divider between the AI suggestion button and √x (symbols).
     let sep_x = header.right() - 35.0;
-    for x in [sep_x, sep_x - 35.0] {
-        p.line_segment(
-            [pos(x, cy - 8.0), pos(x, cy + 8.0)],
-            Stroke::new(1.0, t.divider.gamma_multiply(0.8)),
-        );
-    }
+    p.line_segment(
+        [pos(sep_x, cy - 8.0), pos(sep_x, cy + 8.0)],
+        Stroke::new(1.0, t.divider.gamma_multiply(0.8)),
+    );
     let mut open = st.inline_open;
     crate::ai_inline::header_button(ui, t, session, &mut open, inline_button(header));
     if open && !st.inline_open {
@@ -1297,17 +1415,22 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
 
     // ---- Keys we handle before the text widget sees them.
     let mut pushed = st.push_selection.take() == Some(active);
-    // An inline AI suggestion: Tab inserts it, ⌘→ its next word, Esc drops it.
+    // An inline AI suggestion: Tab inserts it, ⌘→ its next sentence, Esc drops it.
     if has_focus && st.completion.is_none() && session.inline_suggestion().is_some() {
-        let (tab, word, esc) = ui.input_mut(|i| {
+        let (tab, sentence, esc) = ui.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::Tab),
                 i.consume_key(Modifiers::COMMAND, Key::ArrowRight),
                 i.consume_key(Modifiers::NONE, Key::Escape),
             )
         });
-        if tab || word {
-            if session.inline_accept(word).is_ok() {
+        if tab || sentence {
+            let part = if tab {
+                texcraft_engine::inline::Accept::All
+            } else {
+                texcraft_engine::inline::Accept::Sentence
+            };
+            if session.inline_accept(part).is_ok() {
                 pushed = true;
             }
         } else if esc {
@@ -1540,11 +1663,10 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                     if let Some((_, b, g)) = ghost.as_ref().filter(|_| text_hash(text) == hash) {
                         crate::ai_inline::splice_ghost(&mut job, *b, g, &font, t.ghost_text);
                     }
-                    let galley = ui.fonts_mut(|f| f.layout_job(job));
                     if wrap {
-                        hanging_indent(galley, hang)
+                        layout_hanging(ui, job, hang)
                     } else {
-                        galley
+                        ui.fonts_mut(|f| f.layout_job(job))
                     }
                 };
                 let Some(doc) = session.docs.get_mut(active) else {
@@ -1570,11 +1692,11 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                     .show(ui);
                 changed = out.response.response.changed();
                 if let Some(range) = out.cursor_range {
-                    let clean = ui.fonts_mut(|f| f.layout_job((*out.galley.job).clone()));
+                    let job = (*out.galley.job).clone();
                     let clean = if wrap {
-                        hanging_indent(clean, hang)
+                        layout_hanging(ui, job, hang)
                     } else {
-                        clean
+                        ui.fonts_mut(|f| f.layout_job(job))
                     };
                     let right = ui.max_rect().right().max(ui.clip_rect().right()) - 4.0;
                     paint_selection(
@@ -1722,15 +1844,22 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     }
 
     // ---- Mirror the selection back into the session.
+    let mut selection_moved = false;
     if let (Some(c), Some(doc)) = (cursor_range, session.docs.get_mut(active)) {
         let n = doc.text.chars().count();
+        let before = doc.selection;
         doc.selection = Selection {
             anchor: c.secondary.index.0.min(n),
             cursor: c.primary.index.0.min(n),
         };
+        selection_moved = doc.selection != before;
         st.caret_line = edit::line_of_char(&doc.text, doc.selection.cursor);
     }
     st.caret_moved = st.caret_line != caret_line_before;
+    if !changed && selection_moved {
+        // Only typing asks for AI suggestions; moving the caret drops them.
+        session.inline_after_caret_move();
+    }
     if changed {
         session.note_edit();
         if auto_complete || st.completion.is_some() {
@@ -1957,6 +2086,61 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Soft wrap with a hanging indent: first rows as wide as unwrapped text allows, the rest
+    /// indented, every character in place (the ghost text's first row ended a few characters
+    /// early, 2026-10-17).
+    #[test]
+    fn hanging_indent_keeps_first_rows_full_width() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::monospace(12.0);
+            let (w, indent) = (300.0, 24.0);
+            let long = "word ".repeat(40);
+            let cjk = "这回次旅行恰逢其时，我们于金秋九月出发，踏上了这座城市。".repeat(3);
+            let mut job = LayoutJob::default();
+            for (text, color) in [
+                ("short\n", Color32::WHITE),
+                (long.as_str(), Color32::RED),
+                ("\n\n", Color32::WHITE),
+                (cjk.as_str(), Color32::GREEN),
+                ("\nend\n", Color32::WHITE),
+            ] {
+                job.append(text, 0.0, TextFormat::simple(font.clone(), color));
+            }
+            job.wrap.max_width = w;
+            let text = job.text.clone();
+            let g = layout_hanging(ui, job.clone(), indent);
+            let chars: usize = g
+                .rows
+                .iter()
+                .map(|r| r.glyphs.len() + usize::from(r.ends_with_newline))
+                .sum();
+            assert_eq!(chars, text.chars().count());
+            let plain = ui.fonts_mut(|f| f.layout_job(job));
+            // Line starts at the margin, as wide as without the indent; wrapped rows indented.
+            let mut first = true;
+            for (i, r) in g.rows.iter().enumerate() {
+                if first {
+                    assert_eq!(r.pos.x, 0.0, "row {i}");
+                } else {
+                    assert_eq!(r.pos.x, indent, "row {i}");
+                }
+                assert!(r.rect().right() <= w + 0.5, "row {i} too wide");
+                first = r.ends_with_newline;
+            }
+            // The long lines' first rows hold what an unindented layout puts there.
+            assert_eq!(g.rows[1].glyphs.len(), plain.rows[1].glyphs.len());
+            assert!(g.rows.len() >= plain.rows.len());
+            // A cursor round trip through the laid-out rows.
+            let end = egui::text::CCursor::new(text.chars().count());
+            assert_eq!(
+                g.cursor_from_pos(g.pos_from_cursor(end).center().to_vec2()),
+                end
+            );
+        });
+        out.textures_delta.clear();
+    }
 
     #[test]
     fn job_sections_cover_text_and_split_on_highlights() {

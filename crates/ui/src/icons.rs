@@ -1604,15 +1604,3 @@ pub fn copy(p: &Painter, r: Rect, c: Color32) {
         w,
     ));
 }
-
-/// An arrow into a text line (Insert at the caret).
-pub fn insert(p: &Painter, r: Rect, c: Color32) {
-    let u = unit(r);
-    let w = s(c, 1.3 * u);
-    p.line_segment([g(r, 8.0, 2.0), g(r, 8.0, 9.5)], w);
-    p.add(Shape::line(
-        vec![g(r, 5.0, 6.8), g(r, 8.0, 9.8), g(r, 11.0, 6.8)],
-        w,
-    ));
-    p.line_segment([g(r, 2.5, 13.5), g(r, 13.5, 13.5)], w);
-}

@@ -12,6 +12,8 @@ serde.workspace = true
 serde_json.workspace = true
 aes-gcm = "0.10"
 getrandom = "0.4"
+# Images attached to questions go as base64 (already in the tree through usvg).
+base64 = "0.22"
 
 [lints]
 workspace = true

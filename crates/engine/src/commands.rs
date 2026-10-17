@@ -217,6 +217,11 @@ fn always(_: &Session) -> bool {
 fn has_doc(s: &Session) -> bool {
     s.doc().is_some()
 }
+/// Native text editing (⌘Z, ⌘X, ⌘C, ⌘V, ⌘A) also serves the text fields of the Settings and
+/// welcome windows, which may be open with no document.
+fn native_edit(_: &Session) -> bool {
+    true
+}
 fn has_inline_suggestion(s: &Session) -> bool {
     s.inline_suggestion().is_some()
 }
@@ -229,6 +234,18 @@ fn is_running(s: &Session) -> bool {
 }
 fn can_typeset(s: &Session) -> bool {
     s.root_path().is_some()
+}
+/// The engine is chosen by hand only with Auto-Sense off; otherwise Auto-Sense picks it.
+fn engine_choosable(s: &Session) -> bool {
+    !s.settings.auto_sense
+}
+/// The engine menu ticks the engine in use while Auto-Sense picks it, the chosen one otherwise.
+fn engine_checked(s: &Session, e: Engine) -> bool {
+    if s.settings.auto_sense {
+        s.effective_engine() == e
+    } else {
+        s.settings.engine == e
+    }
 }
 fn has_back(s: &Session) -> bool {
     s.history_pos > 0
@@ -817,6 +834,37 @@ static REGISTRY: &[CommandSpec] = &[
         }
     ),
     cmd!(
+        "ai.attachImage",
+        "Attach Image…",
+        None,
+        0,
+        None,
+        always,
+        |s, p| {
+            let path = std::path::PathBuf::from(param_str(p, "path")?);
+            s.ai_attach_file(&path)
+        },
+        params = "{path: string} — a PNG, JPEG, GIF or WebP file, for a model with Vision"
+    ),
+    cmd!(
+        "ai.removeImage",
+        "Remove Image",
+        None,
+        0,
+        None,
+        always,
+        |s, p| {
+            let i = param_u32(p, "index")? as usize;
+            if i < s.ai.draft_images.len() {
+                s.ai.draft_images.remove(i);
+                Ok(())
+            } else {
+                Err(CommandError::Params(format!("no image {i}")))
+            }
+        },
+        params = "{index: number} — an image attached to the question being written"
+    ),
+    cmd!(
         "ai.clear",
         "New Conversation",
         None,
@@ -917,7 +965,16 @@ static REGISTRY: &[CommandSpec] = &[
         0,
         None,
         has_inline_suggestion,
-        |s, _| s.inline_accept(false)
+        |s, _| s.inline_accept(crate::inline::Accept::All)
+    ),
+    cmd!(
+        "ai.inline.acceptSentence",
+        "Accept Next Sentence of Suggestion",
+        None,
+        0,
+        None,
+        has_inline_suggestion,
+        |s, _| s.inline_accept(crate::inline::Accept::Sentence)
     ),
     cmd!(
         "ai.inline.acceptWord",
@@ -926,7 +983,7 @@ static REGISTRY: &[CommandSpec] = &[
         0,
         None,
         has_inline_suggestion,
-        |s, _| s.inline_accept(true)
+        |s, _| s.inline_accept(crate::inline::Accept::Word)
     ),
     cmd!(
         "ai.inline.dismiss",
@@ -1060,7 +1117,7 @@ static REGISTRY: &[CommandSpec] = &[
         Edit,
         0,
         Some(Shortcut::cmd("Z")),
-        has_doc,
+        native_edit,
         |s, _| {
             s.effect(Effect::Native(NativeEdit::Undo));
             Ok(())
@@ -1072,7 +1129,7 @@ static REGISTRY: &[CommandSpec] = &[
         Edit,
         0,
         Some(Shortcut::cmd_shift("Z")),
-        has_doc,
+        native_edit,
         |s, _| {
             s.effect(Effect::Native(NativeEdit::Redo));
             Ok(())
@@ -1084,7 +1141,7 @@ static REGISTRY: &[CommandSpec] = &[
         Edit,
         1,
         Some(Shortcut::cmd("X")),
-        has_doc,
+        native_edit,
         |s, _| {
             s.effect(Effect::Native(NativeEdit::Cut));
             Ok(())
@@ -1096,7 +1153,7 @@ static REGISTRY: &[CommandSpec] = &[
         Edit,
         1,
         Some(Shortcut::cmd("C")),
-        has_doc,
+        native_edit,
         |s, _| {
             s.effect(Effect::Native(NativeEdit::Copy));
             Ok(())
@@ -1108,7 +1165,7 @@ static REGISTRY: &[CommandSpec] = &[
         Edit,
         1,
         Some(Shortcut::cmd("V")),
-        has_doc,
+        native_edit,
         |s, _| {
             s.effect(Effect::Native(NativeEdit::Paste));
             Ok(())
@@ -1120,7 +1177,7 @@ static REGISTRY: &[CommandSpec] = &[
         Edit,
         1,
         Some(Shortcut::cmd("A")),
-        has_doc,
+        native_edit,
         |s, _| {
             s.effect(Effect::Native(NativeEdit::SelectAll));
             Ok(())
@@ -1633,9 +1690,9 @@ static REGISTRY: &[CommandSpec] = &[
         Typeset,
         3,
         None,
-        always,
+        engine_choosable,
         |s, _| set_engine(s, Engine::PdfLatex),
-        checked = |s| s.settings.engine == Engine::PdfLatex
+        checked = |s| engine_checked(s, Engine::PdfLatex)
     ),
     cmd!(
         "typeset.engine.xelatex",
@@ -1643,9 +1700,9 @@ static REGISTRY: &[CommandSpec] = &[
         Typeset,
         3,
         None,
-        always,
+        engine_choosable,
         |s, _| set_engine(s, Engine::XeLatex),
-        checked = |s| s.settings.engine == Engine::XeLatex
+        checked = |s| engine_checked(s, Engine::XeLatex)
     ),
     cmd!(
         "typeset.engine.lualatex",
@@ -1653,9 +1710,9 @@ static REGISTRY: &[CommandSpec] = &[
         Typeset,
         3,
         None,
-        always,
+        engine_choosable,
         |s, _| set_engine(s, Engine::LuaLatex),
-        checked = |s| s.settings.engine == Engine::LuaLatex
+        checked = |s| engine_checked(s, Engine::LuaLatex)
     ),
     cmd!(
         "typeset.engine.tectonic",
@@ -1663,9 +1720,9 @@ static REGISTRY: &[CommandSpec] = &[
         Typeset,
         3,
         None,
-        always,
+        engine_choosable,
         |s, _| set_engine(s, Engine::Tectonic),
-        checked = |s| s.settings.engine == Engine::Tectonic
+        checked = |s| engine_checked(s, Engine::Tectonic)
     ),
     cmd!(
         "typeset.configuration",

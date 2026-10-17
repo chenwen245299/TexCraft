@@ -48,6 +48,8 @@ pub struct Welcome {
     glass: bool,
     /// Bring the window to the front on the next frame.
     focus: bool,
+    /// Edit events from the menu bar (⌘V and co.) for the filter field.
+    pub(crate) edit_events: Vec<egui::Event>,
 }
 
 impl Welcome {
@@ -128,6 +130,7 @@ pub fn show(
         }
         ctx.show_viewport_immediate(welcome_viewport(), builder, |ui, _class| {
             let ctx = ui.ctx().clone();
+            crate::widgets::feed_edit_events(&ctx, &mut w.edit_events);
             if ctx.input(|i| i.viewport().close_requested()) {
                 pick = Some(Pick::Close);
             }

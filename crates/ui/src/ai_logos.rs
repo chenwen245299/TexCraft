@@ -1,7 +1,8 @@
 //! Logos of AI providers and model families, shown in the Assistant's model menu, its answers
 //! and Settings → AI. The SVGs come from LobeHub's icon set (Apache-2.0, see ATTRIBUTION.md)
 //! by way of Argus; they identify the services and imply no endorsement. Monochrome logos are
-//! drawn in the text colour (dark mode included); the others keep their colours.
+//! drawn in the text colour (dark mode included); the others keep their colours. SoCLaaS shows
+//! the NUS crest (a PNG, also by way of Argus).
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -11,6 +12,13 @@ use texcraft_ai::Provider;
 
 /// (key, SVG, monochrome)
 const LOGOS: &[(&str, &[u8], bool)] = &[
+    // Not a provider: the AI Suggestions button's copilot (drawn for TexCraft, see
+    // ATTRIBUTION.md), loaded and tinted like the monochrome logos.
+    (
+        "icons/copilot",
+        include_bytes!("../../../assets/icons/copilot.svg"),
+        true,
+    ),
     (
         "providers/MoleAPI",
         include_bytes!("../../../assets/ai-logos/providers/MoleAPI.svg"),
@@ -288,24 +296,50 @@ const LOGOS: &[(&str, &[u8], bool)] = &[
     ),
 ];
 
-/// Logo key → (SVG bytes to load, monochrome).
-type Sources = HashMap<&'static str, (Arc<[u8]>, bool)>;
+/// (key, PNG): logos that only exist as pictures, drawn in their own colours.
+const PNG_LOGOS: &[(&str, &[u8])] = &[(
+    "providers/nus",
+    include_bytes!("../../../assets/nus/nus.png"),
+)];
 
-/// The SVG bytes to load: monochrome logos are recoloured white so a tint gives any colour.
+/// A logo ready to load.
+struct Source {
+    data: Arc<[u8]>,
+    /// Drawn in the ink colour.
+    mono: bool,
+    /// `svg` or `png`: picks egui's loader.
+    ext: &'static str,
+}
+
+/// Logo key → its bytes.
+type Sources = HashMap<&'static str, Source>;
+
+/// The bytes to load: monochrome SVGs are recoloured white so a tint gives any colour.
 fn sources() -> &'static Sources {
     static SOURCES: OnceLock<Sources> = OnceLock::new();
     SOURCES.get_or_init(|| {
-        LOGOS
-            .iter()
-            .map(|(key, bytes, mono)| {
-                let data: Arc<[u8]> = if *mono {
-                    Arc::from(recolour(&String::from_utf8_lossy(bytes)).into_bytes())
-                } else {
-                    Arc::from(*bytes)
-                };
-                (*key, (data, *mono))
-            })
-            .collect()
+        let svgs = LOGOS.iter().map(|(key, bytes, mono)| {
+            let data: Arc<[u8]> = if *mono {
+                Arc::from(recolour(&String::from_utf8_lossy(bytes)).into_bytes())
+            } else {
+                Arc::from(*bytes)
+            };
+            let source = Source {
+                data,
+                mono: *mono,
+                ext: "svg",
+            };
+            (*key, source)
+        });
+        let pngs = PNG_LOGOS.iter().map(|(key, bytes)| {
+            let source = Source {
+                data: Arc::from(*bytes),
+                mono: false,
+                ext: "png",
+            };
+            (*key, source)
+        });
+        svgs.chain(pngs).collect()
     })
 }
 
@@ -329,28 +363,43 @@ fn recolour(svg: &str) -> String {
     }
 }
 
-/// The logo for `model` served by `provider`: the model maker's when the name says who that is,
-/// else the provider's. SoCLaaS model names are private aliases its operators can repoint, so they
-/// get the provider's logo (none yet) and nothing is read into them.
-pub fn for_model(provider: &Provider, model: &str) -> Option<&'static str> {
+/// The logo for model `m` of `provider`: its maker's when the model's id or display name says
+/// who that is, else the provider's. SoCLaaS ids are aliases its operators can repoint, so only
+/// its display names (the operators' own words, "Testing GLM 5.3 Flash") are read.
+pub fn for_entry(provider: &Provider, m: &texcraft_ai::Model) -> Option<&'static str> {
+    let by_name = Some(m.name.trim())
+        .filter(|n| !n.is_empty())
+        .and_then(self::model);
     if texcraft_ai::is_soclaas(provider) {
-        return self::provider(provider);
+        return by_name.or_else(|| self::provider(provider));
     }
-    self::model(model).or_else(|| self::provider(provider))
+    self::model(&m.id)
+        .or(by_name)
+        .or_else(|| self::provider(provider))
+}
+
+/// The logo for model `id` of `provider` ([`for_entry`] with the model's display name when the
+/// provider lists it).
+pub fn for_model(provider: &Provider, id: &str) -> Option<&'static str> {
+    match provider.models.iter().find(|m| m.id == id) {
+        Some(m) => for_entry(provider, m),
+        None if texcraft_ai::is_soclaas(provider) => self::provider(provider),
+        None => self::model(id).or_else(|| self::provider(provider)),
+    }
 }
 
 /// Draws logo `key` (`"providers/claude"`, `"models/openai"`, …) into `rect`; monochrome logos
 /// take `ink`.
 pub fn paint(ui: &Ui, key: &str, rect: Rect, ink: Color32) {
-    let Some((data, mono)) = sources().get(key) else {
+    let Some(source) = sources().get(key) else {
         return;
     };
     let image = egui::Image::new(egui::ImageSource::Bytes {
-        uri: format!("bytes://texcraft/ai-logos/{key}.svg").into(),
-        bytes: egui::load::Bytes::Shared(data.clone()),
+        uri: format!("bytes://texcraft/ai-logos/{key}.{}", source.ext).into(),
+        bytes: egui::load::Bytes::Shared(source.data.clone()),
     })
     .fit_to_exact_size(rect.size());
-    let image = if *mono { image.tint(ink) } else { image };
+    let image = if source.mono { image.tint(ink) } else { image };
     image.paint_at(ui, rect);
 }
 
@@ -363,7 +412,9 @@ pub fn provider(p: &Provider) -> Option<&'static str> {
     let id = p.id.to_ascii_lowercase();
     let url = p.base_url.to_ascii_lowercase();
     let pick = |needles: &[&str]| needles.iter().any(|n| id.starts_with(n) || url.contains(n));
-    let key = if pick(&["anthropic"]) {
+    let key = if texcraft_ai::is_soclaas(p) {
+        "providers/nus"
+    } else if pick(&["anthropic"]) {
         "providers/claude"
     } else if pick(&["openrouter"]) {
         "providers/openrouter"
@@ -480,12 +531,8 @@ mod tests {
             Some("providers/openrouter")
         );
         assert_eq!(provider(&p("custom-2", "https://example.com/v1")), None);
-        // Every preset but Custom and SoCLaaS (whose NUS mark is not openly licensed) shows its
-        // own logo.
-        for preset in texcraft_ai::PRESETS
-            .iter()
-            .filter(|x| x.id != "custom" && x.id != "soclaas")
-        {
+        // Every preset but Custom shows its own logo.
+        for preset in texcraft_ai::PRESETS.iter().filter(|x| x.id != "custom") {
             let key = provider(&p(preset.id, preset.base_url));
             assert!(key.is_some_and(has), "{}", preset.id);
         }
@@ -509,9 +556,37 @@ mod tests {
         assert_eq!(model("mimo-v2-flash"), Some("models/xiaomimimo"));
         assert_eq!(model("step-3.5-flash"), Some("models/stepfun"));
         assert_eq!(model("kimi-k2-turbo-preview"), Some("models/kimi"));
-        // SoCLaaS aliases say nothing about the model behind them.
+        // SoCLaaS shows the NUS crest, also for its models: their aliases say nothing about
+        // the model behind them.
         let nus = p("soclaas", texcraft_ai::SOCLAAS_BASE_URL);
-        assert_eq!(for_model(&nus, "gpt-private-alias"), None);
+        assert_eq!(provider(&nus), Some("providers/nus"));
+        assert_eq!(for_model(&nus, "gpt-private-alias"), Some("providers/nus"));
+        // …but its display names are the operators' word: GLM's and DeepSeek's logos.
+        let glm = texcraft_ai::Model {
+            id: "x-test-1".into(),
+            name: "Testing GLM 5.3 Flash".into(),
+            ..Default::default()
+        };
+        assert_eq!(for_entry(&nus, &glm), Some("models/zhipu"));
+        let ds = texcraft_ai::Model {
+            id: "x-test-2".into(),
+            name: "Testing DeepSeek V4.1 Flash".into(),
+            ..Default::default()
+        };
+        assert_eq!(for_entry(&nus, &ds), Some("models/deepseek"));
+        let alias = texcraft_ai::Model {
+            id: "deepseek-alias".into(),
+            ..Default::default()
+        };
+        assert_eq!(for_entry(&nus, &alias), Some("providers/nus"));
+        let mut listed = nus.clone();
+        listed.models = vec![glm];
+        assert_eq!(for_model(&listed, "x-test-1"), Some("models/zhipu"));
+        let named = Provider {
+            name: "My SoCLaaS".into(),
+            ..p("custom-3", "https://example.com/v1")
+        };
+        assert_eq!(provider(&named), Some("providers/nus"));
         let openai = p("openai", "https://api.openai.com/v1");
         assert_eq!(for_model(&openai, "gpt-4.1"), Some("models/openai"));
         assert_eq!(model("claude-opus-5-5"), Some("models/claude"));
@@ -520,11 +595,11 @@ mod tests {
         assert_eq!(model("google/gemini-2.5-pro"), Some("models/gemini"));
         assert_eq!(model("qwen3-coder"), Some("models/qwen"));
         assert_eq!(model("something-else"), None);
-        // Every logo loads: the bytes are SVG and mono ones were recoloured.
-        for (key, (data, mono)) in sources() {
-            let text = String::from_utf8_lossy(data);
+        // Every SVG logo is SVG and mono ones were recoloured.
+        for (key, source) in sources().iter().filter(|(_, s)| s.ext == "svg") {
+            let text = String::from_utf8_lossy(&source.data);
             assert!(text.contains("<svg"), "{key}");
-            if *mono {
+            if source.mono {
                 assert!(!text.contains("currentColor"), "{key}");
             }
         }
@@ -536,8 +611,8 @@ mod tests {
     fn every_logo_renders() {
         use resvg::{tiny_skia, usvg};
         let mut broken = Vec::new();
-        for (key, (data, _)) in sources() {
-            let tree = match usvg::Tree::from_data(data, &usvg::Options::default()) {
+        for (key, source) in sources().iter().filter(|(_, s)| s.ext == "svg") {
+            let tree = match usvg::Tree::from_data(&source.data, &usvg::Options::default()) {
                 Ok(t) => t,
                 Err(e) => {
                     broken.push(format!("{key}: {e}"));
@@ -559,5 +634,33 @@ mod tests {
             }
         }
         assert!(broken.is_empty(), "{broken:#?}");
+    }
+
+    /// Every PNG logo loads through egui's image loaders, as `paint` draws it.
+    #[test]
+    fn every_png_logo_loads() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        for (key, source) in sources().iter().filter(|(_, s)| s.ext == "png") {
+            let uri = format!("bytes://texcraft/ai-logos/{key}.png");
+            ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(source.data.clone()));
+            let mut size = None;
+            for _ in 0..500 {
+                match ctx.try_load_image(&uri, egui::SizeHint::default()) {
+                    Ok(egui::load::ImagePoll::Ready { image }) => {
+                        size = Some(image.size);
+                        break;
+                    }
+                    Ok(egui::load::ImagePoll::Pending { .. }) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{key}: {e}"),
+                }
+            }
+            assert!(
+                size.is_some_and(|[w, h]| w >= 64 && h >= 64),
+                "{key}: {size:?}"
+            );
+        }
     }
 }

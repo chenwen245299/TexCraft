@@ -9,6 +9,9 @@
 //! server-sent events, parsed here into [`Event`]s on a background thread ([`Job`]).
 
 pub mod inline;
+pub mod models;
+
+pub use models::{Capability, Model};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -56,8 +59,9 @@ pub struct Provider {
     /// it is never written to `ai.json`, shown or reported).
     #[serde(skip)]
     pub has_key: bool,
-    /// Model ids offered in the Assistant.
-    pub models: Vec<String>,
+    /// Its models (id, display name, capabilities), in the order they were added. Settings
+    /// from before models had names list plain ids; they read too.
+    pub models: Vec<Model>,
     /// Shown in the Assistant's model menu.
     pub enabled: bool,
 }
@@ -299,7 +303,7 @@ impl Config {
             kind: preset.kind,
             base_url: preset.base_url.to_string(),
             has_key: false,
-            models: preset.models.iter().map(|m| (*m).to_string()).collect(),
+            models: preset.models.iter().map(|m| Model::from_id(m)).collect(),
             enabled: true,
         });
         self.normalize();
@@ -308,7 +312,8 @@ impl Config {
 
     /// The chosen provider and model, falling back to the first usable ones.
     pub fn selection(&self) -> Option<(&Provider, &str)> {
-        let usable = |p: &&Provider| p.enabled && !p.models.is_empty();
+        // Chat models only: embedding, audio and image-generation models are not for talking to.
+        let usable = |p: &&Provider| p.enabled && p.models.iter().any(Model::chats);
         let p = self
             .providers
             .iter()
@@ -318,9 +323,10 @@ impl Config {
         let m = p
             .models
             .iter()
-            .find(|m| **m == self.model)
-            .or_else(|| p.models.first())?;
-        Some((p, m.as_str()))
+            .filter(|m| m.chats())
+            .find(|m| m.id == self.model)
+            .or_else(|| p.models.iter().find(|m| m.chats()))?;
+        Some((p, m.id.as_str()))
     }
 
     /// The provider and model for inline suggestions: the ones chosen for them, else the
@@ -334,8 +340,9 @@ impl Config {
             .and_then(|p| {
                 p.models
                     .iter()
-                    .find(|m| **m == self.inline.model)
-                    .map(|m| (p, m.as_str()))
+                    .filter(|m| m.chats())
+                    .find(|m| m.id == self.inline.model)
+                    .map(|m| (p, m.id.as_str()))
             });
         chosen.or_else(|| self.selection())
     }
@@ -343,8 +350,12 @@ impl Config {
     /// Keeps the choice valid after edits.
     pub fn normalize(&mut self) {
         for p in &mut self.providers {
-            p.models.retain(|m| !m.trim().is_empty());
-            p.models.dedup();
+            for m in &mut p.models {
+                m.normalize();
+            }
+            p.models.retain(|m| !m.id.is_empty());
+            let mut seen = std::collections::HashSet::new();
+            p.models.retain(|m| seen.insert(m.id.clone()));
         }
         if let Some((p, m)) = self.selection().map(|(p, m)| (p.id.clone(), m.to_string())) {
             self.provider = p;
@@ -551,6 +562,48 @@ pub struct Turn {
     /// For assistant turns of the Anthropic API: the content blocks as received (thinking
     /// blocks included), sent back unchanged.
     pub blocks: Vec<Value>,
+    /// Images attached to a user turn (for models with vision).
+    pub images: Vec<Image>,
+}
+
+/// An image attached to a question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    /// The file's bytes, shared (every later turn sends the image again).
+    pub data: Arc<[u8]>,
+    /// Its file name (shown, never sent).
+    pub name: String,
+}
+
+impl Image {
+    /// The image as a `data:` URL (OpenAI-compatible APIs).
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.base64())
+    }
+
+    /// The bytes in base64 (Anthropic's `source.data`).
+    pub fn base64(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&self.data[..])
+    }
+}
+
+/// The image format of `bytes` from its magic numbers: what the chat APIs take (PNG, JPEG, GIF,
+/// WebP), else `None`.
+pub fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 /// A request: the provider, model, instructions and conversation.
@@ -569,6 +622,10 @@ pub struct ChatRequest {
     pub turns: Vec<Turn>,
     /// The longest answer, in tokens (`None`: as long as the model allows, for chat).
     pub max_tokens: Option<u32>,
+    /// Ask the model to answer without reasoning first, where the provider has a switch for it
+    /// (inline suggestions: a thinking model spends their small budget thinking and writes
+    /// nothing).
+    pub no_reasoning: bool,
 }
 
 /// Models that accept Anthropic's server-side refusal fallback (`fallbacks: "default"`).
@@ -611,6 +668,22 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
                 .turns
                 .iter()
                 .map(|t| match t.role {
+                    // Images go before the question, as Anthropic recommends.
+                    Role::User if !t.images.is_empty() => {
+                        let mut content: Vec<Value> = t
+                            .images
+                            .iter()
+                            .map(|i| {
+                                json!({"type": "image", "source": {"type": "base64",
+                                    "media_type": i.media_type, "data": i.base64()}})
+                            })
+                            .collect();
+                        // An image alone goes without a text block (Anthropic refuses empty ones).
+                        if !t.text.trim().is_empty() {
+                            content.push(json!({ "type": "text", "text": t.text }));
+                        }
+                        json!({ "role": "user", "content": content })
+                    }
                     Role::User => json!({ "role": "user", "content": t.text }),
                     Role::Assistant if !t.blocks.is_empty() => {
                         json!({ "role": "assistant", "content": echo_blocks(&t.blocks) })
@@ -643,10 +716,24 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
         Kind::OpenAi => {
             let mut messages = vec![json!({ "role": "system", "content": req.system })];
             messages.extend(req.turns.iter().map(|t| {
-                json!({
-                    "role": if t.role == Role::User { "user" } else { "assistant" },
-                    "content": t.text,
-                })
+                let role = if t.role == Role::User {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                if t.role == Role::User && !t.images.is_empty() {
+                    // Text and images as content parts; the images as data URLs.
+                    let mut content = Vec::new();
+                    if !t.text.trim().is_empty() {
+                        content.push(json!({ "type": "text", "text": t.text }));
+                    }
+                    content.extend(t.images.iter().map(
+                        |i| json!({ "type": "image_url", "image_url": { "url": i.data_url() } }),
+                    ));
+                    json!({ "role": role, "content": content })
+                } else {
+                    json!({ "role": role, "content": t.text })
+                }
             }));
             let mut headers = vec!["content-type: application/json".to_string()];
             let key = req.api_key.trim();
@@ -666,6 +753,21 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
             if is_minimax(&req.provider) {
                 // Without it MiniMax puts its chain of thought in the answer, in <think> tags.
                 body["reasoning_split"] = json!(true);
+            }
+            if req.no_reasoning {
+                if is_soclaas(&req.provider) {
+                    // SoCLaaS takes OpenAI's switch; x-test-1 goes no lower than "low".
+                    let effort = if req.model.eq_ignore_ascii_case("x-test-1") {
+                        "low"
+                    } else {
+                        "none"
+                    };
+                    body["reasoning_effort"] = json!(effort);
+                } else if base.to_ascii_lowercase().contains("dashscope") {
+                    // Qwen's compatible mode gates thinking with a flag of its own (and rejects
+                    // reasoning_effort).
+                    body["enable_thinking"] = json!(false);
+                }
             }
             (format!("{base}/chat/completions"), headers, body)
         }
@@ -953,6 +1055,55 @@ fn curl_quote(s: &str) -> String {
 
 /// Starts curl for `url` with `headers` (and the JSON `body` in a private temp file), the
 /// secrets passed on standard input. Returns the child and the temp file to delete.
+/// Name prefix and extension of the request bodies written for curl.
+const BODY_PREFIX: &str = "texcraft-ai-";
+const BODY_EXT: &str = ".json";
+/// A body older than this is a leftover: curl reads it whole before it sends a byte.
+const BODY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes request bodies left in `dir` (`texcraft-ai-<pid>-<time>.json`, written for curl and
+/// removed when the request ends) that are older than `max_age`: a crash or a forced quit
+/// mid-request leaves one behind, with the question, the document and its images. Returns how
+/// many went.
+pub fn sweep_request_files(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(BODY_PREFIX) && name.ends_with(BODY_EXT)
+        })
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age > max_age)
+        })
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
+/// [`sweep_request_files`] in the temp folder, at most once a minute (at start-up and as requests
+/// go out).
+pub fn sweep_stale_request_files() -> usize {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < BODY_MAX_AGE.as_secs() {
+        return 0;
+    }
+    LAST.store(now.max(1), Ordering::Relaxed);
+    sweep_request_files(&std::env::temp_dir(), BODY_MAX_AGE)
+}
+
 fn spawn_curl(
     url: &str,
     headers: &[String],
@@ -965,8 +1116,9 @@ fn spawn_curl(
     }
     let body_file = match body {
         Some(b) => {
+            sweep_stale_request_files();
             let path = std::env::temp_dir().join(format!(
-                "texcraft-ai-{}-{}.json",
+                "{BODY_PREFIX}{}-{}{BODY_EXT}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1109,7 +1261,7 @@ pub fn start(req: &ChatRequest, waker: Arc<dyn Fn() + Send + Sync>) -> Job {
 
 /// Lists the provider's models (`GET /v1/models` or `/models`). Blocking: call it off the UI
 /// thread.
-pub fn fetch_models(provider: &Provider, api_key: &str) -> Result<Vec<String>, AiError> {
+pub fn fetch_models(provider: &Provider, api_key: &str) -> Result<Vec<Model>, AiError> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let (url, headers) = match provider.kind {
         Kind::Anthropic => (
@@ -1145,29 +1297,48 @@ pub fn fetch_models(provider: &Provider, api_key: &str) -> Result<Vec<String>, A
             msg
         }));
     }
-    parse_models(&out)
+    let mut list = models::parse_models(&out, !is_soclaas(provider))?;
+    if is_ollama(provider) {
+        ollama_capabilities(provider, &mut list);
+    }
+    Ok(list)
 }
 
-/// Model ids from a `/models` answer (`{"data": [{"id": …}]}`, also Ollama's `{"models": …}`).
-pub fn parse_models(body: &str) -> Result<Vec<String>, AiError> {
-    let v: Value =
-        serde_json::from_str(body).map_err(|_| err("the provider sent an unexpected answer"))?;
-    let list = v
-        .get("data")
-        .or_else(|| v.get("models"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| err("the provider sent no model list"))?;
-    let mut ids: Vec<String> = list
-        .iter()
-        .filter_map(|m| {
-            m.get("id")
-                .or_else(|| m.get("name"))
-                .and_then(Value::as_str)
-                .map(|s| s.trim_start_matches("models/").to_string())
-        })
-        .collect();
-    ids.dedup();
-    Ok(ids)
+/// Whether `provider` is an Ollama server (its default port, or the Ollama preset).
+fn is_ollama(provider: &Provider) -> bool {
+    provider.id.starts_with("ollama") || provider.base_url.contains(":11434")
+}
+
+/// Ollama's model list says nothing about what each model does; its `/api/show` does (vision,
+/// tools, thinking, embedding), one model at a time. A model it cannot answer for keeps what
+/// its name shows.
+fn ollama_capabilities(provider: &Provider, list: &mut [Model]) {
+    let base = provider.base_url.trim().trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let url = format!("{root}/api/show");
+    let headers = ["content-type: application/json".to_string()];
+    for m in list.iter_mut().take(200) {
+        let body = json!({ "model": m.id });
+        let Ok((mut child, file)) = spawn_curl(&url, &headers, Some(&body), false) else {
+            continue;
+        };
+        let mut out = String::new();
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_string(&mut out);
+        }
+        let ok = child.wait().is_ok_and(|s| s.success());
+        if let Some(f) = file {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Some(kind) = ok
+            .then(|| serde_json::from_str::<Value>(&out).ok())
+            .flatten()
+            .and_then(|v| models::capabilities_from_show(&v))
+            .filter(|caps| !caps.is_empty())
+        {
+            m.capabilities = kind;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1181,7 +1352,7 @@ mod tests {
             kind,
             base_url: base.into(),
             has_key: true,
-            models: vec!["m".into()],
+            models: vec![Model::from_id("m")],
             enabled: true,
         }
     }
@@ -1199,19 +1370,23 @@ mod tests {
                     role: Role::User,
                     text: "Hi".into(),
                     blocks: vec![],
+                    images: Vec::new(),
                 },
                 Turn {
                     role: Role::Assistant,
                     text: "Hello".into(),
                     blocks: vec![thinking.clone(), json!({"type": "text", "text": "Hello"})],
+                    images: Vec::new(),
                 },
                 Turn {
                     role: Role::User,
                     text: "Table?".into(),
                     blocks: vec![],
+                    images: Vec::new(),
                 },
             ],
             max_tokens: None,
+            no_reasoning: false,
         };
         let (url, headers, body) = build(&req);
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
@@ -1255,8 +1430,10 @@ mod tests {
                 role: Role::User,
                 text: "Q".into(),
                 blocks: vec![],
+                images: Vec::new(),
             }],
             max_tokens: None,
+            no_reasoning: false,
         };
         let (url, headers, body) = build(&req);
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
@@ -1323,10 +1500,196 @@ mod tests {
             api_key: "k".into(),
             turns: vec![],
             max_tokens: None,
+            no_reasoning: false,
         };
         assert_eq!(build(&req).2["reasoning_split"], true);
         req.provider = provider(Kind::OpenAi, "https://api.deepseek.com/v1");
         assert!(build(&req).2.get("reasoning_split").is_none());
+    }
+
+    /// Bodies a crash left behind go once they are a minute old; fresh ones (curl may be about
+    /// to read them) and other files stay.
+    #[test]
+    fn leftover_request_bodies_are_swept() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("texcraft-ai-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("texcraft-ai-123-456.json");
+        let fresh = dir.join("texcraft-ai-123-789.json");
+        let other = dir.join("notes.json");
+        let other_old = dir.join("texcraft-ai-notes.txt");
+        for p in [&old, &fresh, &other, &other_old] {
+            std::fs::write(p, "{}").unwrap();
+        }
+        let past = SystemTime::now() - Duration::from_secs(600);
+        for p in [&old, &other, &other_old] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+        assert_eq!(sweep_request_files(&dir, Duration::from_secs(60)), 1);
+        assert!(!old.exists() && fresh.exists() && other.exists() && other_old.exists());
+        assert_eq!(sweep_request_files(&dir.join("missing"), Duration::ZERO), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A question with an image: content parts with a data URL (OpenAI-compatible), an image
+    /// block before the text (Anthropic); questions without images stay plain strings.
+    #[test]
+    fn images_go_with_the_question_in_each_wire_format() {
+        let png = Image {
+            media_type: "image/png".into(),
+            data: Arc::from(vec![
+                0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3,
+            ]),
+            name: "plot.png".into(),
+        };
+        let turn = |images: Vec<Image>| Turn {
+            role: Role::User,
+            text: "What does this plot show?".into(),
+            blocks: vec![],
+            images,
+        };
+        let req = |kind, base: &str| ChatRequest {
+            provider: provider(kind, base),
+            model: "m".into(),
+            system: "S".into(),
+            api_key: "k".into(),
+            turns: vec![turn(vec![]), turn(vec![png.clone()])],
+            max_tokens: None,
+            no_reasoning: false,
+        };
+        let (_, _, body) = build(&req(Kind::OpenAi, "https://api.openai.com/v1"));
+        assert_eq!(body["messages"][1]["content"], "What does this plot show?");
+        let parts = &body["messages"][2]["content"];
+        assert_eq!(
+            parts[0],
+            json!({"type": "text", "text": "What does this plot show?"})
+        );
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            format!("data:image/png;base64,{}", png.base64())
+        );
+        assert!(png.base64().starts_with("iVBORw0KGgo"));
+        let (_, _, body) = build(&req(Kind::Anthropic, "https://api.anthropic.com"));
+        let blocks = &body["messages"][1]["content"];
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], png.base64());
+        assert_eq!(
+            blocks[1],
+            json!({"type": "text", "text": "What does this plot show?"})
+        );
+        assert_eq!(body["messages"][0]["content"], "What does this plot show?");
+    }
+
+    #[test]
+    fn image_formats_are_read_from_their_bytes() {
+        assert_eq!(
+            image_media_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(image_media_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            image_media_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(image_media_type(b"%PDF-1.7"), None);
+        assert_eq!(image_media_type(b""), None);
+    }
+
+    /// The Assistant chats with chat models: an embedding model listed first is passed over.
+    #[test]
+    fn the_chat_selection_skips_non_chat_models() {
+        let mut c = Config::default();
+        let i = c.add(PRESETS.iter().find(|p| p.id == "soclaas").unwrap());
+        c.providers[i].models = vec![
+            Model::from_id("bge-m3"),
+            Model::from_id("whisper-large-v3"),
+            Model {
+                id: "qwen3.6:35b".into(),
+                name: "Qwen 3.6 35B A3B".into(),
+                ..Model::default()
+            },
+        ];
+        c.normalize();
+        assert_eq!(c.selection().map(|(_, m)| m), Some("qwen3.6:35b"));
+        c.model = "bge-m3".into();
+        assert_eq!(c.selection().map(|(_, m)| m), Some("qwen3.6:35b"));
+        c.providers[i].models.truncate(2);
+        assert!(c.selection().is_none());
+    }
+
+    /// Inline suggestions ask for no reasoning: SoCLaaS's qwen3.5:9b otherwise spent all 144
+    /// tokens thinking and wrote nothing (2026-10-17).
+    #[test]
+    fn suggestions_turn_reasoning_off_where_providers_allow() {
+        let settings = inline::InlineSettings::default();
+        let mut soclaas = provider(Kind::OpenAi, SOCLAAS_BASE_URL);
+        soclaas.id = "soclaas".into();
+        let req = inline::request(
+            &soclaas,
+            "qwen3.5:9b",
+            "k".into(),
+            "a.tex",
+            "x",
+            "",
+            &settings,
+        );
+        assert!(req.no_reasoning);
+        assert_eq!(build(&req).2["reasoning_effort"], "none");
+        // x-test-1 accepts nothing lower than "low".
+        let req = inline::request(
+            &soclaas,
+            "x-test-1",
+            "k".into(),
+            "a.tex",
+            "x",
+            "",
+            &settings,
+        );
+        assert_eq!(build(&req).2["reasoning_effort"], "low");
+        let qwen = provider(
+            Kind::OpenAi,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        );
+        let req = inline::request(
+            &qwen,
+            "qwen3-coder",
+            "k".into(),
+            "a.tex",
+            "x",
+            "",
+            &settings,
+        );
+        let body = build(&req).2;
+        assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
+        // Elsewhere nothing a strict validator could reject; chat keeps reasoning.
+        let openai = provider(Kind::OpenAi, "https://api.openai.com/v1");
+        let req = inline::request(&openai, "gpt-4.1", "k".into(), "a.tex", "x", "", &settings);
+        assert!(build(&req).2.get("reasoning_effort").is_none());
+        let mut chat = inline::request(
+            &soclaas,
+            "qwen3.5:9b",
+            "k".into(),
+            "a.tex",
+            "x",
+            "",
+            &settings,
+        );
+        chat.no_reasoning = false;
+        assert!(build(&chat).2.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1479,16 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn model_lists_and_error_bodies() {
-        assert_eq!(
-            parse_models(r#"{"data":[{"id":"a"},{"id":"b"}]}"#).unwrap(),
-            vec!["a", "b"]
-        );
-        assert_eq!(
-            parse_models(r#"{"models":[{"name":"models/gemini-x"}]}"#).unwrap(),
-            vec!["gemini-x"]
-        );
-        assert!(parse_models("nope").is_err());
+    fn error_bodies() {
         assert_eq!(
             error_message(r#"{"error":{"message":"bad key"}}"#),
             "bad key"
@@ -1526,8 +1880,10 @@ mod tests {
                 role: Role::User,
                 text: "Q".into(),
                 blocks: vec![],
+                images: Vec::new(),
             }],
             max_tokens: None,
+            no_reasoning: false,
         };
         let job = start(&req, Arc::new(|| {}));
         let mut text = String::new();

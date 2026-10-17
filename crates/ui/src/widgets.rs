@@ -7,6 +7,16 @@ use egui::{
 
 use crate::theme::Tokens;
 
+/// Feeds `pending` edit events (menu bar ⌘V and co., see `Workbench::route_edit_events`) to the
+/// current window. Call it first in the window's frame, before its widgets read input.
+pub(crate) fn feed_edit_events(ctx: &egui::Context, pending: &mut Vec<egui::Event>) {
+    if pending.is_empty() {
+        return;
+    }
+    let events = std::mem::take(pending);
+    ctx.input_mut(|i| i.events.extend(events));
+}
+
 /// An icon-only button. `draw` paints the icon into the given rect with the given colour.
 pub fn icon_button(
     ui: &mut Ui,
@@ -386,4 +396,31 @@ pub fn capsule_buttons(
         }
     }
     clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key pasted from the menu bar lands in the focused (password) field of the window it was
+    /// fed to.
+    #[test]
+    fn fed_edit_events_reach_the_focused_field() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("api-key");
+        let mut text = String::new();
+        let frame = |pending: &mut Vec<egui::Event>, text: &mut String| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                feed_edit_events(ui.ctx(), pending);
+                let field = egui::TextEdit::singleline(text).id(id).password(true);
+                ui.add(field).request_focus();
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut Vec::new(), &mut text);
+        let mut pending = vec![egui::Event::Paste("sk-test-not-a-key".into())];
+        frame(&mut pending, &mut text);
+        assert!(pending.is_empty());
+        assert_eq!(text, "sk-test-not-a-key");
+    }
 }

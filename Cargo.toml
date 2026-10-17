@@ -37,9 +37,9 @@ thiserror = "2"
 rfd = "0.17"
 notify = "8.2"
 muda = "0.21"
-arboard = { version = "3.6", default-features = false }
-image = { version = "0.25", default-features = false, features = ["png"] }
-egui_extras = { version = "0.36.2", default-features = false, features = ["svg"] }
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+egui_extras = { version = "0.36.2", default-features = false, features = ["svg", "image"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
