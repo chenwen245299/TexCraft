@@ -69,7 +69,9 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Thumbnails | 🟡 | grid view, click opens the page |
 | Header bar (thumbnails, zoom, first/previous, page, next/last, scroll lock, open externally, separate window, pause, more) | ✅ | positions measured to within 1 pt |
 | Separate PDF window (external display) | ✅ | |
-| Links, text selection/search | ❌ | |
+| Text selection and copy | ✅ | drag, double/triple click, ⌘C; English and CJK (also fonts without `ToUnicode`) |
+| Inverse search lands on the clicked word | ✅ | its sentence (else the line) flashes in the editor |
+| Links, PDF search | ❌ | |
 
 ## Updates and distribution
 
@@ -88,7 +90,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 ## Ranked gaps (work list)
 
-1. PDF text selection, search and clickable links.
+1. PDF search and clickable links.
 2. Texifier Connect tab (proprietary cloud collaboration: out of scope; the tab is Source Control).
 3. Hover info boxes and inline image previews.
 4. User-editable snippets and templates folders; autocomplete placeholders with Tab jumps.

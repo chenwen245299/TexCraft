@@ -8,6 +8,7 @@ use egui::{
     ViewportCommand, ViewportId, pos2, vec2,
 };
 use texcraft_engine::Session;
+use texcraft_i18n::{tr, trf};
 use texcraft_project::templates::TEMPLATES;
 
 use crate::dialogs::DialogAction;
@@ -15,7 +16,8 @@ use crate::icons;
 use crate::prefs::popup_control;
 use crate::theme::{Tokens, semibold};
 
-/// Title of the welcome window (hidden; it finds the native window).
+/// Title of the welcome window (hidden; it finds the native window). In English: every use
+/// translates it (`tr(WELCOME_TITLE)`), so the title set and the title searched for agree.
 pub const WELCOME_TITLE: &str = "Welcome to TexCraft";
 const W: f32 = 780.0;
 const H: f32 = 480.0;
@@ -58,10 +60,11 @@ impl Welcome {
         self.glass
     }
 
-    /// Opens the window; `launch`: as the only window at start-up.
+    /// Opens the window; `launch`: as the only window at start-up. Already up as that, it stays
+    /// it (the main window still waits hidden).
     pub fn show_window(&mut self, launch: bool) {
+        self.launch = launch || (self.open && self.launch);
         self.open = true;
-        self.launch = launch;
         self.focus = true;
     }
 }
@@ -116,7 +119,7 @@ pub fn show(
             });
     } else {
         let mut builder = ViewportBuilder::default()
-            .with_title(WELCOME_TITLE)
+            .with_title(tr(WELCOME_TITLE))
             .with_inner_size([W, H])
             .with_resizable(false)
             .with_minimize_button(false)
@@ -139,9 +142,9 @@ pub fn show(
                 w.focus = false;
             }
             if cfg!(target_os = "macos") {
-                let _ =
-                    texcraft_macos::place_traffic_lights_titled(WELCOME_TITLE, 32.0, 8.75, true);
-                w.glass = texcraft_macos::set_vibrancy_titled(WELCOME_TITLE);
+                let title = tr(WELCOME_TITLE);
+                let _ = texcraft_macos::place_traffic_lights_titled(title, 32.0, 8.75, true);
+                w.glass = texcraft_macos::set_vibrancy_titled(title);
             }
             let rect = ctx.content_rect();
             if !w.glass {
@@ -274,9 +277,10 @@ fn tabs(
     let font = FontId::proportional(11.75);
     let mut clicked = None;
     for (i, (name, cx)) in names.iter().zip(centers).enumerate() {
+        let name = tr(name);
         let tw = ui
             .painter()
-            .layout_no_wrap((*name).to_string(), font.clone(), t.form_label)
+            .layout_no_wrap(name.to_string(), font.clone(), t.form_label)
             .size()
             .x;
         let r = Rect::from_center_size(pos2(*cx, cy), vec2(tw + 22.0, h));
@@ -290,13 +294,8 @@ fn tabs(
             }
             t.form_label
         };
-        ui.painter().text(
-            r.center(),
-            Align2::CENTER_CENTER,
-            *name,
-            font.clone(),
-            color,
-        );
+        ui.painter()
+            .text(r.center(), Align2::CENTER_CENTER, name, font.clone(), color);
         if resp.clicked() {
             clicked = Some(i);
         }
@@ -415,15 +414,15 @@ fn body(
                 "open",
                 x0,
                 y0 + 264.5,
-                "Open a local file or project…",
-                "Open an existing local file or project.",
+                tr("Open a local file or project…"),
+                tr("Open an existing local file or project."),
             ) {
                 pick = Some(Pick::Open);
             }
             ui.painter().text(
                 pos2(x0 + 22.5, y0 + 317.0),
                 Align2::LEFT_CENTER,
-                "Template",
+                tr("Template"),
                 FontId::proportional(11.75),
                 t.text_weak,
             );
@@ -432,7 +431,7 @@ fn body(
             let options: Vec<(usize, String)> = TEMPLATES
                 .iter()
                 .enumerate()
-                .map(|(i, tp)| (i, tp.name.to_string()))
+                .map(|(i, tp)| (i, tr(tp.name).to_string()))
                 .collect();
             let pal = crate::prefs::Pal {
                 control: t.welcome_popup,
@@ -454,8 +453,8 @@ fn body(
                 "create",
                 x0,
                 y0 + 338.5,
-                "Create a local file…",
-                "Start a new document from the template.",
+                tr("Create a local file…"),
+                tr("Start a new document from the template."),
             ) {
                 if let Some(tp) = TEMPLATES.get(*template) {
                     let _ =
@@ -469,8 +468,8 @@ fn body(
                 "folder",
                 x0,
                 y0 + 388.5,
-                "Open a project folder…",
-                "Open a folder; TexCraft finds the root document.",
+                tr("Open a project folder…"),
+                tr("Open a folder; TexCraft finds the root document."),
             ) {
                 pick = Some(Pick::OpenFolder);
             }
@@ -479,13 +478,13 @@ fn body(
             let mut y = y0 + 258.0;
             for (text, size, color) in [
                 (
-                    "A native LaTeX editor written in Rust, with live preview, SyncTeX and an outline of your document.".to_string(),
+                    tr("A native LaTeX editor written in Rust, with live preview, SyncTeX and an outline of your document.").to_string(),
                     12.0,
                     t.form_label,
                 ),
-                (format!("TeX programs found: {}", session.toolchain.describe()), 11.0, t.text_weak),
+                (trf!("TeX programs found: {programs}", programs = session.toolchain.describe()), 11.0, t.text_weak),
                 (
-                    "A clean-room re-creation of the Texifier workflow: no code or assets of the original are used.".to_string(),
+                    tr("A clean-room re-creation of the Texifier workflow: no code or assets of the original are used.").to_string(),
                     11.0,
                     t.text_weak,
                 ),
@@ -497,12 +496,16 @@ fn body(
             let mut y = y0 + 258.0;
             for (text, size, color) in [
                 (
-                    "TexCraft is free and open-source software, licensed under the MIT or Apache 2.0 licence, at your option.",
+                    tr(
+                        "TexCraft is free and open-source software, licensed under the MIT or Apache 2.0 licence, at your option.",
+                    ),
                     12.0,
                     t.form_label,
                 ),
                 (
-                    "It is built on egui, wgpu, hayro and other open-source libraries; their licences are listed in ATTRIBUTION.md. Typesetting uses your TeX distribution.",
+                    tr(
+                        "It is built on egui, wgpu, hayro and other open-source libraries; their licences are listed in ATTRIBUTION.md. Typesetting uses your TeX distribution.",
+                    ),
                     11.0,
                     t.text_weak,
                 ),
@@ -557,11 +560,17 @@ fn body(
                 }
             } else {
                 for (i, tp) in TEMPLATES.iter().enumerate() {
+                    let (name, description) = (tr(tp.name), tr(tp.description));
+                    // The filter finds a template by its English name too.
                     let hit = |s: &str| s.to_lowercase().contains(&filter);
-                    if !filter.is_empty() && !hit(tp.name) && !hit(tp.description) {
+                    if !filter.is_empty()
+                        && ![name, description, tp.name, tp.description]
+                            .iter()
+                            .any(|s| hit(s))
+                    {
                         continue;
                     }
-                    if list_row(ui, t, tp.name, tp.description, None) {
+                    if list_row(ui, t, name, description, None) {
                         *template = i;
                         let _ = session
                             .run("file.newFromTemplate", &serde_json::json!({ "id": tp.id }));
@@ -601,7 +610,7 @@ fn body(
         edit,
         egui::TextEdit::singleline(&mut w.filter)
             .id(Id::new("welcome-filter"))
-            .hint_text(egui::RichText::new("Filter").color(t.text_weak))
+            .hint_text(egui::RichText::new(tr("Filter")).color(t.text_weak))
             .frame(egui::Frame::NONE)
             .font(FontId::proportional(10.75))
             .vertical_align(egui::Align::Center),
@@ -622,9 +631,9 @@ fn recent_list(ui: &mut Ui, t: &Tokens, session: &mut Session, filter: &str) -> 
         ui.add_space(150.0);
         ui.vertical_centered(|ui| {
             let text = if filter.is_empty() {
-                "No Recent Documents"
+                tr("No Recent Documents")
             } else {
-                "No Matches"
+                tr("No Matches")
             };
             ui.label(egui::RichText::new(text).size(13.0).color(t.text_weak));
         });
@@ -647,7 +656,7 @@ fn recent_list(ui: &mut Ui, t: &Tokens, session: &mut Session, filter: &str) -> 
         };
         let when = std::fs::metadata(path)
             .and_then(|m| m.modified())
-            .map(|m| format!("Last Modified on {}", crate::clock::date_time(m)))
+            .map(|m| trf!("Last Modified on {date}", date = crate::clock::date_time(m)))
             .unwrap_or_default();
         if list_row(ui, t, &title, &when, Some(&path.display().to_string())) {
             if let Err(e) = session.open_path(path) {
@@ -696,4 +705,29 @@ fn list_row(ui: &mut Ui, t: &Tokens, title: &str, subtitle: &str, tip: Option<&s
         t.text_weak,
     );
     resp.clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use texcraft_i18n::{Lang, has};
+
+    /// Strings shown through a variable (the scanner in `crates/i18n` sees only literals): the
+    /// templates' names and descriptions, the tab names and the window title all have a
+    /// Simplified Chinese entry.
+    #[test]
+    fn displayed_names_are_translated() {
+        for tp in TEMPLATES {
+            assert!(has(Lang::ZhHans, tp.name), "template name {:?}", tp.name);
+            assert!(
+                has(Lang::ZhHans, tp.description),
+                "template description {:?}",
+                tp.description
+            );
+        }
+        for name in LEFT_TABS.iter().chain(&RIGHT_TABS) {
+            assert!(has(Lang::ZhHans, name), "tab {name:?}");
+        }
+        assert!(has(Lang::ZhHans, WELCOME_TITLE));
+    }
 }

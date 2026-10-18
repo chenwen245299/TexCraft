@@ -6,6 +6,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use texcraft_i18n::tr;
 pub use texcraft_update::REPO_URL;
 use texcraft_update::{Event, Job, Release, Staged};
 
@@ -113,7 +114,7 @@ impl Session {
     /// Downloads the available release.
     pub fn download_update(&mut self) -> Result<(), CommandError> {
         let UpdateStatus::Available(release) = self.update.status.clone() else {
-            return Err(CommandError::Failed("no update is available".into()));
+            return Err(CommandError::Failed(tr("no update is available").into()));
         };
         let dir = std::env::temp_dir().join(format!("texcraft-update-{}", release.version));
         self.update.status = UpdateStatus::Downloading {
@@ -133,7 +134,9 @@ impl Session {
     /// otherwise it is installed when TexCraft quits.
     pub fn install_update(&mut self, relaunch: bool) -> Result<(), CommandError> {
         let UpdateStatus::Ready(staged) = &self.update.status else {
-            return Err(CommandError::Failed("no update is ready to install".into()));
+            return Err(CommandError::Failed(
+                tr("no update is ready to install").into(),
+            ));
         };
         if relaunch {
             texcraft_update::install(staged, true).map_err(|e| CommandError::Failed(e.0))?;

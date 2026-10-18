@@ -116,6 +116,20 @@ pub fn set_vibrancy_titled(title: &str) -> bool {
     }
 }
 
+/// Whether the system appearance (System Settings → Appearance) is dark, asked of AppKit. The
+/// app's windows can't tell while they carry an appearance of their own (a Light or Dark choice
+/// in TexCraft): they hear of no system change then. `None` off macOS or off the main thread.
+pub fn system_dark() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::system_dark()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// The app's windows as (title, visible, [x, y, width, height] in screen points), for checks
 /// and the control channel. Empty off macOS.
 pub fn windows() -> Vec<(String, bool, [f64; 4])> {
@@ -178,6 +192,19 @@ pub fn learn_word(word: &str) {
     let _ = word;
 }
 
+/// The user's preferred languages (System Settings → General → Language & Region), most
+/// preferred first, as BCP 47 tags (`zh-Hans-CN`, `en-GB`). Empty off macOS.
+pub fn preferred_languages() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        locale::preferred_languages()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Moves `path` (a file or folder) to the Trash, where Finder can put it back.
 pub fn trash(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -188,6 +215,19 @@ pub fn trash(path: &std::path::Path) -> Result<(), String> {
     {
         let _ = path;
         Err("the Trash is a macOS service".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod locale {
+    use objc2_foundation::NSLocale;
+
+    pub(crate) fn preferred_languages() -> Vec<String> {
+        // SAFETY: a Foundation class method without arguments that returns a retained array of
+        // strings; NSLocale may be used from any thread.
+        let list = unsafe { NSLocale::preferredLanguages() };
+        list.iter().map(|s| s.to_string()).collect()
     }
 }
 
@@ -276,6 +316,19 @@ mod imp {
     use objc2_app_kit::{NSApplication, NSView, NSWindow, NSWindowButton};
     use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    pub fn system_dark() -> Option<bool> {
+        use objc2_app_kit::{NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+        use objc2_foundation::NSCopying;
+        let mtm = MainThreadMarker::new()?;
+        // The application's own appearance is never set, so its effective one is the system's.
+        let appearance = NSApplication::sharedApplication(mtm).effectiveAppearance();
+        // SAFETY: AppKit's constant appearance names, read on the main thread.
+        let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+        let names = objc2_foundation::NSArray::from_vec(vec![aqua.copy(), dark.copy()]);
+        let best = appearance.bestMatchFromAppearancesWithNames(&names)?;
+        Some(&*best == dark)
+    }
 
     pub fn frames(window: &impl HasWindowHandle) -> Vec<[f64; 4]> {
         if MainThreadMarker::new().is_none() {
@@ -581,5 +634,15 @@ mod imp {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// AppKit is asked on the main thread only: elsewhere no answer, and no crash.
+    #[test]
+    fn system_dark_off_the_main_thread_is_none() {
+        let answer = std::thread::spawn(super::system_dark).join();
+        assert!(matches!(answer, Ok(None)));
     }
 }

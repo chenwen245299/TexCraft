@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use texcraft_i18n::{tr, trf};
 use texcraft_project::FileKind;
 
 use crate::{CommandError, Effect, Session, edit};
@@ -37,7 +38,7 @@ pub fn system_trash(path: &Path) -> Result<(), String> {
         c.arg("trash").arg(path);
         c
     } else {
-        return Err("moving to the Trash is not available here".into());
+        return Err(tr("moving to the Trash is not available here").into());
     };
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(()),
@@ -141,7 +142,7 @@ impl Session {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .or_else(|| self.project_dir.clone())
-            .ok_or_else(|| failed("no document to insert into"))?;
+            .ok_or_else(|| failed(tr("no document to insert into")))?;
         let text = reference_to(path, &from);
         self.edit_active(|t, sel| edit::replace_selection(t, sel, &text))?;
         // Back to the editor, caret after the insertion.
@@ -159,9 +160,11 @@ impl Session {
     pub fn rename_file(&mut self, path: &Path, name: &str) -> Result<PathBuf, CommandError> {
         let name = name.trim();
         if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-            return Err(failed(format!("“{name}” is not a valid name")));
+            return Err(failed(trf!("“{name}” is not a valid name", name = name)));
         }
-        let dir = path.parent().ok_or_else(|| failed("cannot rename this"))?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| failed(tr("cannot rename this")))?;
         let to = dir.join(name);
         if to == path {
             return Ok(to);
@@ -171,7 +174,7 @@ impl Session {
             && to.file_name().map(|n| n.to_string_lossy().to_lowercase())
                 == path.file_name().map(|n| n.to_string_lossy().to_lowercase());
         if to.exists() && !same_file {
-            return Err(failed(format!("“{name}” already exists")));
+            return Err(failed(trf!("“{name}” already exists", name = name)));
         }
         // Which open documents live at or under `path` (resolved before it moves).
         let from = real(path);
@@ -185,8 +188,13 @@ impl Session {
                 Some((i, p.strip_prefix(&from).ok()?.to_path_buf()))
             })
             .collect();
-        std::fs::rename(path, &to)
-            .map_err(|e| failed(format!("cannot rename {}: {e}", path.display())))?;
+        std::fs::rename(path, &to).map_err(|e| {
+            failed(trf!(
+                "cannot rename {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         for (i, rest) in followers {
             if let Some(d) = self.docs.get_mut(i) {
                 d.path = Some(if rest.as_os_str().is_empty() {
@@ -209,9 +217,14 @@ impl Session {
     /// Creates `untitled folder` (or `untitled folder 2`, …) in `dir` and starts renaming it.
     pub fn create_folder(&mut self, dir: &Path) -> Result<PathBuf, CommandError> {
         let to = unused_name(dir, "untitled folder", "")
-            .ok_or_else(|| failed("no free name for a new folder"))?;
-        std::fs::create_dir(&to)
-            .map_err(|e| failed(format!("cannot create {}: {e}", to.display())))?;
+            .ok_or_else(|| failed(tr("no free name for a new folder")))?;
+        std::fs::create_dir(&to).map_err(|e| {
+            failed(trf!(
+                "cannot create {path}: {e}",
+                path = to.display(),
+                e = e
+            ))
+        })?;
         self.refresh_files();
         self.effect(Effect::BeginRename(to.clone()));
         Ok(to)
@@ -220,9 +233,14 @@ impl Session {
     /// Creates an empty `untitled.tex` (or `untitled 2.tex`, …) in `dir` and starts renaming it.
     pub fn create_file(&mut self, dir: &Path) -> Result<PathBuf, CommandError> {
         let to = unused_name(dir, "untitled", ".tex")
-            .ok_or_else(|| failed("no free name for a new file"))?;
-        std::fs::write(&to, "")
-            .map_err(|e| failed(format!("cannot create {}: {e}", to.display())))?;
+            .ok_or_else(|| failed(tr("no free name for a new file")))?;
+        std::fs::write(&to, "").map_err(|e| {
+            failed(trf!(
+                "cannot create {path}: {e}",
+                path = to.display(),
+                e = e
+            ))
+        })?;
         self.refresh_files();
         self.effect(Effect::BeginRename(to.clone()));
         Ok(to)
@@ -230,9 +248,14 @@ impl Session {
 
     /// Copies `path` next to itself (`name copy.ext`) and returns the copy.
     pub fn duplicate_file(&mut self, path: &Path) -> Result<PathBuf, CommandError> {
-        let to = copy_name(path).ok_or_else(|| failed("cannot duplicate this"))?;
-        copy_recursive(path, &to)
-            .map_err(|e| failed(format!("cannot duplicate {}: {e}", path.display())))?;
+        let to = copy_name(path).ok_or_else(|| failed(tr("cannot duplicate this")))?;
+        copy_recursive(path, &to).map_err(|e| {
+            failed(trf!(
+                "cannot duplicate {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         self.refresh_files();
         Ok(to)
     }
@@ -247,12 +270,12 @@ impl Session {
                 .is_some_and(|p| real(p).starts_with(&target))
         };
         if let Some(d) = self.docs.iter().find(|d| inside(d) && d.is_dirty()) {
-            return Err(failed(format!(
-                "{} has unsaved changes: save or close it first",
-                d.display_name()
+            return Err(failed(trf!(
+                "{name} has unsaved changes: save or close it first",
+                name = d.display_name()
             )));
         }
-        (self.trash)(path).map_err(|e| failed(format!("cannot move to the Trash: {e}")))?;
+        (self.trash)(path).map_err(|e| failed(trf!("cannot move to the Trash: {e}", e = e)))?;
         while let Some(i) = self.docs.iter().position(inside) {
             self.close(i);
         }

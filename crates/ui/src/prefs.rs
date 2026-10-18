@@ -10,13 +10,15 @@ use egui::{
     Align, Align2, Color32, Context, FontId, Galley, Id, Key, Rect, Sense, Stroke, StrokeKind, Ui,
     ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
-use texcraft_engine::{EditorTheme, Grading, PageMode, Session, ThemeChoice, Zoom};
+use texcraft_engine::{EditorTheme, Grading, LanguageChoice, PageMode, Session, ThemeChoice, Zoom};
+use texcraft_i18n::{tr, trf};
 use texcraft_project::{BibTool, Engine, TypesetMode, Typesetter};
 
 use crate::icons;
 use crate::theme::{Tokens, semibold};
 
-/// Title of the Settings window (hidden; it finds the native window for its buttons).
+/// Title of the Settings window (hidden; it finds the native window for its buttons). English:
+/// every use passes it through `tr` so the window's title and the lookups always agree.
 pub const SETTINGS_TITLE: &str = "TexCraft Settings";
 /// Settings window width.
 const WINDOW_W: f32 = 700.0;
@@ -65,11 +67,11 @@ impl Pane {
     /// Toolbar label.
     pub fn label(self) -> &'static str {
         match self {
-            Self::General => "General",
-            Self::Sidebar => "Sidebar",
-            Self::Editor => "Editor",
-            Self::Viewer => "Document Viewer",
-            Self::Typesetting => "Typesetting",
+            Self::General => tr("General"),
+            Self::Sidebar => tr("Sidebar"),
+            Self::Editor => tr("Editor"),
+            Self::Viewer => tr("Document Viewer"),
+            Self::Typesetting => tr("Typesetting"),
             Self::Ai => "AI",
         }
     }
@@ -89,9 +91,19 @@ impl Pane {
 }
 
 /// Typeset Configuration tabs.
-const SHEET_TABS: [&str; 4] = ["Summary", "General", "Bibliographies", "Indices"];
+fn sheet_tabs() -> [&'static str; 4] {
+    [
+        tr("Summary"),
+        tr("General"),
+        tr("Bibliographies"),
+        tr("Indices"),
+    ]
+}
+
 /// Editor pane tabs.
-const EDITOR_TABS: [&str; 2] = ["Editing Aids", "Editor Look & Feel"];
+fn editor_tabs() -> [&'static str; 2] {
+    [tr("Editing Aids"), tr("Editor Look & Feel")]
+}
 
 /// State of the Settings window and the Typeset Configuration sheet.
 #[derive(Default)]
@@ -665,13 +677,15 @@ pub(crate) fn opts<T: Clone>(list: &[(T, &str)]) -> Vec<(T, String)> {
 // Settings window
 
 /// Shows the Settings window while it is open. Returns true when the Typeset Configuration
-/// sheet should open (its button in the Typesetting pane).
+/// sheet should open (its button in the Typesetting pane). `update`: the update window's open flag
+/// when it is to show on this window (Check for Updates… was clicked here).
 pub fn settings_window(
     ctx: &Context,
     t: &Tokens,
     session: &mut Session,
     prefs: &mut Prefs,
     outline_depth: &mut u8,
+    update: Option<&mut bool>,
 ) -> bool {
     if !prefs.open {
         if prefs.ai.picker.is_open() {
@@ -679,16 +693,16 @@ pub fn settings_window(
         }
         return false;
     }
-    let open_sheet = settings_contents(ctx, t, session, prefs, outline_depth);
+    let open_sheet = settings_contents(ctx, t, session, prefs, outline_depth, update);
     // The model picker (Add Models…), over the Settings window.
     let pal = pal(t);
     if let Some(n) =
         crate::model_picker::show(ctx, &pal, session, &mut prefs.ai.picker, prefs.inline)
     {
         let msg = match n {
-            0 => "Those models were already added.".to_string(),
-            1 => "Added 1 model.".to_string(),
-            n => format!("Added {n} models."),
+            0 => tr("Those models were already added.").to_string(),
+            1 => tr("Added 1 model.").to_string(),
+            n => trf!("Added {n} models.", n = n),
         };
         prefs.ai.message = Some((msg, true));
     }
@@ -702,6 +716,7 @@ fn settings_contents(
     session: &mut Session,
     prefs: &mut Prefs,
     outline_depth: &mut u8,
+    mut update: Option<&mut bool>,
 ) -> bool {
     if prefs.inline {
         let mut open_sheet = false;
@@ -729,7 +744,7 @@ fn settings_contents(
         prefs.height = 520.0;
     }
     let mut builder = ViewportBuilder::default()
-        .with_title(SETTINGS_TITLE)
+        .with_title(tr(SETTINGS_TITLE))
         .with_inner_size([WINDOW_W, prefs.height])
         .with_resizable(false)
         .with_minimize_button(false)
@@ -753,10 +768,14 @@ fn settings_contents(
             prefs.focus = false;
         }
         if cfg!(target_os = "macos") {
-            let _ = texcraft_macos::place_traffic_lights_titled(SETTINGS_TITLE, 51.0, 19.0, true);
+            let _ =
+                texcraft_macos::place_traffic_lights_titled(tr(SETTINGS_TITLE), 51.0, 19.0, true);
         }
         let rect = ctx.content_rect();
         open_sheet = settings_body(ui, &pal, session, prefs, outline_depth, rect);
+        if let Some(open) = update.as_deref_mut() {
+            crate::update::show(&ctx, t, session, open);
+        }
     });
     open_sheet
 }
@@ -872,7 +891,7 @@ fn pane_bar(ui: &mut Ui, pal: &Pal, prefs: &mut Prefs, rect: Rect) -> f32 {
             top + PANE_BAR_H - 0.5,
             20.0,
             112.0,
-            &EDITOR_TABS,
+            &editor_tabs(),
             prefs.editor_tab,
             11.8,
         ) {
@@ -900,48 +919,60 @@ fn pane_bar(ui: &mut Ui, pal: &Pal, prefs: &mut Prefs, rect: Rect) -> f32 {
 
 fn general_pane(f: &mut Form<'_>, session: &mut Session) {
     f.popup(
-        "Choose whether TexCraft follows the system appearance or always uses the light or dark appearance.",
-        "Appearance",
+        tr("Choose whether TexCraft follows the system appearance or always uses the light or dark appearance."),
+        tr("Appearance"),
         &mut session.view.theme,
         &opts(&[
-            (ThemeChoice::System, "Use System Setting"),
-            (ThemeChoice::Light, "Light"),
-            (ThemeChoice::Dark, "Dark"),
+            (ThemeChoice::System, tr("Use System Setting")),
+            (ThemeChoice::Light, tr("Light")),
+            (ThemeChoice::Dark, tr("Dark")),
+        ]),
+    );
+    // Language names stay in their own language.
+    f.popup(
+        tr("Choose the language of TexCraft's menus, windows and messages. Use System Setting follows the order of languages in System Settings → General → Language & Region."),
+        tr("Language"),
+        &mut session.view.language,
+        &opts(&[
+            (LanguageChoice::System, tr("Use System Setting")),
+            (LanguageChoice::English, "English"),
+            (LanguageChoice::ChineseSimplified, "简体中文"),
         ]),
     );
     f.checkbox(
-        "Show the welcome window with recent documents and templates when TexCraft starts without a document.",
-        "Show welcome window at startup",
+        tr("Show the welcome window with recent documents and templates when TexCraft starts without a document."),
+        tr("Show welcome window at startup"),
         &mut session.view.show_welcome,
     );
     f.checkbox(
-        "Show the issues list in the sidebar when a typeset ends with errors.",
-        "Show issues after a failed typeset",
+        tr("Show the issues list in the sidebar when a typeset ends with errors."),
+        tr("Show issues after a failed typeset"),
         &mut session.view.show_issues_after_error,
     );
     f.checkbox(
-        "TexCraft looks for a new version when it starts and every few hours.",
-        "Check for updates automatically",
+        tr("TexCraft looks for a new version when it starts and every few hours."),
+        tr("Check for updates automatically"),
         &mut session.view.auto_check_updates,
     );
     f.checkbox(
-        "New versions are downloaded in the background and installed when you quit TexCraft.",
-        "Download updates automatically",
+        tr("New versions are downloaded in the background and installed when you quit TexCraft."),
+        tr("Download updates automatically"),
         &mut session.view.auto_download_updates,
     );
     let last = if session.view.last_update_check == 0 {
-        "Never checked".to_string()
+        tr("Never checked").to_string()
     } else {
         let at =
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(session.view.last_update_check);
-        format!("Last checked {}", crate::clock::date_time(at))
+        trf!("Last checked {date}", date = crate::clock::date_time(at))
     };
     if f.button(
-        &format!(
-            "This is TexCraft {}. {last}.",
-            texcraft_engine::CURRENT_VERSION
+        &trf!(
+            "This is TexCraft {version}. {last}.",
+            version = texcraft_engine::CURRENT_VERSION,
+            last = last
         ),
-        "Check for Updates…",
+        tr("Check for Updates…"),
     ) {
         let _ = session.run("app.checkForUpdates", &serde_json::Value::Null);
     }
@@ -954,15 +985,15 @@ fn sidebar_pane(f: &mut Form<'_>, outline_depth: &mut u8) {
         *outline_depth
     };
     if f.popup(
-        "The deepest sectioning level listed in the Table of Contents of the Structure view.",
-        "Table of contents depth",
+        tr("The deepest sectioning level listed in the Table of Contents of the Structure view."),
+        tr("Table of contents depth"),
         &mut depth,
         &opts(&[
-            (1u8, "Parts and chapters"),
-            (2, "Sections"),
-            (3, "Subsections"),
-            (4, "Subsubsections"),
-            (5, "Paragraphs"),
+            (1u8, tr("Parts and chapters")),
+            (2, tr("Sections")),
+            (3, tr("Subsections")),
+            (4, tr("Subsubsections")),
+            (5, tr("Paragraphs")),
         ]),
     ) {
         *outline_depth = depth;
@@ -972,34 +1003,34 @@ fn sidebar_pane(f: &mut Form<'_>, outline_depth: &mut u8) {
 fn editing_aids(f: &mut Form<'_>, session: &mut Session) {
     let v = &mut session.view;
     f.checkbox(
-        "Selecting this will display line numbers in the editor.",
-        "Show line numbers in the editor",
+        tr("Selecting this will display line numbers in the editor."),
+        tr("Show line numbers in the editor"),
         &mut v.line_numbers,
     );
     f.checkbox(
-        "TexCraft can automatically complete LaTeX commands as you type your documents.",
-        "Auto-complete commands",
+        tr("TexCraft can automatically complete LaTeX commands as you type your documents."),
+        tr("Auto-complete commands"),
         &mut v.auto_complete,
     );
     f.checkbox(
-        "Automatically indent each line based on the line before.",
-        "Auto Indent",
+        tr("Automatically indent each line based on the line before."),
+        tr("Auto Indent"),
         &mut v.auto_indent,
     );
     f.checkbox(
-        "Automatically insert an \\end{…} command after each \\begin{…}.",
-        "Automatch \\begin with \\end",
+        tr("Automatically insert an \\end{…} command after each \\begin{…}."),
+        tr("Automatch \\begin with \\end"),
         &mut v.auto_end,
     );
     f.popup(
-        "Number of spaces to indent by. This is used for inserting tabs and auto-indentations.",
-        "Editor tab indent size",
+        tr("Number of spaces to indent by. This is used for inserting tabs and auto-indentations."),
+        tr("Editor tab indent size"),
         &mut v.tab_spaces,
         &opts(&[
-            (0u8, "Tab"),
-            (2, "2 Spaces"),
-            (4, "4 Spaces"),
-            (8, "8 Spaces"),
+            (0u8, tr("Tab")),
+            (2, tr("2 Spaces")),
+            (4, tr("4 Spaces")),
+            (8, tr("8 Spaces")),
         ]),
     );
     // Wrapping: 0 none, 1 soft wrap, 2 soft wrap with hanging indent.
@@ -1009,23 +1040,32 @@ fn editing_aids(f: &mut Form<'_>, session: &mut Session) {
         (true, true) => 2,
     };
     if f.popup(
-        "The type of wrapping to be applied to lines in the editor that are too long to fit in the current window width.",
-        "Line wrapping in the editor",
+        tr("The type of wrapping to be applied to lines in the editor that are too long to fit in the current window width."),
+        tr("Line wrapping in the editor"),
         &mut wrap,
-        &opts(&[(0u8, "No wrapping"), (1, "Soft wrap"), (2, "Soft wrap with hanging indent")]),
+        &opts(&[
+            (0u8, tr("No wrapping")),
+            (1, tr("Soft wrap")),
+            (2, tr("Soft wrap with hanging indent")),
+        ]),
     ) {
         v.wrap_lines = wrap > 0;
         v.hanging_indent = wrap == 2;
     }
     f.popup(
-        "A hanging indent is a small blank space that's added to all but the first line when the text is too long to fit inside the line. This setting determines the width of the space used for hanging indent. It is valid when the line wrapping mode is chosen to be a soft wrap with hanging indent.",
-        "Hanging indent size",
+        tr("A hanging indent is a small blank space that's added to all but the first line when the text is too long to fit inside the line. This setting determines the width of the space used for hanging indent. It is valid when the line wrapping mode is chosen to be a soft wrap with hanging indent."),
+        tr("Hanging indent size"),
         &mut v.hanging_chars,
-        &opts(&[(0u8, "Tab Width"), (2, "2 Characters"), (4, "4 Characters"), (8, "8 Characters")]),
+        &opts(&[
+            (0u8, tr("Tab Width")),
+            (2, tr("2 Characters")),
+            (4, tr("4 Characters")),
+            (8, tr("8 Characters")),
+        ]),
     );
     f.checkbox(
-        "Underline misspelled words in text and comments, using the system spelling dictionary.",
-        "Check spelling while typing",
+        tr("Underline misspelled words in text and comments, using the system spelling dictionary."),
+        tr("Check spelling while typing"),
         &mut v.spellcheck,
     );
 }
@@ -1033,10 +1073,13 @@ fn editing_aids(f: &mut Form<'_>, session: &mut Session) {
 fn look_and_feel(f: &mut Form<'_>, session: &mut Session) {
     let v = &mut session.view;
     f.popup(
-        "The colours of the editor in the light appearance. Classic is cream paper with olive comments; Plain is white paper.",
-        "Editor theme",
+        tr("The colours of the editor in the light appearance. Classic is cream paper with olive comments; Plain is white paper."),
+        tr("Editor theme"),
         &mut v.editor_theme,
-        &opts(&[(EditorTheme::Classic, "Classic"), (EditorTheme::Plain, "Plain")]),
+        &opts(&[
+            (EditorTheme::Classic, tr("Classic")),
+            (EditorTheme::Plain, tr("Plain")),
+        ]),
     );
     let mut size = v.editor_font_size.round() as u32;
     let sizes: Vec<(u32, String)> = [11u32, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24]
@@ -1044,8 +1087,8 @@ fn look_and_feel(f: &mut Form<'_>, session: &mut Session) {
         .map(|s| (*s, format!("{s} pt")))
         .collect();
     if f.popup(
-        "The size of the text in the editor.",
-        "Editor font size",
+        tr("The size of the text in the editor."),
+        tr("Editor font size"),
         &mut size,
         &sizes,
     ) {
@@ -1056,37 +1099,37 @@ fn look_and_feel(f: &mut Form<'_>, session: &mut Session) {
 fn viewer_pane(f: &mut Form<'_>, session: &mut Session) {
     let v = &mut session.view;
     f.checkbox(
-        "Clicking in the PDF shows the matching line in the editor. When this is off, use ⌘-click.",
-        "Jump to the source with a single click",
+        tr("Clicking in the PDF shows the matching line in the editor. When this is off, use ⌘-click."),
+        tr("Jump to the source with a single click"),
         &mut v.single_click_sync,
     );
     f.checkbox(
-        "After each typeset, the PDF scrolls to the part of the document you are editing.",
-        "Show the editing position after typesetting",
+        tr("After each typeset, the PDF scrolls to the part of the document you are editing."),
+        tr("Show the editing position after typesetting"),
         &mut v.sync_after_typeset,
     );
     f.checkbox(
-        "The PDF follows the caret as you move through the source.",
-        "Scroll lock",
+        tr("The PDF follows the caret as you move through the source."),
+        tr("Scroll lock"),
         &mut v.scroll_lock,
     );
     f.popup(
-        "How pages are arranged in the document viewer.",
-        "Page layout",
+        tr("How pages are arranged in the document viewer."),
+        tr("Page layout"),
         &mut v.page_mode,
         &opts(&[
-            (PageMode::SingleContinuous, "Single Page Continuous"),
-            (PageMode::TwoContinuous, "Two Pages Continuous"),
-            (PageMode::Single, "Single Page"),
+            (PageMode::SingleContinuous, tr("Single Page Continuous")),
+            (PageMode::TwoContinuous, tr("Two Pages Continuous")),
+            (PageMode::Single, tr("Single Page")),
         ]),
     );
     f.popup(
-        "The zoom level of the document viewer.",
-        "Zoom",
+        tr("The zoom level of the document viewer."),
+        tr("Zoom"),
         &mut v.zoom,
         &opts(&[
-            (Zoom::FitWidth, "Fit Width"),
-            (Zoom::FitPage, "Fit Page"),
+            (Zoom::FitWidth, tr("Fit Width")),
+            (Zoom::FitPage, tr("Fit Page")),
             (Zoom::Fixed(0.75), "75%"),
             (Zoom::Fixed(1.0), "100%"),
             (Zoom::Fixed(1.25), "125%"),
@@ -1095,45 +1138,48 @@ fn viewer_pane(f: &mut Form<'_>, session: &mut Session) {
         ]),
     );
     f.popup(
-        "In the dark appearance, TexCraft can re-tint the PDF so that pages are not bright white. The PDF file itself is not changed.",
-        "Image grading in dark mode",
+        tr("In the dark appearance, TexCraft can re-tint the PDF so that pages are not bright white. The PDF file itself is not changed."),
+        tr("Image grading in dark mode"),
         &mut v.grading,
-        &opts(&[(Grading::Entire, "Grade Entire Viewer Output"), (Grading::None, "No Grading")]),
+        &opts(&[
+            (Grading::Entire, tr("Grade Entire Viewer Output")),
+            (Grading::None, tr("No Grading")),
+        ]),
     );
 }
 
 fn typesetting_pane(f: &mut Form<'_>, session: &mut Session) -> bool {
     let s = &mut session.settings;
     f.checkbox(
-        "Save edited files before a full typeset. Live previews never save: they typeset the text in the editor.",
-        "Save files before typesetting",
+        tr("Save edited files before a full typeset. Live previews never save: they typeset the text in the editor."),
+        tr("Save files before typesetting"),
         &mut s.save_before_typeset,
     );
     f.popup(
-        "How long the live preview waits after a keystroke. Immediately starts on the first keystroke and keeps up while you type.",
-        "Live preview delay",
+        tr("How long the live preview waits after a keystroke. Immediately starts on the first keystroke and keeps up while you type."),
+        tr("Live preview delay"),
         &mut s.live_delay_ms,
         &opts(&[
-            (0u32, "Immediately"),
+            (0u32, tr("Immediately")),
             (100, "100 ms"),
             (250, "250 ms"),
             (500, "500 ms"),
-            (1000, "1 second"),
+            (1000, tr("1 second")),
         ]),
     );
     f.checkbox(
-        "While the document has errors, the live preview keeps showing the last PDF that typeset cleanly.",
-        "Keep the last good preview",
+        tr("While the document has errors, the live preview keeps showing the last PDF that typeset cleanly."),
+        tr("Keep the last good preview"),
         &mut s.live_keep_good,
     );
     f.checkbox(
-        "Store the preamble in a format file so that live previews only typeset the body (pdfLaTeX).",
-        "Precompile the preamble",
+        tr("Store the preamble in a format file so that live previews only typeset the body (pdfLaTeX)."),
+        tr("Precompile the preamble"),
         &mut s.cache_preamble,
     );
     f.button(
-        "The typesetter, engine, bibliography and index settings of this document.",
-        "Typeset Configuration…",
+        tr("The typesetter, engine, bibliography and index settings of this document."),
+        tr("Typeset Configuration…"),
     )
 }
 
@@ -1176,7 +1222,7 @@ fn sheet_contents(
     p.text(
         pos2(sx + 10.0, sy + 14.0),
         Align2::LEFT_CENTER,
-        "Typesetter",
+        tr("Typesetter"),
         heading.clone(),
         pal.label,
     );
@@ -1192,9 +1238,9 @@ fn sheet_contents(
         let cx = sx + 10.0 + col_w * i as f32 - if i == 1 { 10.0 } else { 0.0 };
         let cy = sy + 43.5;
         let title = if kind == Typesetter::Live {
-            "Live Preview Typesetter"
+            tr("Live Preview Typesetter")
         } else {
-            "External Typesetter"
+            tr("External Typesetter")
         };
         let tg = p.layout_no_wrap(title.to_string(), heading.clone(), pal.label);
         let tw = tg.size().x;
@@ -1232,9 +1278,13 @@ fn sheet_contents(
         }
         let info = pos2(end + 12.0, cy);
         let tip = if kind == Typesetter::Live {
-            "TexCraft runs one fast pass of your TeX engine over the unsaved text after every change, in .texcraft/live. Bibliographies and indices update on a full typeset (⌘T)."
+            tr(
+                "TexCraft runs one fast pass of your TeX engine over the unsaved text after every change, in .texcraft/live. Bibliographies and indices update on a full typeset (⌘T).",
+            )
         } else {
-            "latexmk (or tectonic) runs the full typeset — bibliography, index and reruns — on the saved files, like typesetting in a terminal."
+            tr(
+                "latexmk (or tectonic) runs the full typeset — bibliography, index and reruns — on the saved files, like typesetting in a terminal.",
+            )
         };
         ui.interact(
             Rect::from_center_size(info, vec2(14.0, 14.0)),
@@ -1259,9 +1309,9 @@ fn sheet_contents(
             });
         }
         let sub = if kind == Typesetter::Live {
-            "Realtime Typesetting · Lean · Unsaved Text"
+            tr("Realtime Typesetting · Lean · Unsaved Text")
         } else {
-            "Traditional · Complete · Saved Files"
+            tr("Traditional · Complete · Saved Files")
         };
         p.text(
             pos2(cx + 20.0, sy + 66.0),
@@ -1274,7 +1324,9 @@ fn sheet_contents(
             note(
                 ui,
                 pal,
-                "TexCraft's live typesetter updates the preview as you type. It uses the TeX installation you already have; bibliographies update on a full typeset.",
+                tr(
+                    "TexCraft's live typesetter updates the preview as you type. It uses the TeX installation you already have; bibliographies update on a full typeset.",
+                ),
                 sy + 78.0,
                 cx + 20.0,
                 col_w - 44.0,
@@ -1283,7 +1335,7 @@ fn sheet_contents(
             note(
                 ui,
                 pal,
-                "External typesetter, such as MacTeX.",
+                tr("External typesetter, such as MacTeX."),
                 sy + 78.0,
                 cx + 20.0,
                 col_w - 30.0,
@@ -1295,7 +1347,7 @@ fn sheet_contents(
                 Id::new("ts-auto"),
                 pos2(cx + 20.0, sy + 108.5),
                 15.0,
-                "Auto-Typeset",
+                tr("Auto-Typeset"),
                 12.0,
                 &mut auto,
                 !live,
@@ -1310,7 +1362,7 @@ fn sheet_contents(
             note(
                 ui,
                 pal,
-                "Automatically start a typeset when typing is paused.",
+                tr("Automatically start a typeset when typing is paused."),
                 sy + 118.5,
                 cx + 20.0,
                 col_w - 30.0,
@@ -1323,7 +1375,7 @@ fn sheet_contents(
     p.text(
         pos2(sx + 10.0, sy + 158.0),
         Align2::LEFT_CENTER,
-        "Typeset Configuration",
+        tr("Typeset Configuration"),
         heading,
         pal.label,
     );
@@ -1345,8 +1397,8 @@ fn sheet_contents(
         };
         f.style.check_dy = 7.5;
         f.checkbox(
-            "When this is enabled, TexCraft reads your document and picks the engine it needs (XeLaTeX for fontspec, ctex or Chinese text; LuaLaTeX for luacode) and sets up Chinese text. Disable it to choose manually.",
-            "Auto-Sense",
+            tr("When this is enabled, TexCraft reads your document and picks the engine it needs (XeLaTeX for fontspec, ctex or Chinese text; LuaLaTeX for luacode) and sets up Chinese text. Disable it to choose manually."),
+            tr("Auto-Sense"),
             &mut session.settings.auto_sense,
         );
     }
@@ -1358,7 +1410,7 @@ fn sheet_contents(
         sy + 248.5,
         23.0,
         93.0,
-        &SHEET_TABS,
+        &sheet_tabs(),
         prefs.sheet_tab,
         12.0,
     ) {
@@ -1383,22 +1435,22 @@ fn sheet_contents(
             1 => general_tab(&mut f, session),
             2 => {
                 f.popup(
-                    "This is the engine used for the (optional) compilation of bibliography.",
-                    "Bibliography Engine",
+                    tr("This is the engine used for the (optional) compilation of bibliography."),
+                    tr("Bibliography Engine"),
                     &mut session.settings.bib_tool,
                     &opts(&[
-                        (BibTool::Auto, "Automatic (BibTeX or Biber)"),
-                        (BibTool::None, "None"),
+                        (BibTool::Auto, tr("Automatic (BibTeX or Biber)")),
+                        (BibTool::None, tr("None")),
                     ]),
                 );
             }
             _ => {
                 let mut index = 0u8;
                 f.popup(
-                    "This is the program used to build the index when the document calls \\makeindex. latexmk runs it as needed during a full typeset.",
-                    "Index Engine",
+                    tr("This is the program used to build the index when the document calls \\makeindex. latexmk runs it as needed during a full typeset."),
+                    tr("Index Engine"),
                     &mut index,
-                    &opts(&[(0u8, "Automatic (makeindex)")]),
+                    &opts(&[(0u8, tr("Automatic (makeindex)"))]),
                 );
             }
         }
@@ -1407,7 +1459,7 @@ fn sheet_contents(
     // ---- Footer.
     hairline(ui, sx, sx + w, sy + h - 41.0, pal.hairline_strong);
     let close_r = Rect::from_min_size(pos2(sx + w - 99.0, sy + h - 30.5), vec2(87.0, 20.0));
-    push_button(ui, pal, Id::new("ts-close"), close_r, "Close", 11.7)
+    push_button(ui, pal, Id::new("ts-close"), close_r, tr("Close"), 11.7)
         || ui.input(|i| i.key_pressed(Key::Enter))
 }
 
@@ -1432,51 +1484,53 @@ fn note(ui: &Ui, pal: &Pal, text: &str, top: f32, x: f32, width: f32) {
 fn summary_tab(f: &mut Form<'_>, session: &mut Session) {
     let plan = session.typeset_plan();
     let engine = plan.engine;
-    let how = match plan.source {
-        texcraft_project::EngineSource::MagicComment => " (from % !TEX program)",
-        texcraft_project::EngineSource::AutoSense => " (Auto-Sense)",
-        texcraft_project::EngineSource::Setting => "",
+    let name = engine.label();
+    let used = match plan.source {
+        texcraft_project::EngineSource::MagicComment => {
+            trf!("{engine} (from % !TEX program)", engine = name)
+        }
+        texcraft_project::EngineSource::AutoSense => {
+            trf!("{engine} (Auto-Sense)", engine = name)
+        }
+        texcraft_project::EngineSource::Setting => name.to_string(),
     };
-    f.value(
-        "The engine that typesets this document.",
-        &format!("{}{how}", engine.label()),
-    );
+    f.value(tr("The engine that typesets this document."), &used);
     if plan.add_cjk {
         let fonts = session.toolchain.cjk_fonts.as_ref().map_or_else(
-            || "no Chinese fonts found".to_string(),
+            || tr("no Chinese fonts found").to_string(),
             |c| format!("{}, {}", c.serif, c.sans),
         );
         f.value(
-            "Chinese text is set up with xeCJK; the file is not changed.",
+            tr("Chinese text is set up with xeCJK; the file is not changed."),
             &fonts,
         );
     }
     let s = &session.settings;
     let typing = match s.mode() {
-        TypesetMode::Live => "LIVE: live preview of the unsaved text",
-        TypesetMode::Auto => "AUTO: full typeset when typing pauses",
-        TypesetMode::Manual => "MANUAL: full typeset on ⌘T only",
+        TypesetMode::Live => tr("LIVE: live preview of the unsaved text"),
+        TypesetMode::Auto => tr("AUTO: full typeset when typing pauses"),
+        TypesetMode::Manual => tr("MANUAL: full typeset on ⌘T only"),
     };
-    f.value("What happens while you type.", typing);
+    f.value(tr("What happens while you type."), typing);
     let tool = if engine == Engine::Tectonic {
         "tectonic"
     } else {
         "latexmk"
     };
     f.value(
-        "A full typeset (⌘T) runs bibliography, index and reruns as needed.",
-        &format!("{} via {tool}", engine.label()),
+        tr("A full typeset (⌘T) runs bibliography, index and reruns as needed."),
+        &trf!("{engine} via {tool}", engine = name, tool = tool),
     );
     f.value(
-        "How bibliographies are compiled.",
+        tr("How bibliographies are compiled."),
         if s.bib_tool == BibTool::Auto {
-            "Automatically (BibTeX or Biber)"
+            tr("Automatically (BibTeX or Biber)")
         } else {
-            "Never"
+            tr("Never")
         },
     );
     let tc = session.toolchain.describe();
-    f.value("The TeX programs TexCraft found.", &tc);
+    f.value(tr("The TeX programs TexCraft found."), &tc);
 }
 
 fn general_tab(f: &mut Form<'_>, session: &mut Session) {
@@ -1488,7 +1542,7 @@ fn general_tab(f: &mut Form<'_>, session: &mut Session) {
             let name = if tc.supports(*e) {
                 e.label().to_string()
             } else {
-                format!("{} — not installed", e.label())
+                trf!("{engine} — not installed", engine = e.label())
             };
             (*e, name)
         })
@@ -1497,23 +1551,23 @@ fn general_tab(f: &mut Form<'_>, session: &mut Session) {
         // Auto-Sense picks the engine: show the one in use, locked.
         let mut used = session.effective_engine();
         f.popup_enabled(
-            "Auto-Sense picks the engine from the document. Turn Auto-Sense off to choose it yourself.",
-            "Typesetting Engine",
+            tr("Auto-Sense picks the engine from the document. Turn Auto-Sense off to choose it yourself."),
+            tr("Typesetting Engine"),
             &mut used,
             &engines,
             false,
         );
     } else {
         f.popup(
-            "The engine used when the document has no % !TEX program comment.",
-            "Typesetting Engine",
+            tr("The engine used when the document has no % !TEX program comment."),
+            tr("Typesetting Engine"),
             &mut session.settings.engine,
             &engines,
         );
     }
     f.checkbox(
-        "Lets packages such as minted and gnuplot run programs. Only enable it for documents you trust.",
-        "Allow shell escape",
+        tr("Lets packages such as minted and gnuplot run programs. Only enable it for documents you trust."),
+        tr("Allow shell escape"),
         &mut session.settings.shell_escape,
     );
 }
@@ -1618,8 +1672,8 @@ fn model_editor(
     let mut y = top + 10.0;
     // Name and id side by side.
     let half = (w - 10.0) / 2.0;
-    field_title(ui, pal, x, y + 8.0, "Display Name");
-    field_title(ui, pal, x + half + 10.0, y + 8.0, "Model ID");
+    field_title(ui, pal, x, y + 8.0, tr("Display Name"));
+    field_title(ui, pal, x + half + 10.0, y + 8.0, tr("Model ID"));
     y += 18.0;
     let nr = Rect::from_min_size(pos2(x, y), vec2(half, 24.0));
     let hint = p.models.get(k).map(|m| m.id.clone()).unwrap_or_default();
@@ -1630,7 +1684,17 @@ fn model_editor(
         changed = true;
     }
     let ir = Rect::from_min_size(pos2(x + half + 10.0, y), vec2(half, 24.0));
-    if text_field(ui, pal, id("id"), ir, &mut st.edit_id, false, "Model id").changed() {
+    if text_field(
+        ui,
+        pal,
+        id("id"),
+        ir,
+        &mut st.edit_id,
+        false,
+        tr("Model id"),
+    )
+    .changed()
+    {
         // A new id only when it is one and no other model has it.
         let new_id = st.edit_id.trim().to_string();
         let taken = p
@@ -1648,7 +1712,7 @@ fn model_editor(
     }
     y += 32.0;
     // Context length.
-    field_title(ui, pal, x, y + 8.0, "Context Length");
+    field_title(ui, pal, x, y + 8.0, tr("Context Length"));
     y += 18.0;
     let cr = Rect::from_min_size(pos2(x, y), vec2(120.0, 24.0));
     if text_field(
@@ -1658,7 +1722,7 @@ fn model_editor(
         cr,
         &mut st.edit_context,
         false,
-        "e.g. 128K",
+        tr("e.g. 128K"),
     )
     .changed()
         && let Some(m) = p.models.get_mut(k)
@@ -1671,24 +1735,26 @@ fn model_editor(
         pos2(cr.right() + 10.0, cr.center().y),
         Align2::LEFT_CENTER,
         match known {
-            Some(n) => format!("{n} tokens"),
-            None if st.edit_context.trim().is_empty() => "Unknown".to_string(),
-            None => "Write a number of tokens, 128K or 1M".to_string(),
+            Some(n) => trf!("{n} tokens", n = n),
+            None if st.edit_context.trim().is_empty() => tr("Unknown").to_string(),
+            None => tr("Write a number of tokens, 128K or 1M").to_string(),
         },
         FontId::proportional(11.0),
         pal.note,
     );
     y += 32.0;
     // Capabilities: chips that switch on and off.
-    field_title(ui, pal, x, y + 8.0, "Capabilities");
+    field_title(ui, pal, x, y + 8.0, tr("Capabilities"));
     y += 20.0;
     let mut cx = x;
     for cap in Capability::ALL {
         let on = p.models.get(k).is_some_and(|m| m.has(cap));
         let font = FontId::proportional(11.5);
+        // Shown translated; the id keeps the English name.
+        let name = tr(cap.label());
         let g = ui
             .painter()
-            .layout_no_wrap(cap.label().to_string(), font.clone(), pal.label);
+            .layout_no_wrap(name.to_string(), font.clone(), pal.label);
         let cw = g.size().x + 22.0;
         if cx + cw > x + w {
             cx = x;
@@ -1698,12 +1764,12 @@ fn model_editor(
         let resp = ui
             .interact(r, id(cap.label()), Sense::click())
             .on_hover_text(match cap {
-                Capability::Vision => "Reads images: the Assistant can attach them",
-                Capability::Reasoning => "Reasons before it answers",
-                Capability::ToolCalling => "Calls tools",
-                Capability::Embedding => "Makes embeddings (not for chat)",
-                Capability::Audio => "Hears or speaks (not for chat unless it does more)",
-                Capability::ImageGen => "Makes images (not for chat unless it does more)",
+                Capability::Vision => tr("Reads images: the Assistant can attach them"),
+                Capability::Reasoning => tr("Reasons before it answers"),
+                Capability::ToolCalling => tr("Calls tools"),
+                Capability::Embedding => tr("Makes embeddings (not for chat)"),
+                Capability::Audio => tr("Hears or speaks (not for chat unless it does more)"),
+                Capability::ImageGen => tr("Makes images (not for chat unless it does more)"),
             });
         let (fill, text) = if on {
             (pal.accent, Color32::WHITE)
@@ -1714,7 +1780,7 @@ fn model_editor(
         };
         ui.painter().rect_filled(r, 11.0, fill);
         ui.painter()
-            .text(r.center(), Align2::CENTER_CENTER, cap.label(), font, text);
+            .text(r.center(), Align2::CENTER_CENTER, name, font, text);
         if resp.clicked()
             && let Some(m) = p.models.get_mut(k)
         {
@@ -1731,9 +1797,9 @@ fn model_editor(
     y += 30.0;
     let chats = p.models.get(k).is_none_or(texcraft_ai::Model::chats);
     let note = if chats {
-        "With Vision the Assistant can attach images to questions."
+        tr("With Vision the Assistant can attach images to questions.")
     } else {
-        "Not offered for chat: it only embeds, hears or speaks, or makes images."
+        tr("Not offered for chat: it only embeds, hears or speaks, or makes images.")
     };
     ui.painter().text(
         pos2(x, y + 6.0),
@@ -1743,7 +1809,7 @@ fn model_editor(
         pal.note,
     );
     let dr = Rect::from_min_size(pos2(x + w - 70.0, y - 4.0), vec2(70.0, 22.0));
-    let done = push_button(ui, pal, id("done"), dr, "Done", 11.5);
+    let done = push_button(ui, pal, id("done"), dr, tr("Done"), 11.5);
     y += 24.0;
     let h = y - panel_top;
     // The panel behind (painted after, under the controls' layer order is the same: a frame).
@@ -1780,7 +1846,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         ui.painter().text(
             list.center(),
             Align2::CENTER_CENTER,
-            "No Providers",
+            tr("No Providers"),
             FontId::proportional(12.0),
             pal.note,
         );
@@ -1846,15 +1912,13 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             fg,
         );
         let sub = if !p.enabled {
-            "Off".to_string()
+            tr("Off").to_string()
         } else if !ready {
-            "No API key".to_string()
+            tr("No API key").to_string()
+        } else if p.models.len() == 1 {
+            tr("1 model").to_string()
         } else {
-            format!(
-                "{} model{}",
-                p.models.len(),
-                if p.models.len() == 1 { "" } else { "s" }
-            )
+            trf!("{n} models", n = p.models.len())
         };
         ui.painter().text(
             pos2(row.left() + 30.0, row.top() + 26.0),
@@ -1890,11 +1954,11 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     );
     let plus_resp = ui
         .interact(plus, Id::new("ai-add"), Sense::click())
-        .on_hover_text("Add a Provider");
+        .on_hover_text(tr("Add a Provider"));
     icons::plus(ui.painter(), plus.shrink(5.0), pal.control_text);
     let minus_resp = ui
         .interact(minus, Id::new("ai-remove"), Sense::click())
-        .on_hover_text("Remove the Provider");
+        .on_hover_text(tr("Remove the Provider"));
     icons::minus(
         ui.painter(),
         minus.shrink(5.0),
@@ -1902,7 +1966,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     );
     egui::Popup::menu(&plus_resp).show(|ui| {
         crate::menu::begin(ui, 230.0);
-        crate::menu::heading(ui, t, "Add a Provider");
+        crate::menu::heading(ui, t, tr("Add a Provider"));
         for preset in texcraft_ai::PRESETS {
             let probe = texcraft_ai::Provider {
                 id: preset.id.into(),
@@ -1914,7 +1978,9 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
                 logo_column: true,
                 ..Default::default()
             };
-            if crate::menu::item(ui, t, preset.name, opts).clicked() {
+            // Generic presets ("Ollama (local)", "Custom (OpenAI-compatible)") are translated;
+            // the provider they add keeps the English name until the user renames it.
+            if crate::menu::item(ui, t, tr(preset.name), opts).clicked() {
                 st.selected = session.ai.config.add(preset);
                 st.message = None;
                 changed = true;
@@ -1945,10 +2011,18 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     let selected = st.selected;
     let id = move |k: &str| Id::new(("ai-field", k, selected));
     if let Some(p) = session.ai.config.providers.get_mut(st.selected) {
-        field_title(ui, pal, x, y + 8.0, "Name");
+        field_title(ui, pal, x, y + 8.0, tr("Name"));
         let r = Rect::from_min_size(pos2(x, y + 18.0), vec2(w, 24.0));
-        changed |=
-            text_field(ui, pal, id("name"), r, &mut p.name, false, "Provider name").changed();
+        changed |= text_field(
+            ui,
+            pal,
+            id("name"),
+            r,
+            &mut p.name,
+            false,
+            tr("Provider name"),
+        )
+        .changed();
         y += 54.0;
 
         field_title(ui, pal, x, y + 8.0, "API");
@@ -1962,18 +2036,18 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             &[
                 (
                     texcraft_ai::Kind::Anthropic,
-                    texcraft_ai::Kind::Anthropic.label().to_string(),
+                    tr(texcraft_ai::Kind::Anthropic.label()).to_string(),
                 ),
                 (
                     texcraft_ai::Kind::OpenAi,
-                    texcraft_ai::Kind::OpenAi.label().to_string(),
+                    tr(texcraft_ai::Kind::OpenAi.label()).to_string(),
                 ),
             ],
             12.0,
         );
         y += 54.0;
 
-        field_title(ui, pal, x, y + 8.0, "Base URL");
+        field_title(ui, pal, x, y + 8.0, tr("Base URL"));
         let r = Rect::from_min_size(pos2(x, y + 18.0), vec2(w, 24.0));
         let hint = if p.kind == texcraft_ai::Kind::Anthropic {
             "https://api.anthropic.com"
@@ -1983,7 +2057,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         changed |= text_field(ui, pal, id("url"), r, &mut p.base_url, false, hint).changed();
         y += 54.0;
 
-        field_title(ui, pal, x, y + 8.0, "API Key");
+        field_title(ui, pal, x, y + 8.0, tr("API Key"));
         let r = Rect::from_min_size(pos2(x, y + 18.0), vec2(w, 24.0));
         if p.has_key && !st.editing_key {
             // A saved key is never shown or copied out again: only replaced or removed.
@@ -1999,17 +2073,17 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             ui.painter().text(
                 pos2(field.left() + 26.0, field.center().y),
                 Align2::LEFT_CENTER,
-                "Saved, encrypted on this computer",
+                tr("Saved, encrypted on this computer"),
                 FontId::proportional(12.0),
                 pal.desc,
             );
             let cr = Rect::from_min_size(pos2(field.right() + 6.0, r.top()), vec2(bw, 24.0));
-            if push_button(ui, pal, id("key-change"), cr, "Change…", 11.5) {
+            if push_button(ui, pal, id("key-change"), cr, tr("Change…"), 11.5) {
                 st.editing_key = true;
                 st.key_input.clear();
             }
             let rr = Rect::from_min_size(pos2(cr.right() + 6.0, r.top()), vec2(bw, 24.0));
-            if push_button(ui, pal, id("key-remove"), rr, "Remove", 11.5) {
+            if push_button(ui, pal, id("key-remove"), rr, tr("Remove"), 11.5) {
                 remove_key = Some(p.id.clone());
             }
         } else {
@@ -2022,11 +2096,11 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
                 field,
                 &mut st.key_input,
                 true,
-                "Paste the key from the provider's console",
+                tr("Paste the key from the provider's console"),
             );
             let enter = key_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             let sr = Rect::from_min_size(pos2(field.right() + 6.0, r.top()), vec2(bw, 24.0));
-            if (push_button(ui, pal, id("key-save"), sr, "Save", 11.5) || enter)
+            if (push_button(ui, pal, id("key-save"), sr, tr("Save"), 11.5) || enter)
                 && !st.key_input.trim().is_empty()
             {
                 save_key = Some((p.id.clone(), std::mem::take(&mut st.key_input)));
@@ -2038,7 +2112,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         // Models: display name, id and capabilities, in a list that scrolls past MODEL_ROWS
         // rows. A click edits one below the list (name, id, context length, capabilities, as in
         // Argus); more come from the picker window.
-        field_title(ui, pal, x, y + 8.0, "Models");
+        field_title(ui, pal, x, y + 8.0, tr("Models"));
         y += 18.0;
         if st.editing.is_some_and(|k| k >= p.models.len()) {
             st.editing = None;
@@ -2049,7 +2123,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             ui.painter().text(
                 pos2(x + 9.0, y + 10.0),
                 Align2::LEFT_CENTER,
-                "No models yet: add some from the provider's list.",
+                tr("No models yet: add some from the provider's list."),
                 FontId::proportional(11.5),
                 pal.note,
             );
@@ -2090,10 +2164,10 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
                         );
                         let xresp = ui
                             .interact(xr, Id::new(("ai-model-x", sel, k)), Sense::click())
-                            .on_hover_text("Remove");
+                            .on_hover_text(tr("Remove"));
                         let eresp = ui
                             .interact(er, Id::new(("ai-model-e", sel, k)), Sense::click())
-                            .on_hover_text("Edit");
+                            .on_hover_text(tr("Edit"));
                         let hot = resp.hovered() || xresp.hovered() || eresp.hovered();
                         let painter = ui.painter();
                         if on {
@@ -2114,7 +2188,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
                         let mut badges_w = 0.0;
                         for cap in m.capabilities.iter().rev() {
                             let g = painter.layout_no_wrap(
-                                cap.label().to_string(),
+                                tr(cap.label()).to_string(),
                                 badge_font.clone(),
                                 pal.accent,
                             );
@@ -2191,7 +2265,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         }
         y += 6.0;
         let ar = Rect::from_min_size(pos2(x, y), vec2(112.0, 24.0));
-        if push_button(ui, pal, id("add-models"), ar, "Add Models…", 11.5) {
+        if push_button(ui, pal, id("add-models"), ar, tr("Add Models…"), 11.5) {
             open_picker = Some(st.selected);
         }
         y += 32.0;
@@ -2230,7 +2304,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
             id("enabled"),
             pos2(x, y + 8.0),
             15.0,
-            "Show in the Assistant's model menu",
+            tr("Show in the Assistant's model menu"),
             12.0,
             &mut enabled,
             true,
@@ -2241,7 +2315,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         y += 26.0;
     } else {
         let g = ui.painter().layout(
-            "Add a provider with + (SoCLaaS at NUS, Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, Kimi, Qwen, MiMo, GLM, MiniMax, StepFun, MoleAPI, a local Ollama, or any OpenAI-compatible server), then paste its API key.".to_string(),
+            tr("Add a provider with + (SoCLaaS at NUS, Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, Kimi, Qwen, MiMo, GLM, MiniMax, StepFun, MoleAPI, a local Ollama, or any OpenAI-compatible server), then paste its API key.").to_string(),
             FontId::proportional(12.0),
             pal.desc,
             w,
@@ -2252,7 +2326,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
 
     if let Some((pid, key)) = save_key {
         match session.ai_set_key(&pid, &key) {
-            Ok(()) => st.message = Some(("The key is saved, encrypted.".into(), true)),
+            Ok(()) => st.message = Some((tr("The key is saved, encrypted.").into(), true)),
             Err(e) => st.message = Some((e.to_string(), false)),
         }
     }
@@ -2286,7 +2360,7 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
         Id::new("ai-include"),
         pos2(left, y + 8.0),
         15.0,
-        "Send the open document with each question",
+        tr("Send the open document with each question"),
         12.0,
         &mut include,
         true,
@@ -2299,5 +2373,47 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
 
     if changed && let Err(e) = session.save_ai_config() {
         st.message = Some((e.to_string(), false));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use texcraft_i18n::{Lang, scoped};
+
+    #[test]
+    fn labels_follow_the_interface_language() {
+        {
+            let _zh = scoped(Lang::ZhHans);
+            assert_eq!(Pane::Viewer.label(), "文稿查看器");
+            assert_eq!(Pane::Ai.label(), "AI");
+            assert_eq!(editor_tabs(), ["编辑辅助", "编辑器外观"]);
+            assert_eq!(sheet_tabs(), ["概览", "通用", "参考文献", "索引"]);
+            // The window is created and found again under the same translated title.
+            assert_eq!(tr(SETTINGS_TITLE), "TexCraft 设置");
+        }
+        let _en = scoped(Lang::En);
+        assert_eq!(Pane::Viewer.label(), "Document Viewer");
+        assert_eq!(tr(SETTINGS_TITLE), SETTINGS_TITLE);
+    }
+
+    #[test]
+    fn toolchain_description_is_translated() {
+        let mut session = Session::new(Arc::new(|| {}));
+        session.toolchain = Default::default();
+        session.toolchain.latexmk = Some("bin/latexmk".into());
+        session.toolchain.xelatex = Some("bin/xelatex".into());
+        {
+            let _en = scoped(Lang::En);
+            assert_eq!(
+                session.toolchain.describe(),
+                "latexmk, no pdflatex, xelatex, no lualatex, no tectonic"
+            );
+        }
+        let _zh = scoped(Lang::ZhHans);
+        assert_eq!(
+            session.toolchain.describe(),
+            "latexmk, 未找到 pdflatex, xelatex, 未找到 lualatex, 未找到 tectonic"
+        );
     }
 }

@@ -4,6 +4,7 @@
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Align2, Color32, FontId, Id, Key, Rect, Sense, Stroke, Ui, pos2, vec2};
 use texcraft_engine::Session;
+use texcraft_i18n::{tr, trf};
 
 use crate::prefs::{Pal, check_control, pal, popup_control};
 use crate::theme::Tokens;
@@ -69,11 +70,11 @@ pub fn header_button(ui: &mut Ui, t: &Tokens, session: &Session, open: &mut bool
     let on = session.ai.config.inline.enabled;
     let available = session.inline_available();
     let tip = if !available {
-        "AI Suggestions: set up a provider in Settings → AI"
+        tr("AI Suggestions: set up a provider in Settings → AI")
     } else if on {
-        "AI Suggestions: on (Tab accepts, ⌘→ next sentence, Esc dismisses)"
+        tr("AI Suggestions: on (Tab accepts, ⌘→ next sentence, Esc dismisses)")
     } else {
-        "AI Suggestions: off (⌥\\ asks once)"
+        tr("AI Suggestions: off (⌥\\ asks once)")
     };
     let resp = ui
         .interact(r, Id::new("ai-inline-button"), Sense::click())
@@ -252,7 +253,7 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
     p.text(
         pos2(r.left() + 22.0, r.center().y),
         Align2::LEFT_CENTER,
-        "AI Suggestions",
+        tr("AI Suggestions"),
         crate::theme::semibold(13.5),
         pal.label,
     );
@@ -266,7 +267,7 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         Id::new("ai-inline-on"),
         pos2(r.left(), r.center().y),
         14.0,
-        "Suggest while typing",
+        tr("Suggest while typing"),
         12.5,
         &mut on,
         true,
@@ -285,13 +286,13 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         ui,
         pal,
         Rect::from_min_size(r.min, vec2(70.0, r.height())),
-        "Model",
+        tr("Model"),
         "",
     );
     let assistant = session
         .ai_model()
-        .map(|m| format!("Same as the Assistant ({})", m.label()))
-        .unwrap_or_else(|| "Same as the Assistant".into());
+        .map(|m| trf!("Same as the Assistant ({model})", model = m.label()))
+        .unwrap_or_else(|| tr("Same as the Assistant").into());
     let mut options: Vec<((String, String), String)> =
         vec![((String::new(), String::new()), assistant)];
     // Chat models only, by their display names.
@@ -338,8 +339,8 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         t,
         pal,
         "ai-inline-delay",
-        "Suggest after a pause of",
-        &format!("{:.1} s", delay / 1000.0),
+        tr("Suggest after a pause of"),
+        &trf!("{secs} s", secs = format!("{:.1}", delay / 1000.0)),
         &mut delay,
         100.0..=2000.0,
         50.0,
@@ -353,12 +354,12 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         t,
         pal,
         "ai-inline-lines",
-        "Longest suggestion",
-        &format!(
-            "{} line{}",
-            lines as u32,
-            if lines as u32 == 1 { "" } else { "s" }
-        ),
+        tr("Longest suggestion"),
+        &if lines as u32 == 1 {
+            trf!("{n} line", n = lines as u32)
+        } else {
+            trf!("{n} lines", n = lines as u32)
+        },
         &mut lines,
         1.0..=20.0,
         1.0,
@@ -372,7 +373,7 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         t,
         pal,
         "ai-inline-before",
-        "Context before the cursor",
+        tr("Context before the cursor"),
         &chars(before),
         &mut before,
         500.0..=16000.0,
@@ -387,7 +388,7 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
         t,
         pal,
         "ai-inline-after",
-        "Context after the cursor",
+        tr("Context after the cursor"),
         &chars(after),
         &mut after,
         0.0..=8000.0,
@@ -409,7 +410,7 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
     ui.add_space(8.0);
     let status = if !session.inline_available() {
         Some((
-            "Set up a provider and its API key in Settings → AI.".to_string(),
+            tr("Set up a provider and its API key in Settings → AI.").to_string(),
             t.error,
         ))
     } else if let Some(e) = &session.inline.last_error {
@@ -417,7 +418,10 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
     } else {
         session.inline.last_latency.map(|d| {
             (
-                format!("Last suggestion in {:.1} s.", d.as_secs_f32()),
+                trf!(
+                    "Last suggestion in {secs} s.",
+                    secs = format!("{:.1}", d.as_secs_f32())
+                ),
                 pal.desc,
             )
         })
@@ -429,21 +433,29 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
     if !session.inline_available() {
         let (r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
         let b = Rect::from_min_size(r.min, vec2(110.0, 22.0));
-        if crate::prefs::push_button(ui, pal, Id::new("ai-inline-setup"), b, "AI Settings…", 12.0)
-        {
+        if crate::prefs::push_button(
+            ui,
+            pal,
+            Id::new("ai-inline-setup"),
+            b,
+            tr("AI Settings…"),
+            12.0,
+        ) {
             let _ = session.run("ai.settings", &serde_json::Value::Null);
         }
         ui.add_space(4.0);
     }
     ui.label(
-        egui::RichText::new("Tab accepts · ⌘→ next sentence · Esc dismisses · ⌥\\ suggests now")
-            .size(11.0)
-            .color(pal.note),
+        egui::RichText::new(tr(
+            "Tab accepts · ⌘→ next sentence · Esc dismisses · ⌥\\ suggests now",
+        ))
+        .size(11.0)
+        .color(pal.note),
     );
     ui.label(
-        egui::RichText::new(
+        egui::RichText::new(tr(
             "The text around the cursor goes to the chosen model after each pause in typing.",
-        )
+        ))
         .size(11.0)
         .color(pal.note),
     );
@@ -453,11 +465,11 @@ fn body(ui: &mut Ui, t: &Tokens, pal: &Pal, session: &mut Session) -> bool {
 fn chars(n: f32) -> String {
     let n = n as u32;
     if n == 0 {
-        "none".into()
+        tr("none").into()
     } else if n >= 1000 {
-        format!("{:.1}k characters", n as f32 / 1000.0)
+        trf!("{n}k characters", n = format!("{:.1}", n as f32 / 1000.0))
     } else {
-        format!("{n} characters")
+        trf!("{n} characters", n = n)
     }
 }
 

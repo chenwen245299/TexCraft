@@ -4,6 +4,7 @@
 
 ```text
 L0  syntax  log  synctex        pure functions over text/bytes; no workspace deps
+L0  i18n                        interface languages: tr()/trf! over an English-keyed catalogue
 L1  pdf  project                hayro rendering worker; engines, settings, root detection, templates
 L2  typeset                     runs TeX: full typesets (latexmk/tectonic) and live passes
 L2  update                      release manifest, download/verify/unpack, install after quit
@@ -27,6 +28,21 @@ A crate depends only on lower layers. Nothing below `ui` knows about egui.
 - Commands never touch the GUI. They queue `Effect`s (reveal a line, push the selection into the
   editor, flash rectangles in the PDF, open a panel…) that `Workbench::apply_effects` turns into UI
   state or platform `Request`s for the app (file panels, Finder, quit, native edit actions).
+
+## Interface languages
+
+English is the source language. User-visible strings are written in English and wrapped in
+`texcraft_i18n::tr("…")`, or `trf!("Renamed to {path}", path = …)` when they carry values; the
+English text is the key of the catalogue (`crates/i18n/src/zh_hans/<area>.rs`) and the fallback.
+The language is process-wide: the app resolves the Language setting (`View::language`: System /
+English / 简体中文, System following macOS's preferred languages read at launch into
+`Session::system_languages`) with `Session::lang` and applies it with `set_language` every
+frame; egui text changes on the next frame and the native menu bar is rebuilt (AppKit menus
+cannot be retitled in place). Background threads (typesetting, updates) read the same global, so
+their errors arrive in the current language. Tests use `texcraft_i18n::scoped`, a per-thread
+override, so parallel tests never see each other's language. `tests/catalogue.rs` scans the
+workspace's source for `tr`/`trf!` literals: every one needs a zh-Hans entry, entries keep their
+placeholders, `trf!` arguments match them, keys have one translation and none is stale.
 
 ## Threads
 

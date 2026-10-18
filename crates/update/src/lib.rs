@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use texcraft_i18n::{tr, trf};
 
 /// The project's GitHub page (the update window links to it).
 pub const REPO_URL: &str = "https://github.com/chenwen245299/TexCraft";
@@ -170,7 +171,8 @@ pub fn newer_release(manifest: &Manifest, current: &str, platform: &str) -> Opti
 
 /// Parses a manifest.
 pub fn parse_manifest(json: &str) -> Result<Manifest, UpdateError> {
-    serde_json::from_str(json).map_err(|e| err(format!("The update information is invalid: {e}")))
+    serde_json::from_str(json)
+        .map_err(|e| err(trf!("The update information is invalid: {e}", e = e)))
 }
 
 /// `curl` (on `PATH` on macOS and Windows 10+).
@@ -202,24 +204,29 @@ fn no_window(c: &mut Command) {
 /// for tests).
 pub fn fetch_manifest(url: &str) -> Result<Manifest, UpdateError> {
     if let Some(path) = local_path(url) {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| err(format!("Cannot read {}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            err(trf!(
+                "Cannot read {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         return parse_manifest(&text);
     }
     let out = curl()
         .args(["-fsSL", "--max-time", "30", "--retry", "1", url])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| err(format!("Cannot run curl to check for updates: {e}")))?;
+        .map_err(|e| err(trf!("Cannot run curl to check for updates: {e}", e = e)))?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if msg.contains("404") {
-            return Err(err("No TexCraft release has been published yet."));
+            return Err(err(tr("No TexCraft release has been published yet.")));
         }
         return Err(err(if msg.is_empty() {
-            "Cannot reach the update server.".to_string()
+            tr("Cannot reach the update server.").to_string()
         } else {
-            format!("Cannot reach the update server: {msg}")
+            trf!("Cannot reach the update server: {msg}", msg = msg)
         }));
     }
     parse_manifest(&String::from_utf8_lossy(&out.stdout))
@@ -234,14 +241,23 @@ fn local_path(url: &str) -> Option<PathBuf> {
 
 /// Hex SHA-256 of a file.
 pub fn sha256_file(path: &Path) -> Result<String, UpdateError> {
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| err(format!("Cannot open {}: {e}", path.display())))?;
+    let mut f = std::fs::File::open(path).map_err(|e| {
+        err(trf!(
+            "Cannot open {path}: {e}",
+            path = path.display(),
+            e = e
+        ))
+    })?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| err(format!("Cannot read {}: {e}", path.display())))?;
+        let n = f.read(&mut buf).map_err(|e| {
+            err(trf!(
+                "Cannot read {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         if n == 0 {
             break;
         }
@@ -301,7 +317,7 @@ fn spawn_job(
         });
     if spawned.is_err() {
         let (tx, rx2) = channel();
-        let _ = tx.send(Event::Failed("Cannot start the update thread.".into()));
+        let _ = tx.send(Event::Failed(tr("Cannot start the update thread.").into()));
         return Job { rx: rx2, cancel };
     }
     Job { rx, cancel }
@@ -348,13 +364,18 @@ pub fn download(
     progress: &dyn Fn(u64, u64),
 ) -> Result<Staged, UpdateError> {
     let _ = std::fs::remove_dir_all(dir);
-    std::fs::create_dir_all(dir)
-        .map_err(|e| err(format!("Cannot create {}: {e}", dir.display())))?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        err(trf!(
+            "Cannot create {path}: {e}",
+            path = dir.display(),
+            e = e
+        ))
+    })?;
     let archive = dir.join("update.zip");
     let total = release.asset.size;
     if let Some(src) = local_path(&release.asset.url) {
         std::fs::copy(&src, &archive)
-            .map_err(|e| err(format!("Cannot copy {}: {e}", src.display())))?;
+            .map_err(|e| err(trf!("Cannot copy {path}: {e}", path = src.display(), e = e)))?;
         progress(total, total);
     } else {
         let mut child = curl()
@@ -365,12 +386,12 @@ pub fn download(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| err(format!("Cannot run curl to download the update: {e}")))?;
+            .map_err(|e| err(trf!("Cannot run curl to download the update: {e}", e = e)))?;
         let status = loop {
             if cancel.load(Ordering::SeqCst) {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(err("The download was cancelled."));
+                return Err(err(tr("The download was cancelled.")));
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -379,7 +400,7 @@ pub fn download(
                     progress(done.min(total), total);
                     std::thread::sleep(Duration::from_millis(150));
                 }
-                Err(e) => return Err(err(format!("The download failed: {e}"))),
+                Err(e) => return Err(err(trf!("The download failed: {e}", e = e))),
             }
         };
         if !status.success() {
@@ -387,7 +408,7 @@ pub fn download(
             if let Some(mut s) = child.stderr.take() {
                 let _ = s.read_to_string(&mut msg);
             }
-            return Err(err(format!("The download failed: {}", msg.trim())));
+            return Err(err(trf!("The download failed: {e}", e = msg.trim())));
         }
         progress(total, total);
     }
@@ -399,7 +420,7 @@ pub fn download(
     }
     let sum = sha256_file(&archive)?;
     if !sum.eq_ignore_ascii_case(release.asset.sha256.trim()) {
-        return Err(err("The download is damaged (checksum mismatch)."));
+        return Err(err(tr("The download is damaged (checksum mismatch).")));
     }
     let path = unpack(&archive, dir)?;
     Ok(Staged {
@@ -413,8 +434,13 @@ pub fn download(
 pub fn unpack(archive: &Path, dir: &Path) -> Result<PathBuf, UpdateError> {
     let out = dir.join("unpacked");
     let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&out)
-        .map_err(|e| err(format!("Cannot create {}: {e}", out.display())))?;
+    std::fs::create_dir_all(&out).map_err(|e| {
+        err(trf!(
+            "Cannot create {path}: {e}",
+            path = out.display(),
+            e = e
+        ))
+    })?;
     let mut c = if cfg!(target_os = "macos") {
         let mut c = Command::new("/usr/bin/ditto");
         c.args(["-x", "-k"]).arg(archive).arg(&out);
@@ -430,9 +456,9 @@ pub fn unpack(archive: &Path, dir: &Path) -> Result<PathBuf, UpdateError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|e| err(format!("Cannot unpack the update: {e}")))?;
+        .map_err(|e| err(trf!("Cannot unpack the update: {e}", e = e)))?;
     if !status.success() {
-        return Err(err("Cannot unpack the update."));
+        return Err(err(tr("Cannot unpack the update.")));
     }
     let app = if cfg!(target_os = "macos") {
         out.join("TexCraft.app")
@@ -450,7 +476,7 @@ pub fn unpack(archive: &Path, dir: &Path) -> Result<PathBuf, UpdateError> {
     if ok {
         Ok(app)
     } else {
-        Err(err("The update archive does not contain TexCraft."))
+        Err(err(tr("The update archive does not contain TexCraft.")))
     }
 }
 
@@ -494,10 +520,10 @@ del \"%~f0\"\r\n";
 /// Starts a helper that installs `staged` over the running copy once this process exits, and
 /// relaunches it if `relaunch`. The caller quits afterwards (or installs on its next quit).
 pub fn install(staged: &Staged, relaunch: bool) -> Result<(), UpdateError> {
-    let exe =
-        std::env::current_exe().map_err(|e| err(format!("Cannot find TexCraft itself: {e}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| err(trf!("Cannot find TexCraft itself: {e}", e = e)))?;
     let target = install_location(&exe).ok_or_else(|| {
-        err("This copy of TexCraft is not an installed app (a development build); download the new version from the release page.")
+        err(tr("This copy of TexCraft is not an installed app (a development build); download the new version from the release page."))
     })?;
     let parent = target.parent().unwrap_or(&target);
     let probe = parent.join(".texcraft-write-test");
@@ -513,7 +539,7 @@ pub fn install(staged: &Staged, relaunch: bool) -> Result<(), UpdateError> {
     let mut c = if cfg!(windows) {
         let script = std::env::temp_dir().join(format!("texcraft-update-{pid}.cmd"));
         std::fs::write(&script, WINDOWS_INSTALLER)
-            .map_err(|e| err(format!("Cannot write the installer: {e}")))?;
+            .map_err(|e| err(trf!("Cannot write the installer: {e}", e = e)))?;
         let mut c = Command::new("cmd");
         c.arg("/C")
             .arg(&script)
@@ -539,7 +565,7 @@ pub fn install(staged: &Staged, relaunch: bool) -> Result<(), UpdateError> {
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
-        .map_err(|e| err(format!("Cannot start the installer: {e}")))
+        .map_err(|e| err(trf!("Cannot start the installer: {e}", e = e)))
 }
 
 #[cfg(test)]

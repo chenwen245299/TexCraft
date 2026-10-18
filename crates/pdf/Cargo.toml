@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 hayro.workspace = true
+read-fonts.workspace = true
 thiserror.workspace = true
 
 [lints]

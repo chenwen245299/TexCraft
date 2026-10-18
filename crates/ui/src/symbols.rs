@@ -2,7 +2,7 @@
 
 /// One symbol category.
 pub struct Category {
-    /// Header text.
+    /// Header text, in English (shown translated: `tr(name)`).
     pub name: &'static str,
     /// (rendered glyph, command inserted).
     pub symbols: &'static [(&'static str, &'static str)],
@@ -271,3 +271,20 @@ pub const CATEGORIES: &[Category] = &[
         ],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The headers are shown through a variable, which the catalogue's scanner cannot see.
+    #[test]
+    fn category_names_are_translated() {
+        for c in CATEGORIES {
+            assert!(
+                texcraft_i18n::has(texcraft_i18n::Lang::ZhHans, c.name),
+                "{:?}",
+                c.name
+            );
+        }
+    }
+}

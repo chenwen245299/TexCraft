@@ -3,17 +3,25 @@
 //! [`render_page`] renders synchronously (CLI, tests, wasm). [`RenderWorker`] owns a document on a
 //! background thread and renders pages on request, dropping requests that went stale (an older
 //! document, or a page re-requested at another scale) so the viewer stays responsive while the
-//! user zooms and scrolls.
+//! user zooms and scrolls. It also extracts each page's text ([`PageText`]: glyphs, boxes, lines)
+//! for selecting and copying, after the pending renders.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
-use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_interpret::{InterpreterCache, InterpreterSettings};
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
+
+mod text;
+
+pub use text::{
+    Granularity, PageText, TextGlyph, TextLine, TextPos, TextRect, is_cjk_letter, range_on_page,
+    selected_text,
+};
 
 /// The largest bitmap side we render, in pixels.
 pub const MAX_SIDE: f32 = 8192.0;
@@ -110,6 +118,18 @@ pub fn render_page(data: Arc<Vec<u8>>, page: usize, scale: f32) -> Result<Render
     )
 }
 
+/// Extracts the text of one page synchronously (0-based `page`).
+pub fn page_text(data: Arc<Vec<u8>>, page: usize) -> Result<PageText, PdfError> {
+    let pdf = guarded(|| load(data))??;
+    text::extract(
+        &pdf,
+        &InterpreterCache::new(),
+        &InterpreterSettings::default(),
+        &mut text::CidFonts::default(),
+        page,
+    )
+}
+
 fn render_with<'a>(
     pdf: &'a Pdf,
     cache: &RenderCache<'a>,
@@ -179,6 +199,15 @@ pub enum RenderEvent {
     },
     /// A page is ready.
     Rendered(RenderedPage),
+    /// A page's text is ready.
+    Text {
+        /// The document generation.
+        doc: u64,
+        /// 0-based page.
+        page: usize,
+        /// Its text, or why it could not be read.
+        text: Result<Arc<PageText>, PdfError>,
+    },
     /// Opening or rendering failed.
     Failed {
         /// The document generation.
@@ -193,6 +222,7 @@ pub enum RenderEvent {
 enum Msg {
     Open { doc: u64, data: Arc<Vec<u8>> },
     Render { doc: u64, page: usize, scale: f32 },
+    Text { doc: u64, page: usize },
     CancelRenders,
 }
 
@@ -237,6 +267,12 @@ impl RenderWorker {
         let _ = self.tx.send(Msg::Render { doc, page, scale });
     }
 
+    /// Requests the text of page `page` (0-based) of document `doc`. Text is extracted once the
+    /// pending renders are done.
+    pub fn text(&self, doc: u64, page: usize) {
+        let _ = self.tx.send(Msg::Text { doc, page });
+    }
+
     /// Drops all pending render requests.
     pub fn cancel_renders(&self) {
         let _ = self.tx.send(Msg::CancelRenders);
@@ -278,12 +314,14 @@ fn worker_main(rx: &Receiver<Msg>, tx: &Sender<RenderEvent>, wake: &dyn Fn()) {
         });
         wake();
         let cache = RenderCache::new();
+        let text_cache = InterpreterCache::new();
+        let mut text_fonts = text::CidFonts::default();
         let settings = InterpreterSettings::default();
-        let mut queue: VecDeque<(usize, f32)> = VecDeque::new();
+        let mut queue = Queue::default();
 
         'doc: loop {
             // Block for work when idle, then drain everything pending.
-            if queue.is_empty() {
+            if queue.renders.is_empty() && queue.texts.is_empty() {
                 match rx.recv() {
                     Ok(msg) => {
                         if absorb(msg, doc, &mut queue, &mut next_open) {
@@ -304,7 +342,16 @@ fn worker_main(rx: &Receiver<Msg>, tx: &Sender<RenderEvent>, wake: &dyn Fn()) {
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
-            let Some((page, scale)) = queue.pop_front() else {
+            let Some((page, scale)) = queue.renders.pop_front() else {
+                // Pixels first: text only when no render is waiting.
+                if let Some(page) = queue.texts.pop_front() {
+                    let text = text::extract(&pdf, &text_cache, &settings, &mut text_fonts, page)
+                        .map(Arc::new);
+                    if tx.send(RenderEvent::Text { doc, page, text }).is_err() {
+                        return;
+                    }
+                    wake();
+                }
                 continue;
             };
             let event = match render_with(&pdf, &cache, &settings, doc, page, scale) {
@@ -323,11 +370,20 @@ fn worker_main(rx: &Receiver<Msg>, tx: &Sender<RenderEvent>, wake: &dyn Fn()) {
     }
 }
 
+/// Work waiting for the open document.
+#[derive(Default)]
+struct Queue {
+    /// Pages to render, at a scale.
+    renders: VecDeque<(usize, f32)>,
+    /// Pages whose text to extract.
+    texts: VecDeque<usize>,
+}
+
 /// Folds one message into the queue. Returns true when a new document must be opened.
 fn absorb(
     msg: Msg,
     doc: u64,
-    queue: &mut VecDeque<(usize, f32)>,
+    queue: &mut Queue,
     next_open: &mut Option<(u64, Arc<Vec<u8>>)>,
 ) -> bool {
     match msg {
@@ -341,13 +397,19 @@ fn absorb(
             scale,
         } => {
             if d == doc {
-                queue.retain(|(p, _)| *p != page);
-                queue.push_back((page, scale));
+                queue.renders.retain(|(p, _)| *p != page);
+                queue.renders.push_back((page, scale));
+            }
+            false
+        }
+        Msg::Text { doc: d, page } => {
+            if d == doc && !queue.texts.contains(&page) {
+                queue.texts.push_back(page);
             }
             false
         }
         Msg::CancelRenders => {
-            queue.clear();
+            queue.renders.clear();
             false
         }
     }

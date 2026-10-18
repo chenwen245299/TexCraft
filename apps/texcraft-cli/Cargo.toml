@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 texcraft-engine.workspace = true
+texcraft-i18n.workspace = true
 texcraft-syntax.workspace = true
 texcraft-log.workspace = true
 texcraft-synctex.workspace = true

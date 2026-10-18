@@ -161,6 +161,9 @@ pub struct Tokens {
     pub page_border: Color32,
     /// SyncTeX flash.
     pub sync_flash: Color32,
+    /// The source that inverse search landed on, flashed in the editor as a full-width band: lemon
+    /// yellow as in the target app, far more saturated than the cream page and find matches.
+    pub source_flash: Color32,
     /// Popup/popover background.
     pub popup_bg: Color32,
     /// The "M" of a modified file in Source Control.
@@ -280,6 +283,7 @@ impl Tokens {
             pdf_bg: hex(0xECECEC),
             page_border: hex(0xD0D0D2),
             sync_flash: Color32::from_rgba_unmultiplied(80, 160, 255, 70),
+            source_flash: Color32::from_rgba_unmultiplied(250, 240, 50, 235),
             popup_bg: hex(0xF2F2F2),
             git_modified: hex(0xB7791F),
             menu_border: Color32::from_black_alpha(38),
@@ -369,6 +373,8 @@ impl Tokens {
             pdf_bg: hex(0x1E1E1E),
             page_border: hex(0x111111),
             sync_flash: Color32::from_rgba_unmultiplied(80, 160, 255, 80),
+            // Deep amber: syntax colours (blue commands) stay readable on it.
+            source_flash: Color32::from_rgba_unmultiplied(255, 200, 0, 64),
             popup_bg: hex(0x2C2C2E),
             git_modified: hex(0xE2C08D),
             menu_border: Color32::from_white_alpha(34),
@@ -665,4 +671,56 @@ pub fn install_style(ctx: &egui::Context) {
         scroll.interact_background_opacity = 0.0;
         style.interaction.selectable_labels = false;
     });
+}
+
+#[cfg(test)]
+mod flash_colour_tests {
+    use super::*;
+
+    /// `fg` (premultiplied) over an opaque `bg`.
+    fn over(bg: Color32, fg: Color32) -> [f32; 3] {
+        let a = f32::from(fg.a()) / 255.0;
+        let mix = |f: u8, b: u8| f32::from(f) + f32::from(b) * (1.0 - a);
+        [
+            mix(fg.r(), bg.r()),
+            mix(fg.g(), bg.g()),
+            mix(fg.b(), bg.b()),
+        ]
+    }
+
+    fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    fn rgb(c: Color32) -> [f32; 3] {
+        [f32::from(c.r()), f32::from(c.g()), f32::from(c.b())]
+    }
+
+    /// The inverse-search flash is yellow and clearly apart from every editor page: white,
+    /// the Classic theme's cream and dark; and from the (paler) find-match yellow.
+    #[test]
+    fn source_flash_is_yellow_and_stands_out() {
+        let classic = Tokens::light().with_editor_theme(texcraft_engine::EditorTheme::Classic);
+        for t in [Tokens::light(), classic, Tokens::dark()] {
+            let bg = t.editor_bg;
+            let lit = over(bg, t.source_flash);
+            let [r, g, b] = lit;
+            assert!(r > b + 50.0 && g > b + 40.0, "yellow: {lit:?} on {bg:?}");
+            let apart = if t.dark { 55.0 } else { 80.0 };
+            assert!(
+                distance(lit, rgb(bg)) > apart,
+                "{lit:?} too close to {bg:?}"
+            );
+            let find = over(bg, t.find_match);
+            assert!(distance(lit, find) > 20.0, "{lit:?} vs find {find:?}");
+        }
+        // The cream page itself is a pale yellow: the flash is far more saturated.
+        let cream = rgb(hex(0xFCF8E4));
+        let lit = over(hex(0xFCF8E4), Tokens::light().source_flash);
+        assert!(cream[2] - lit[2] > 100.0, "{lit:?}");
+    }
 }

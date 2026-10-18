@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 texcraft-engine.workspace = true
+texcraft-i18n.workspace = true
 texcraft-ui.workspace = true
 texcraft-project.workspace = true
 egui.workspace = true

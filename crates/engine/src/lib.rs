@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use texcraft_i18n::{Lang, tr, trf};
 use texcraft_log::{Issue, Severity};
 use texcraft_project::{Engine, FileKind, FileNode, Settings, Typesetter, find_root};
 use texcraft_synctex::{PdfRect, SyncTex};
@@ -22,6 +23,7 @@ pub mod files;
 pub mod git;
 pub mod index;
 pub mod inline;
+pub mod sync;
 pub mod update;
 
 pub use commands::{CommandSpec, Shortcut, registry};
@@ -69,10 +71,10 @@ impl Document {
         self.path.is_none() && self.revision == 1
     }
 
-    /// File name, or "Untitled".
+    /// File name, or "Untitled" (in the interface language).
     pub fn display_name(&self) -> String {
         self.path.as_ref().and_then(|p| p.file_name()).map_or_else(
-            || "Untitled".to_string(),
+            || tr("Untitled").to_string(),
             |n| n.to_string_lossy().into_owned(),
         )
     }
@@ -139,16 +141,16 @@ impl SidebarTab {
         Self::Search,
     ];
 
-    /// Tooltip / accessibility name.
+    /// Tooltip / accessibility name (in the interface language).
     pub fn label(self) -> &'static str {
         match self {
-            Self::Contents => "Contents",
-            Self::Todos => "TODOs",
-            Self::Git => "Source Control",
-            Self::Files => "File Browser",
-            Self::Results => "Typeset Results",
-            Self::Search => "Search",
-            Self::Assistant => "AI Assistant",
+            Self::Contents => tr("Contents"),
+            Self::Todos => tr("TODOs"),
+            Self::Git => tr("Source Control"),
+            Self::Files => tr("File Browser"),
+            Self::Results => tr("Typeset Results"),
+            Self::Search => tr("Search"),
+            Self::Assistant => tr("AI Assistant"),
         }
     }
 }
@@ -250,6 +252,46 @@ pub enum ThemeChoice {
     Dark,
 }
 
+/// The interface language setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum LanguageChoice {
+    /// The first of the system's preferred languages TexCraft has (macOS: Language & Region),
+    /// else English.
+    #[default]
+    System,
+    /// English.
+    English,
+    /// Simplified Chinese (简体中文).
+    #[serde(rename = "zh-Hans")]
+    ChineseSimplified,
+}
+
+impl LanguageChoice {
+    /// Every choice, in menu order.
+    pub const ALL: [LanguageChoice; 3] = [Self::System, Self::English, Self::ChineseSimplified];
+
+    /// The language this choice means, given the system's preferred languages (most preferred
+    /// first, BCP 47 or POSIX tags).
+    pub fn resolve<S: AsRef<str>>(self, system: &[S]) -> Lang {
+        match self {
+            Self::System => Lang::from_preferred(system),
+            Self::English => Lang::En,
+            Self::ChineseSimplified => Lang::ZhHans,
+        }
+    }
+
+    /// The choice for a `--lang` value: `system`, or a language tag (`en`, `zh-Hans`, `zh-CN`…).
+    pub fn from_arg(arg: &str) -> Option<LanguageChoice> {
+        if arg.eq_ignore_ascii_case("system") {
+            return Some(Self::System);
+        }
+        Lang::from_tag(arg).map(|l| match l {
+            Lang::En => Self::English,
+            Lang::ZhHans => Self::ChineseSimplified,
+        })
+    }
+}
+
 /// View state: which panes are shown and how. Persisted between launches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -276,6 +318,8 @@ pub struct View {
     pub scroll_lock: bool,
     /// Theme.
     pub theme: ThemeChoice,
+    /// Interface language.
+    pub language: LanguageChoice,
     /// Editor colour scheme.
     pub editor_theme: EditorTheme,
     /// Editor font size in points.
@@ -330,6 +374,7 @@ impl Default for View {
             grading: Grading::Entire,
             scroll_lock: false,
             theme: ThemeChoice::System,
+            language: LanguageChoice::System,
             editor_theme: EditorTheme::Classic,
             editor_font_size: 16.0,
             wrap_lines: true,
@@ -368,6 +413,30 @@ pub enum NativeEdit {
     Paste,
     /// Select all.
     SelectAll,
+}
+
+/// A point on a PDF page: 1-based page, points from the page's top-left corner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfPoint {
+    /// 1-based page.
+    pub page: u32,
+    /// Points from the left edge.
+    pub x: f32,
+    /// Points from the top edge.
+    pub y: f32,
+}
+
+/// How a PDF text selection grows: by character (drag), word (double-click) or line
+/// (triple-click).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextUnit {
+    /// Characters.
+    #[default]
+    Char,
+    /// Whole words.
+    Word,
+    /// Whole lines.
+    Line,
 }
 
 /// Something the UI should do after a command or a tick.
@@ -457,6 +526,18 @@ pub enum Effect {
     UpdateWindow,
     /// Put text on the clipboard.
     CopyText(String),
+    /// Briefly highlight characters `start..end` of document `doc` (where inverse search
+    /// landed); an empty range highlights the caret's row.
+    FlashSource {
+        /// Document index.
+        doc: usize,
+        /// First character.
+        start: usize,
+        /// End (exclusive).
+        end: usize,
+    },
+    /// Select text in the PDF from one point to another; `None` clears the selection.
+    SelectPdfText(Option<(PdfPoint, PdfPoint, TextUnit)>),
     /// Show the diff in `Session::git.diff`.
     GitDiff,
     /// Open Settings at the AI pane.
@@ -530,6 +611,9 @@ pub struct PdfState {
     pub mirror: Option<Mirror>,
     /// The edit this PDF reflects (for measuring keystroke-to-pixels latency).
     pub edit_at: Option<Instant>,
+    /// The text selected in the PDF viewer (kept up to date by the viewer; `pdf.copySelection`
+    /// copies it).
+    pub selected_text: String,
 }
 
 /// One TexCraft window's worth of state.
@@ -583,25 +667,38 @@ pub struct Session {
     pub pdf_fit_scale: Option<f32>,
     /// Moves files to the Trash (the macOS app installs AppKit's; tests install a fake).
     pub trash: files::TrashFn,
+    /// The system's preferred interface languages, most preferred first (the app reads them at
+    /// launch; empty means English). The Language setting's System choice follows them.
+    pub system_languages: Vec<String>,
     waker: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// Errors from commands.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Errors from commands. `Failed` carries a message for the user, already in the interface
+/// language; the others are worded (translated) when displayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
     /// No command with that id.
-    #[error("unknown command `{0}`")]
     Unknown(String),
     /// The command is disabled in the current state.
-    #[error("`{0}` is not available right now")]
     Disabled(String),
-    /// Bad or missing parameters.
-    #[error("bad parameters: {0}")]
+    /// Bad or missing parameters (for agents and scripts: the detail stays English).
     Params(String),
     /// The command ran and failed.
-    #[error("{0}")]
     Failed(String),
 }
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(id) => f.write_str(&trf!("unknown command `{id}`", id = id)),
+            Self::Disabled(id) => f.write_str(&trf!("`{id}` is not available right now", id = id)),
+            Self::Params(detail) => f.write_str(&trf!("bad parameters: {detail}", detail = detail)),
+            Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
 
 impl Session {
     /// A new session with one untitled document. `waker` is called from background threads when
@@ -633,6 +730,7 @@ impl Session {
             plan_cache: std::cell::Cell::new(None),
             index_built: None,
             trash: files::system_trash,
+            system_languages: Vec::new(),
             waker,
         };
         s.new_untitled(texcraft_project::templates::TEMPLATES[1].source.to_string());
@@ -673,6 +771,12 @@ impl Session {
     /// The active document, mutably.
     pub fn doc_mut(&mut self) -> Option<&mut Document> {
         self.docs.get_mut(self.active)
+    }
+
+    /// The interface language: the Language setting, with System resolved against
+    /// [`Session::system_languages`]. The app applies it ([`texcraft_i18n::set_language`]).
+    pub fn lang(&self) -> Lang {
+        self.view.language.resolve(&self.system_languages)
     }
 
     /// Shows a transient status message.
@@ -755,13 +859,18 @@ impl Session {
             return Ok(i);
         }
         if !FileKind::of(path).is_editable() && path.extension().is_some() {
-            return Err(CommandError::Failed(format!(
-                "{} is not a text file TexCraft can edit",
-                path.display()
+            return Err(CommandError::Failed(trf!(
+                "{path} is not a text file TexCraft can edit",
+                path = path.display()
             )));
         }
-        let bytes = std::fs::read(path)
-            .map_err(|e| CommandError::Failed(format!("cannot open {}: {e}", path.display())))?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            CommandError::Failed(trf!(
+                "cannot open {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         let text = String::from_utf8(bytes)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
             .replace("\r\n", "\n");
@@ -822,14 +931,19 @@ impl Session {
     /// Saves document `idx` to its path (untitled documents ask for a path).
     pub fn save(&mut self, idx: usize) -> Result<(), CommandError> {
         let Some(doc) = self.docs.get_mut(idx) else {
-            return Err(CommandError::Failed("no such document".into()));
+            return Err(CommandError::Failed(tr("no such document").into()));
         };
         let Some(path) = doc.path.clone() else {
             self.effect(Effect::SaveAsDialog { doc: idx });
             return Ok(());
         };
-        std::fs::write(&path, doc.text.as_bytes())
-            .map_err(|e| CommandError::Failed(format!("cannot save {}: {e}", path.display())))?;
+        std::fs::write(&path, doc.text.as_bytes()).map_err(|e| {
+            CommandError::Failed(trf!(
+                "cannot save {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         doc.saved_revision = doc.revision;
         self.git.stale = true;
         Ok(())
@@ -838,10 +952,15 @@ impl Session {
     /// Saves document `idx` to `path` (Save As).
     pub fn save_as(&mut self, idx: usize, path: PathBuf) -> Result<(), CommandError> {
         let Some(doc) = self.docs.get_mut(idx) else {
-            return Err(CommandError::Failed("no such document".into()));
+            return Err(CommandError::Failed(tr("no such document").into()));
         };
-        std::fs::write(&path, doc.text.as_bytes())
-            .map_err(|e| CommandError::Failed(format!("cannot save {}: {e}", path.display())))?;
+        std::fs::write(&path, doc.text.as_bytes()).map_err(|e| {
+            CommandError::Failed(trf!(
+                "cannot save {path}: {e}",
+                path = path.display(),
+                e = e
+            ))
+        })?;
         doc.path = Some(path.clone());
         doc.scratch = None;
         doc.saved_revision = doc.revision;
@@ -909,7 +1028,7 @@ impl Session {
         let copied = std::fs::copy(pdf, &part).and_then(|_| std::fs::rename(&part, &dest));
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&part);
-            self.set_status(format!("Cannot write {name}: {e}"));
+            self.set_status(trf!("Cannot write {name}: {e}", name = name, e = e));
             return;
         }
         self.refresh_files();
@@ -1071,7 +1190,7 @@ impl Session {
         }
         let root = self
             .root_path()
-            .ok_or_else(|| CommandError::Failed("nothing to typeset".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("nothing to typeset").into()))?;
         // Write what the engine will read: open buffers of this project (saved docs) and the
         // scratch file of an untitled document.
         let save_all = self.settings.save_before_typeset;
@@ -1085,7 +1204,11 @@ impl Session {
                         let _ = std::fs::create_dir_all(dir);
                     }
                     std::fs::write(&scratch, d.text.as_bytes()).map_err(|e| {
-                        CommandError::Failed(format!("cannot write {}: {e}", scratch.display()))
+                        CommandError::Failed(trf!(
+                            "cannot write {path}: {e}",
+                            path = scratch.display(),
+                            e = e
+                        ))
                     })?;
                 }
             } else if save_all && d.is_dirty() {
@@ -1119,13 +1242,13 @@ impl Session {
         }
         let root = self
             .root_path()
-            .ok_or_else(|| CommandError::Failed("nothing to typeset".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("nothing to typeset").into()))?;
         let root = texcraft_project::normalize(&root);
         let project_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
         let root_rel = root
             .file_name()
             .map(PathBuf::from)
-            .ok_or_else(|| CommandError::Failed("the root file has no name".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("the root file has no name").into()))?;
         let buffers: Vec<(PathBuf, String)> = self
             .docs
             .iter()
@@ -1137,7 +1260,7 @@ impl Session {
             .collect();
         if !buffers.iter().any(|(p, _)| *p == root_rel) && !root.is_file() {
             return Err(CommandError::Failed(
-                "the root file is not saved yet".into(),
+                tr("the root file is not saved yet").into(),
             ));
         }
         let plan = self.typeset_plan();
@@ -1273,23 +1396,31 @@ impl Session {
         if let Some(err) = &outcome.error {
             self.set_status(err.clone());
             self.effect(Effect::Alert {
-                title: "Typesetting could not start".into(),
+                title: tr("Typesetting could not start").into(),
                 message: err.clone(),
             });
         } else if outcome.cancelled {
-            self.set_status("Typesetting stopped");
+            self.set_status(tr("Typesetting stopped"));
         } else if outcome.live {
             self.typeset.last_live = Some(outcome.duration);
         } else {
             let errors = outcome.report.errors();
             let warnings = outcome.report.warnings();
-            self.set_status(format!(
-                "Typeset in {:.1} s — {} error{}, {} warning{}",
-                outcome.duration.as_secs_f32(),
-                errors,
-                if errors == 1 { "" } else { "s" },
-                warnings,
-                if warnings == 1 { "" } else { "s" },
+            let errors_text = if errors == 1 {
+                trf!("{n} error", n = errors)
+            } else {
+                trf!("{n} errors", n = errors)
+            };
+            let warnings_text = if warnings == 1 {
+                trf!("{n} warning", n = warnings)
+            } else {
+                trf!("{n} warnings", n = warnings)
+            };
+            self.set_status(trf!(
+                "Typeset in {seconds} s — {errors}, {warnings}",
+                seconds = format!("{:.1}", outcome.duration.as_secs_f32()),
+                errors = errors_text,
+                warnings = warnings_text
             ));
             if errors > 0 && self.view.show_issues_after_error && !outcome.live {
                 self.view.sidebar = true;
@@ -1364,7 +1495,7 @@ impl Session {
             .unwrap_or_default();
         if rects.is_empty() {
             if flash {
-                self.set_status("No matching position in the PDF");
+                self.set_status(tr("No matching position in the PDF"));
             }
             return;
         }
@@ -1373,12 +1504,24 @@ impl Session {
 
     /// Inverse search: opens the source at the point on a PDF page.
     pub fn inverse_sync(&mut self, page: u32, x: f32, y: f32) -> Result<(), CommandError> {
+        self.inverse_sync_with(page, x, y, None)
+    }
+
+    /// Inverse search with the PDF text around the point: the caret lands on the clicked
+    /// character when the source line contains it, and its sentence (else the line) flashes.
+    pub fn inverse_sync_with(
+        &mut self,
+        page: u32,
+        x: f32,
+        y: f32,
+        hint: Option<&sync::SyncHint>,
+    ) -> Result<(), CommandError> {
         let loc = self
             .pdf
             .synctex
             .as_ref()
             .and_then(|s| s.inverse(page, x, y))
-            .ok_or_else(|| CommandError::Failed("No source position for that point".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("No source position for that point").into()))?;
         let base = self
             .typeset
             .root
@@ -1394,7 +1537,22 @@ impl Session {
             Some(m) => m.to_project(&file),
             None => file,
         };
-        self.reveal(&file, loc.line)
+        self.reveal(&file, loc.line)?;
+        let doc = self.active;
+        if let Some(d) = self.docs.get_mut(doc) {
+            let start = edit::char_of_line(&d.text, loc.line);
+            let from = edit::byte_of(&d.text, start);
+            let rest = d.text.get(from..).unwrap_or_default();
+            let line = rest.split('\n').next().unwrap_or_default();
+            let (caret, flash) = sync::locate(line, loc.column, hint);
+            d.selection = Selection::caret(start + caret);
+            self.effect(Effect::FlashSource {
+                doc,
+                start: start + flash.start,
+                end: start + flash.end,
+            });
+        }
+        Ok(())
     }
 
     /// Opens `file` (if needed) and moves the caret to 1-based `line`.
@@ -1522,7 +1680,7 @@ impl Session {
         let doc = self
             .docs
             .get_mut(idx)
-            .ok_or_else(|| CommandError::Failed("no document".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("no document").into()))?;
         let (text, sel) = f(&doc.text, doc.selection);
         doc.replace_text(text, sel);
         self.effect(Effect::SelectionChanged { doc: idx });
@@ -1533,6 +1691,11 @@ impl Session {
     /// A JSON summary of the state, for the control channel and tests.
     pub fn inspect(&self) -> serde_json::Value {
         let (errors, warnings, bad_boxes) = self.issue_counts();
+        // English whatever the interface language: agents parse it.
+        let toolchain = {
+            let _en = texcraft_i18n::scoped(Lang::En);
+            self.toolchain.describe()
+        };
         serde_json::json!({
             "documents": self.docs.iter().enumerate().map(|(i, d)| serde_json::json!({
                 "index": i,
@@ -1554,6 +1717,12 @@ impl Session {
                 "busy": self.update.is_busy(),
             },
             "view": self.view,
+            // The Language setting is `view.language`; this is what it means now.
+            "language": {
+                "resolved": self.lang().code(),
+                "interface": texcraft_i18n::language().code(),
+                "system": self.system_languages,
+            },
             "typeset": {
                 "mode": self.settings.mode().name(),
                 "paused": self.live_paused,
@@ -1573,14 +1742,15 @@ impl Session {
                 "path": self.pdf.path,
                 "generation": self.pdf.generation,
                 "synctex": self.pdf.synctex.is_some(),
+                "selectedText": self.pdf.selected_text,
             },
             "status": self.status.as_ref().map(|s| s.0.clone()),
-            "toolchain": self.toolchain.describe(),
+            "toolchain": toolchain,
             "ai": {
                 "provider": self.ai.config.selection().map(|(p, _)| p.name.clone()),
                 "model": self.ai.config.selection().map(|(_, m)| m.to_string()),
                 "providers": self.ai.config.providers.iter().map(|p| serde_json::json!({
-                    "id": p.id, "name": p.name, "kind": p.kind.label(), "baseUrl": p.base_url,
+                    "id": p.id, "name": p.name, "kind": p.kind.name(), "baseUrl": p.base_url,
                     "hasKey": p.has_key, "models": p.models, "enabled": p.enabled,
                 })).collect::<Vec<_>>(),
                 "includeDocument": self.ai.config.include_document,

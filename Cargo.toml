@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 # Workspace crates (layer in brackets, see AGENTS.md)
 texcraft-syntax = { path = "crates/syntax" }   # L0
+texcraft-i18n = { path = "crates/i18n" }       # L0 interface languages (English source, zh-Hans)
 texcraft-log = { path = "crates/log" }         # L0
 texcraft-synctex = { path = "crates/synctex" } # L0
 texcraft-pdf = { path = "crates/pdf" }         # L1
@@ -30,6 +31,8 @@ egui = "0.36.2"
 eframe = { version = "0.36.2", features = ["persistence"] }
 egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }
 hayro = "0.8.0"
+# CFF charsets for PDF text extraction (the version hayro's skrifa already uses).
+read-fonts = "0.43.3"
 flate2 = "1.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

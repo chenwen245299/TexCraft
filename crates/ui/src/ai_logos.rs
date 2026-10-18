@@ -52,7 +52,7 @@ const LOGOS: &[(&str, &[u8], bool)] = &[
     (
         "providers/dots",
         include_bytes!("../../../assets/ai-logos/providers/dots.svg"),
-        false,
+        true,
     ),
     (
         "providers/gemini",
@@ -127,7 +127,7 @@ const LOGOS: &[(&str, &[u8], bool)] = &[
     (
         "providers/openrouter",
         include_bytes!("../../../assets/ai-logos/providers/openrouter.svg"),
-        false,
+        true,
     ),
     (
         "providers/qwenai",
@@ -192,7 +192,7 @@ const LOGOS: &[(&str, &[u8], bool)] = &[
     (
         "models/dots",
         include_bytes!("../../../assets/ai-logos/models/dots.svg"),
-        false,
+        true,
     ),
     (
         "models/gemini",
@@ -631,6 +631,20 @@ mod tests {
             );
             if pixmap.pixels().iter().all(|p| p.alpha() == 0) {
                 broken.push(format!("{key}: renders nothing"));
+            }
+            // Drawn as it is, black ink vanishes on the dark theme's menus: such a logo must be
+            // monochrome (tinted with the text colour).
+            let brightest = pixmap
+                .pixels()
+                .iter()
+                .filter(|p| p.alpha() > 128)
+                .map(|p| {
+                    let c = p.demultiply();
+                    c.red().max(c.green()).max(c.blue())
+                })
+                .max();
+            if !source.mono && brightest.is_some_and(|b| b < 48) {
+                broken.push(format!("{key}: black only; mark it monochrome"));
             }
         }
         assert!(broken.is_empty(), "{broken:#?}");

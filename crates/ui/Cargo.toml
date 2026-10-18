@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 texcraft-engine.workspace = true
 texcraft-syntax.workspace = true
+texcraft-i18n.workspace = true
 texcraft-project.workspace = true
 texcraft-git.workspace = true
 texcraft-ai.workspace = true

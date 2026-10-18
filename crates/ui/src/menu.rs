@@ -237,7 +237,7 @@ pub fn command(
         disabled: !session.is_enabled(id),
         ..Default::default()
     };
-    if item(ui, t, label.unwrap_or(spec.label), opts).clicked()
+    if item(ui, t, label.unwrap_or(spec.label()), opts).clicked()
         && let Err(e) = session.run(id, &serde_json::Value::Null)
     {
         session.set_status(e.to_string());

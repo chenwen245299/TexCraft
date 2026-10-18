@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use texcraft_ai::Event;
 use texcraft_ai::inline as ai_inline;
+use texcraft_i18n::{tr, trf};
 
 use crate::{CommandError, Session, edit};
 
@@ -152,7 +153,7 @@ impl Session {
     /// Inserts the suggestion (Tab), its next sentence (⌘→) or its next word.
     pub fn inline_accept(&mut self, part: Accept) -> Result<(), CommandError> {
         let Some(s) = self.inline_suggestion().cloned() else {
-            return Err(CommandError::Failed("no suggestion to accept".into()));
+            return Err(CommandError::Failed(tr("no suggestion to accept").into()));
         };
         let take = match part {
             Accept::All => s.text.clone(),
@@ -203,14 +204,14 @@ impl Session {
             .map(|(p, m)| (p.clone(), m.to_string()))
         else {
             return Err(CommandError::Failed(
-                "Set up an AI provider in Settings → AI first.".into(),
+                tr("Set up an AI provider in Settings → AI first.").into(),
             ));
         };
         let api_key = self.ai_key_for(&provider);
         if api_key.trim().is_empty() && !texcraft_ai::is_local(&provider) {
-            return Err(CommandError::Failed(format!(
-                "Add the API key for {} in Settings → AI.",
-                provider.name
+            return Err(CommandError::Failed(trf!(
+                "Add the API key for {provider} in Settings → AI.",
+                provider = provider.name
             )));
         }
         let Some(d) = self.docs.get(self.active) else {
@@ -312,7 +313,7 @@ impl Session {
                 }
                 Event::Refused(_) => {
                     self.inline.pending = None;
-                    self.inline.last_error = Some("The model declined to suggest here.".into());
+                    self.inline.last_error = Some(tr("The model declined to suggest here.").into());
                 }
                 Event::Failed(msg) => {
                     self.inline.pending = None;
@@ -352,9 +353,10 @@ impl Session {
 fn only_thought(config: &texcraft_ai::Config) -> String {
     let model = config
         .inline_selection()
-        .map_or_else(|| "The model".to_string(), |(_, m)| m.to_string());
-    format!(
+        .map_or_else(|| tr("The model").to_string(), |(_, m)| m.to_string());
+    trf!(
         "{model} spent the suggestion on reasoning and wrote nothing. Pick a model that \
-         answers without reasoning for suggestions."
+         answers without reasoning for suggestions.",
+        model = model
     )
 }

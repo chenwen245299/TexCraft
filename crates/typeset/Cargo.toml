@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+texcraft-i18n.workspace = true
 texcraft-log.workspace = true
 texcraft-project.workspace = true
 texcraft-syntax.workspace = true

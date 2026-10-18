@@ -1,4 +1,6 @@
-//! The native macOS menu bar, built from the command registry (muda).
+//! The native macOS menu bar, built from the command registry (muda), in the interface
+//! language. AppKit menus cannot retitle themselves, so a language change rebuilds the bar
+//! ([`NativeMenu::set_language`]).
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -8,6 +10,7 @@ use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use texcraft_engine::commands::Menu as CmdMenu;
 use texcraft_engine::{Session, Shortcut, registry};
+use texcraft_i18n::{Lang, tr};
 use texcraft_project::templates::TEMPLATES;
 
 enum Item {
@@ -23,8 +26,9 @@ pub struct NativeMenu {
     _menu: Menu,
     items: Vec<Entry>,
     recent: Submenu,
-    recent_shown: Vec<std::path::PathBuf>,
+    recent_shown: Option<Vec<std::path::PathBuf>>,
     rx: Receiver<String>,
+    lang: Lang,
 }
 
 fn accelerator(sc: Shortcut) -> Option<Accelerator> {
@@ -69,8 +73,90 @@ fn accelerator(sc: Shortcut) -> Option<Accelerator> {
     Some(Accelerator::new(m, code))
 }
 
+/// Builds the menu bar in the current interface language and installs it in NSApp.
+fn build() -> (Menu, Vec<Entry>, Submenu) {
+    let menu = Menu::new();
+    let mut items: Vec<Entry> = Vec::new();
+    let recent = Submenu::new(tr("Open Recent"), true);
+
+    for top in CmdMenu::BAR {
+        let sub = Submenu::new(top.title(), true);
+        if top == CmdMenu::Window {
+            let _ = sub.append(&PredefinedMenuItem::minimize(Some(tr("Minimize"))));
+            let _ = sub.append(&PredefinedMenuItem::maximize(Some(tr("Zoom"))));
+            let _ = sub.append(&PredefinedMenuItem::fullscreen(Some(tr(
+                "Enter Full Screen",
+            ))));
+            let _ = sub.append(&PredefinedMenuItem::separator());
+        }
+        let mut last_group = None;
+        for c in registry().iter().filter(|c| c.menu == top) {
+            if last_group.is_some_and(|g| g != c.group) {
+                let _ = sub.append(&PredefinedMenuItem::separator());
+            }
+            last_group = Some(c.group);
+            // The app menu gets the standard Services / Hide items before Quit.
+            if top == CmdMenu::App && c.id == "app.quit" {
+                let _ = sub.append(&PredefinedMenuItem::services(Some(tr("Services"))));
+                let _ = sub.append(&PredefinedMenuItem::separator());
+                let _ = sub.append(&PredefinedMenuItem::hide(Some(tr("Hide TexCraft"))));
+                let _ = sub.append(&PredefinedMenuItem::hide_others(Some(tr("Hide Others"))));
+                let _ = sub.append(&PredefinedMenuItem::show_all(Some(tr("Show All"))));
+                let _ = sub.append(&PredefinedMenuItem::separator());
+            }
+            if c.id == "file.newFromTemplate" {
+                let tsub = Submenu::new(tr("New from Template"), true);
+                for t in TEMPLATES {
+                    let _ = tsub.append(&MenuItem::with_id(
+                        format!("template:{}", t.id),
+                        tr(t.name),
+                        true,
+                        None,
+                    ));
+                }
+                let _ = tsub.append(&PredefinedMenuItem::separator());
+                let _ = tsub.append(&MenuItem::with_id(
+                    "file.newFromTemplate",
+                    tr("Template Gallery…"),
+                    true,
+                    None,
+                ));
+                let _ = sub.append(&tsub);
+                continue;
+            }
+            let acc = c.shortcut.and_then(accelerator);
+            if c.checked.is_some() {
+                let item = CheckMenuItem::with_id(c.id, c.label(), true, false, acc);
+                let _ = sub.append(&item);
+                items.push((c.id, Item::Check(item), None));
+            } else {
+                let item = MenuItem::with_id(c.id, c.label(), true, acc);
+                let _ = sub.append(&item);
+                items.push((c.id, Item::Normal(item), None));
+            }
+            if c.id == "file.openFolder" {
+                let _ = sub.append(&recent);
+            }
+        }
+        if top == CmdMenu::Window {
+            let _ = sub.append(&PredefinedMenuItem::separator());
+            let _ = sub.append(&PredefinedMenuItem::bring_all_to_front(Some(tr(
+                "Bring All to Front",
+            ))));
+            sub.set_as_windows_menu_for_nsapp();
+        }
+        if top == CmdMenu::Help {
+            sub.set_as_help_menu_for_nsapp();
+        }
+        let _ = menu.append(&sub);
+    }
+    menu.init_for_nsapp();
+    (menu, items, recent)
+}
+
 impl NativeMenu {
-    /// Builds and installs the menu bar. `wake` is called on every menu event.
+    /// Builds and installs the menu bar in the current interface language. `wake` is called on
+    /// every menu event.
     pub fn install(wake: impl Fn() + Send + Sync + 'static) -> Option<Self> {
         let (tx, rx) = channel::<String>();
         let tx = std::sync::Mutex::new(tx);
@@ -80,86 +166,31 @@ impl NativeMenu {
             }
             wake();
         }));
-
-        let menu = Menu::new();
-        let mut items: Vec<Entry> = Vec::new();
-        let recent = Submenu::new("Open Recent", true);
-
-        for top in CmdMenu::BAR {
-            let sub = Submenu::new(top.title(), true);
-            if top == CmdMenu::Window {
-                let _ = sub.append(&PredefinedMenuItem::minimize(None));
-                let _ = sub.append(&PredefinedMenuItem::maximize(Some("Zoom")));
-                let _ = sub.append(&PredefinedMenuItem::fullscreen(None));
-                let _ = sub.append(&PredefinedMenuItem::separator());
-            }
-            let mut last_group = None;
-            for c in registry().iter().filter(|c| c.menu == top) {
-                if last_group.is_some_and(|g| g != c.group) {
-                    let _ = sub.append(&PredefinedMenuItem::separator());
-                }
-                last_group = Some(c.group);
-                // The app menu gets the standard Services / Hide items before Quit.
-                if top == CmdMenu::App && c.id == "app.quit" {
-                    let _ = sub.append(&PredefinedMenuItem::services(None));
-                    let _ = sub.append(&PredefinedMenuItem::separator());
-                    let _ = sub.append(&PredefinedMenuItem::hide(Some("Hide TexCraft")));
-                    let _ = sub.append(&PredefinedMenuItem::hide_others(None));
-                    let _ = sub.append(&PredefinedMenuItem::show_all(None));
-                    let _ = sub.append(&PredefinedMenuItem::separator());
-                }
-                if c.id == "file.newFromTemplate" {
-                    let tsub = Submenu::new("New from Template", true);
-                    for t in TEMPLATES {
-                        let _ = tsub.append(&MenuItem::with_id(
-                            format!("template:{}", t.id),
-                            t.name,
-                            true,
-                            None,
-                        ));
-                    }
-                    let _ = tsub.append(&PredefinedMenuItem::separator());
-                    let _ = tsub.append(&MenuItem::with_id(
-                        "file.newFromTemplate",
-                        "Template Gallery…",
-                        true,
-                        None,
-                    ));
-                    let _ = sub.append(&tsub);
-                    continue;
-                }
-                let acc = c.shortcut.and_then(accelerator);
-                if c.checked.is_some() {
-                    let item = CheckMenuItem::with_id(c.id, c.label, true, false, acc);
-                    let _ = sub.append(&item);
-                    items.push((c.id, Item::Check(item), None));
-                } else {
-                    let item = MenuItem::with_id(c.id, c.label, true, acc);
-                    let _ = sub.append(&item);
-                    items.push((c.id, Item::Normal(item), None));
-                }
-                if c.id == "file.openFolder" {
-                    let _ = sub.append(&recent);
-                }
-            }
-            if top == CmdMenu::Window {
-                let _ = sub.append(&PredefinedMenuItem::separator());
-                let _ = sub.append(&PredefinedMenuItem::bring_all_to_front(None));
-                sub.set_as_windows_menu_for_nsapp();
-            }
-            if top == CmdMenu::Help {
-                sub.set_as_help_menu_for_nsapp();
-            }
-            let _ = menu.append(&sub);
-        }
-        menu.init_for_nsapp();
+        let (menu, items, recent) = build();
         Some(Self {
             _menu: menu,
             items,
             recent,
-            recent_shown: Vec::new(),
+            recent_shown: None,
             rx,
+            lang: texcraft_i18n::language(),
         })
+    }
+
+    /// Rebuilds the menu bar when the interface language is no longer the one it was built
+    /// in. Returns whether it did.
+    pub fn set_language(&mut self, lang: Lang) -> bool {
+        if lang == self.lang {
+            return false;
+        }
+        let (menu, items, recent) = build();
+        // The new bar replaces the old one in NSApp before the old one is dropped.
+        self._menu = menu;
+        self.items = items;
+        self.recent = recent;
+        self.recent_shown = None;
+        self.lang = lang;
+        true
     }
 
     /// Menu item ids clicked since the last call.
@@ -188,7 +219,7 @@ impl NativeMenu {
             }
             *last = Some((enabled, checked));
         }
-        if self.recent_shown != session.recent {
+        if self.recent_shown.as_ref() != Some(&session.recent) {
             for _ in 0..self.recent.items().len() {
                 let _ = self.recent.remove_at(0);
             }
@@ -225,9 +256,9 @@ impl NativeMenu {
             if session.recent.is_empty() {
                 let _ = self
                     .recent
-                    .append(&MenuItem::new("No Recent Documents", false, None));
+                    .append(&MenuItem::new(tr("No Recent Documents"), false, None));
             }
-            self.recent_shown = session.recent.clone();
+            self.recent_shown = Some(session.recent.clone());
         }
     }
 }

@@ -1172,3 +1172,132 @@ fn ai_assistant_sends_the_document_and_inserts_the_answer() {
     s.run("ai.clear", &Value::Null).unwrap();
     assert!(s.ai.messages.is_empty());
 }
+
+/// A session showing the `single` SyncTeX fixture's source, as if it had been typeset.
+fn synced_session() -> Session {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../synctex/tests/data/single");
+    let mut s = session();
+    s.pdf.synctex = Some(SyncTex::load(&data.join("single.synctex.gz")).unwrap());
+    s.pdf.path = Some(PathBuf::from("/tmp/texcraft-synctex/single/single.pdf"));
+    let d = s.docs.get_mut(0).unwrap();
+    d.text = std::fs::read_to_string(data.join("single.tex")).unwrap();
+    d.path = Some(PathBuf::from("/tmp/texcraft-synctex/single/single.tex"));
+    s
+}
+
+fn source_flash(s: &mut Session) -> Option<String> {
+    let mut flash = None;
+    while let Some(e) = s.take_effect() {
+        if let Effect::FlashSource { doc, start, end } = e {
+            let text = &s.docs[doc].text;
+            flash = Some(text.chars().skip(start).take(end - start).collect());
+        }
+    }
+    flash
+}
+
+#[test]
+fn inverse_search_flashes_the_line_or_the_clicked_sentence() {
+    // (409.5, 233.9) on page 1 is source line 14 (synctex edit).
+    let line14 = "This is the first paragraph of the document. It spans several";
+    let mut s = synced_session();
+    s.inverse_sync(1, 409.5, 233.9).unwrap();
+    let caret = s.docs[0].selection.cursor;
+    assert_eq!(caret, edit::char_of_line(&s.docs[0].text, 14));
+    assert_eq!(source_flash(&mut s).as_deref(), Some(line14));
+
+    // With the PDF text around the click: the caret on the clicked letter, its sentence lit.
+    let mut s = synced_session();
+    s.run(
+        "typeset.inverseSync",
+        &json!({"page": 1, "x": 409.5, "y": 233.9, "before": "the first ", "word": "paragraph",
+                "after": " of the", "offset": 4}),
+    )
+    .unwrap();
+    let start = edit::char_of_line(&s.docs[0].text, 14);
+    assert_eq!(
+        s.docs[0].selection.cursor,
+        start + line14.find("paragraph").unwrap() + 4
+    );
+    assert_eq!(
+        source_flash(&mut s).as_deref(),
+        Some("This is the first paragraph of the document.")
+    );
+    let mut s = synced_session();
+    s.run(
+        "typeset.inverseSync",
+        &json!({"page": 1, "x": 409.5, "y": 233.9, "word": "spans"}),
+    )
+    .unwrap();
+    assert_eq!(source_flash(&mut s).as_deref(), Some("It spans several"));
+
+    // Nothing there: an error and no flash.
+    let mut s = synced_session();
+    s.pdf.synctex = None;
+    assert!(s.inverse_sync(1, 409.5, 233.9).is_err());
+    assert_eq!(source_flash(&mut s), None);
+}
+
+#[test]
+fn pdf_selection_commands() {
+    let mut s = synced_session();
+    // Nothing selected: copying is disabled.
+    assert!(matches!(
+        s.run("pdf.copySelection", &Value::Null),
+        Err(CommandError::Disabled(_))
+    ));
+    s.pdf.selected_text = "测试 text".into();
+    s.run("pdf.copySelection", &Value::Null).unwrap();
+    assert_eq!(s.take_effect(), Some(Effect::CopyText("测试 text".into())));
+
+    s.run(
+        "pdf.selectText",
+        &json!({"page": 2, "x": 10.0, "y": 20.0, "toX": 30.0, "toY": 40.5, "unit": "word"}),
+    )
+    .unwrap();
+    let p = |page, x, y| PdfPoint { page, x, y };
+    assert_eq!(
+        s.take_effect(),
+        Some(Effect::SelectPdfText(Some((
+            p(2, 10.0, 20.0),
+            p(2, 30.0, 40.5),
+            TextUnit::Word
+        ))))
+    );
+    s.run(
+        "pdf.selectText",
+        &json!({"page": 1, "x": 1.0, "y": 2.0, "toPage": 3, "toX": 4.0, "toY": 5.0}),
+    )
+    .unwrap();
+    assert_eq!(
+        s.take_effect(),
+        Some(Effect::SelectPdfText(Some((
+            p(1, 1.0, 2.0),
+            p(3, 4.0, 5.0),
+            TextUnit::Char
+        ))))
+    );
+    // A single point (a click: selects the word or line there with a unit).
+    s.run(
+        "pdf.selectText",
+        &json!({"page": 1, "x": 1.0, "y": 2.0, "unit": "line"}),
+    )
+    .unwrap();
+    assert_eq!(
+        s.take_effect(),
+        Some(Effect::SelectPdfText(Some((
+            p(1, 1.0, 2.0),
+            p(1, 1.0, 2.0),
+            TextUnit::Line
+        ))))
+    );
+    assert!(matches!(
+        s.run(
+            "pdf.selectText",
+            &json!({"page": 1, "x": 1.0, "y": 2.0, "unit": "page"})
+        ),
+        Err(CommandError::Params(_))
+    ));
+    s.run("pdf.clearSelection", &Value::Null).unwrap();
+    assert_eq!(s.take_effect(), Some(Effect::SelectPdfText(None)));
+}

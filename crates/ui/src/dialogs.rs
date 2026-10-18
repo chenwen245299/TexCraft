@@ -4,6 +4,7 @@
 
 use egui::{Id, Key, RichText, vec2};
 use texcraft_engine::{Session, registry};
+use texcraft_i18n::{tr, trf};
 
 use crate::menu::{self, ButtonKind};
 use crate::theme::{Tokens, semibold};
@@ -74,11 +75,11 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
             let mut go = None;
             let m = modal("goto-line").show(ctx, |ui| {
                 ui.set_width(280.0);
-                heading(ui, t, "Go to Line", None);
+                heading(ui, t, tr("Go to Line"), None);
                 ui.add_space(10.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(text)
-                        .hint_text("Line number")
+                        .hint_text(tr("Line number"))
                         .desired_width(f32::INFINITY)
                         .margin(vec2(8.0, 5.0)),
                 );
@@ -87,7 +88,10 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                 match menu::dialog_buttons(
                     ui,
                     t,
-                    &[("Cancel", ButtonKind::Normal), ("Go", ButtonKind::Default)],
+                    &[
+                        (tr("Cancel"), ButtonKind::Normal),
+                        (tr("Go"), ButtonKind::Default),
+                    ],
                 ) {
                     Some(0) => close = true,
                     Some(_) => {
@@ -117,19 +121,19 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                     ui.add_space(8.0);
                     ui.label(RichText::new("TexCraft").font(semibold(20.0)).color(t.form_label));
                     ui.label(
-                        RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                        RichText::new(trf!("Version {version}", version = env!("CARGO_PKG_VERSION")))
                             .size(12.0)
                             .color(t.form_desc),
                     );
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new("A native LaTeX editor written in pure Rust.")
+                        RichText::new(tr("A native LaTeX editor written in pure Rust."))
                             .size(12.0)
                             .color(t.form_label),
                     );
                     ui.add_space(4.0);
                     for line in [
-                        "Clean-room: modelled on public descriptions of Texifier; no code or assets copied.".to_string(),
+                        tr("Clean-room: modelled on public descriptions of Texifier; no code or assets copied.").to_string(),
                         session.toolchain.describe(),
                         "MIT OR Apache-2.0".to_string(),
                     ] {
@@ -137,7 +141,8 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                     }
                 });
                 ui.add_space(14.0);
-                if menu::dialog_buttons(ui, t, &[("OK", ButtonKind::Default)]).is_some() || enter
+                if menu::dialog_buttons(ui, t, &[(tr("OK"), ButtonKind::Default)]).is_some()
+                    || enter
                 {
                     close = true;
                 }
@@ -149,7 +154,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
         Dialog::Shortcuts => {
             let m = modal("shortcuts").show(ctx, |ui| {
                 ui.set_width(560.0);
-                heading(ui, t, "Keyboard Shortcuts", None);
+                heading(ui, t, tr("Keyboard Shortcuts"), None);
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
                     let mut last_menu = None;
@@ -172,20 +177,20 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                                     ui.end_row();
                                     last_menu = Some(c.menu);
                                 }
-                                ui.label(RichText::new(c.label).size(12.0).color(t.form_label));
+                                ui.label(RichText::new(c.label()).size(12.0).color(t.form_label));
                                 ui.label(RichText::new(sc.display()).size(12.0).color(t.form_desc));
                                 ui.end_row();
                             }
                         });
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Editor: Esc opens autocomplete · Tab accepts · ⌘-click shows the position in the PDF · ⌘-click in the PDF jumps to the source")
+                        RichText::new(tr("Editor: Esc opens autocomplete · Tab accepts · ⌘-click shows the position in the PDF · ⌘-click in the PDF jumps to the source"))
                             .size(11.0)
                             .color(t.form_note),
                     );
                 });
                 ui.add_space(14.0);
-                if menu::dialog_buttons(ui, t, &[("Close", ButtonKind::Default)]).is_some()
+                if menu::dialog_buttons(ui, t, &[(tr("Close"), ButtonKind::Default)]).is_some()
                     || enter
                 {
                     close = true;
@@ -200,7 +205,9 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                 ui.set_width(380.0);
                 heading(ui, t, title.as_str(), Some(message.as_str()));
                 ui.add_space(16.0);
-                if menu::dialog_buttons(ui, t, &[("OK", ButtonKind::Default)]).is_some() || enter {
+                if menu::dialog_buttons(ui, t, &[(tr("OK"), ButtonKind::Default)]).is_some()
+                    || enter
+                {
                     close = true;
                 }
             });
@@ -220,8 +227,11 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                 heading(
                     ui,
                     t,
-                    &format!("Do you want to save the changes made to “{name}”?"),
-                    Some("Your changes will be lost if you don't save them."),
+                    &trf!(
+                        "Do you want to save the changes made to “{name}”?",
+                        name = name
+                    ),
+                    Some(tr("Your changes will be lost if you don't save them.")),
                 );
                 ui.add_space(16.0);
                 // "Don't Save" sits apart at the left, as on macOS.
@@ -230,7 +240,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                 let mut left = ui.new_child(egui::UiBuilder::new().max_rect(
                     egui::Rect::from_min_size(egui::pos2(row, top), vec2(110.0, 28.0)),
                 ));
-                if menu::dialog_button(&mut left, t, "Don't Save", ButtonKind::Normal, 100.0) {
+                if menu::dialog_button(&mut left, t, tr("Don't Save"), ButtonKind::Normal, 100.0) {
                     session.close(idx);
                     close = true;
                 }
@@ -238,8 +248,8 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                     ui,
                     t,
                     &[
-                        ("Cancel", ButtonKind::Normal),
-                        ("Save", ButtonKind::Default),
+                        (tr("Cancel"), ButtonKind::Normal),
+                        (tr("Save"), ButtonKind::Default),
                     ],
                 ) {
                     Some(0) => close = true,

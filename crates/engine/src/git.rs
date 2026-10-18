@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use texcraft_git::{ChangeKind, Job, Op, Snapshot};
+use texcraft_i18n::{tr, trf};
 
 use crate::{CommandError, Effect, Session, SidebarTab};
 
@@ -59,7 +60,7 @@ impl Session {
     pub fn git_run(&mut self, op: Op) -> Result<(), CommandError> {
         let dir = self
             .git_dir()
-            .ok_or_else(|| CommandError::Failed("open a project folder first".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("open a project folder first").into()))?;
         if *self
             .git
             .available
@@ -78,7 +79,7 @@ impl Session {
             Ok(())
         } else {
             Err(CommandError::Failed(
-                "Git is not installed (https://git-scm.com)".into(),
+                tr("Git is not installed (https://git-scm.com)").into(),
             ))
         }
     }
@@ -129,7 +130,7 @@ impl Session {
             .git
             .repo
             .as_ref()
-            .ok_or_else(|| CommandError::Failed("not a Git repository".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("not a Git repository").into()))?;
         let untracked = repo
             .status
             .changes
@@ -149,9 +150,9 @@ impl Session {
                     .is_some_and(|(a, b)| a == b)
                     && d.is_dirty()
             }) {
-                return Err(CommandError::Failed(format!(
-                    "{} has unsaved changes: save or revert it first",
-                    d.display_name()
+                return Err(CommandError::Failed(trf!(
+                    "{name} has unsaved changes: save or revert it first",
+                    name = d.display_name()
                 )));
             }
             self.git_run(Op::Discard(vec![rel]))
@@ -163,16 +164,18 @@ impl Session {
     pub fn git_commit(&mut self, message: Option<&str>) -> Result<(), CommandError> {
         let message = message.map_or_else(|| self.git.message.clone(), str::to_string);
         if message.trim().is_empty() {
-            return Err(CommandError::Failed("Enter a commit message first.".into()));
+            return Err(CommandError::Failed(
+                tr("Enter a commit message first.").into(),
+            ));
         }
         let repo = self
             .git
             .repo
             .as_ref()
-            .ok_or_else(|| CommandError::Failed("not a Git repository".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("not a Git repository").into()))?;
         if repo.status.is_clean() {
             return Err(CommandError::Failed(
-                "There are no changes to commit.".into(),
+                tr("There are no changes to commit.").into(),
             ));
         }
         let all = repo.status.staged.is_empty();
@@ -217,12 +220,13 @@ impl Session {
             match outcome.result {
                 Ok(Some(text)) => {
                     if let Op::Diff { path, staged, .. } = &outcome.op {
-                        let title = format!(
-                            "{path} ({})",
-                            if *staged { "Index" } else { "Working Tree" }
-                        );
+                        let title = if *staged {
+                            trf!("{path} (Index)", path = path)
+                        } else {
+                            trf!("{path} (Working Tree)", path = path)
+                        };
                         let text = if text.trim().is_empty() {
-                            "No changes.".to_string()
+                            tr("No changes.").to_string()
                         } else {
                             text
                         };
@@ -233,7 +237,7 @@ impl Session {
                 Ok(None) => {
                     if committed {
                         self.git.message.clear();
-                        self.set_status("Committed");
+                        self.set_status(tr("Committed"));
                     }
                 }
                 Err(e) => self.git.error = Some(e.0),

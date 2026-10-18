@@ -1,0 +1,406 @@
+//! The Settings window and the Typeset Configuration sheet (crates/ui/src/prefs.rs).
+
+pub(super) const ENTRIES: super::Entries = &[
+    // Window and pane bar
+    ("TexCraft Settings", "TexCraft 设置"),
+    ("General", "通用"),
+    ("Sidebar", "边栏"),
+    ("Editor", "编辑器"),
+    ("Document Viewer", "文稿查看器"),
+    ("Typesetting", "排版"),
+    ("Editing Aids", "编辑辅助"),
+    ("Editor Look & Feel", "编辑器外观"),
+    // General
+    (
+        "Choose whether TexCraft follows the system appearance or always uses the light or dark appearance.",
+        "选择 TexCraft 是跟随系统外观，还是始终使用浅色或深色外观。",
+    ),
+    ("Appearance", "外观"),
+    ("Use System Setting", "使用系统设置"),
+    ("Light", "浅色"),
+    ("Dark", "深色"),
+    (
+        "Choose the language of TexCraft's menus, windows and messages. Use System Setting follows the order of languages in System Settings → General → Language & Region.",
+        "选择 TexCraft 的菜单、窗口和信息所用的语言。“使用系统设置”会按照“系统设置 → 通用 → 语言与地区”中的语言顺序选取。",
+    ),
+    ("Language", "语言"),
+    (
+        "Show the welcome window with recent documents and templates when TexCraft starts without a document.",
+        "启动时若没有打开文稿，显示列出最近文稿和模板的欢迎窗口。",
+    ),
+    ("Show welcome window at startup", "启动时显示欢迎窗口"),
+    (
+        "Show the issues list in the sidebar when a typeset ends with errors.",
+        "排版以错误结束时，在边栏中显示问题列表。",
+    ),
+    ("Show issues after a failed typeset", "排版失败后显示问题"),
+    (
+        "TexCraft looks for a new version when it starts and every few hours.",
+        "TexCraft 会在启动时以及每隔几小时检查一次新版本。",
+    ),
+    ("Check for updates automatically", "自动检查更新"),
+    (
+        "New versions are downloaded in the background and installed when you quit TexCraft.",
+        "新版本会在后台下载，并在你退出 TexCraft 时安装。",
+    ),
+    ("Download updates automatically", "自动下载更新"),
+    ("Never checked", "从未检查"),
+    ("Last checked {date}", "上次检查时间：{date}"),
+    (
+        "This is TexCraft {version}. {last}.",
+        "这是 TexCraft {version}。{last}。",
+    ),
+    ("Check for Updates…", "检查更新…"),
+    // Sidebar
+    (
+        "The deepest sectioning level listed in the Table of Contents of the Structure view.",
+        "“结构”视图的目录中列出的最深章节层级。",
+    ),
+    ("Table of contents depth", "目录深度"),
+    ("Parts and chapters", "部分和章"),
+    ("Sections", "节"),
+    ("Subsections", "小节"),
+    ("Subsubsections", "子小节"),
+    ("Paragraphs", "段落"),
+    // Editor: Editing Aids
+    (
+        "Selecting this will display line numbers in the editor.",
+        "选择此项后，编辑器中会显示行号。",
+    ),
+    ("Show line numbers in the editor", "在编辑器中显示行号"),
+    (
+        "TexCraft can automatically complete LaTeX commands as you type your documents.",
+        "TexCraft 可以在你键入文稿时自动补全 LaTeX 命令。",
+    ),
+    ("Auto-complete commands", "自动补全命令"),
+    (
+        "Automatically indent each line based on the line before.",
+        "根据上一行自动缩进每一行。",
+    ),
+    ("Auto Indent", "自动缩进"),
+    (
+        "Automatically insert an \\end{…} command after each \\begin{…}.",
+        "在每个 \\begin{…} 之后自动插入 \\end{…} 命令。",
+    ),
+    ("Automatch \\begin with \\end", "自动为 \\begin 匹配 \\end"),
+    (
+        "Number of spaces to indent by. This is used for inserting tabs and auto-indentations.",
+        "每级缩进的空格数，用于插入制表符和自动缩进。",
+    ),
+    ("Editor tab indent size", "编辑器缩进宽度"),
+    ("Tab", "制表符"),
+    ("2 Spaces", "2 个空格"),
+    ("4 Spaces", "4 个空格"),
+    ("8 Spaces", "8 个空格"),
+    (
+        "The type of wrapping to be applied to lines in the editor that are too long to fit in the current window width.",
+        "编辑器中的行太长、超出当前窗口宽度时所采用的换行方式。",
+    ),
+    ("Line wrapping in the editor", "编辑器中的换行"),
+    ("No wrapping", "不换行"),
+    ("Soft wrap", "自动换行"),
+    ("Soft wrap with hanging indent", "自动换行并悬挂缩进"),
+    (
+        "A hanging indent is a small blank space that's added to all but the first line when the text is too long to fit inside the line. This setting determines the width of the space used for hanging indent. It is valid when the line wrapping mode is chosen to be a soft wrap with hanging indent.",
+        "悬挂缩进是长行折行后，除第一行外各行前面的一小段空白。此设置决定它的宽度，仅在换行方式为“自动换行并悬挂缩进”时有效。",
+    ),
+    ("Hanging indent size", "悬挂缩进宽度"),
+    ("Tab Width", "制表符宽度"),
+    ("2 Characters", "2 个字符"),
+    ("4 Characters", "4 个字符"),
+    ("8 Characters", "8 个字符"),
+    (
+        "Underline misspelled words in text and comments, using the system spelling dictionary.",
+        "使用系统拼写词典，为正文和注释中拼错的单词加下划线。",
+    ),
+    ("Check spelling while typing", "键入时检查拼写"),
+    // Editor: Look & Feel
+    (
+        "The colours of the editor in the light appearance. Classic is cream paper with olive comments; Plain is white paper.",
+        "浅色外观下编辑器的颜色。“经典”是米色纸张配橄榄色注释；“简洁”是白色纸张。",
+    ),
+    ("Editor theme", "编辑器主题"),
+    ("Classic", "经典"),
+    ("Plain", "简洁"),
+    (
+        "The size of the text in the editor.",
+        "编辑器中文本的大小。",
+    ),
+    ("Editor font size", "编辑器字号"),
+    // Document Viewer
+    (
+        "Clicking in the PDF shows the matching line in the editor. When this is off, use ⌘-click.",
+        "在 PDF 中点按会在编辑器中显示对应的行。此项关闭时，请按住 ⌘ 点按。",
+    ),
+    (
+        "Jump to the source with a single click",
+        "点按一次即跳转到源代码",
+    ),
+    (
+        "After each typeset, the PDF scrolls to the part of the document you are editing.",
+        "每次排版后，PDF 会滚动到你正在编辑的部分。",
+    ),
+    (
+        "Show the editing position after typesetting",
+        "排版后显示编辑位置",
+    ),
+    (
+        "The PDF follows the caret as you move through the source.",
+        "在源代码中移动插入点时，PDF 会随之滚动。",
+    ),
+    ("Scroll lock", "滚动锁定"),
+    (
+        "How pages are arranged in the document viewer.",
+        "页面在文稿查看器中的排列方式。",
+    ),
+    ("Page layout", "页面布局"),
+    ("Single Page Continuous", "单页连续"),
+    ("Two Pages Continuous", "双页连续"),
+    ("Single Page", "单页"),
+    (
+        "The zoom level of the document viewer.",
+        "文稿查看器的缩放比例。",
+    ),
+    ("Zoom", "缩放"),
+    ("Fit Width", "适合宽度"),
+    ("Fit Page", "适合页面"),
+    (
+        "In the dark appearance, TexCraft can re-tint the PDF so that pages are not bright white. The PDF file itself is not changed.",
+        "深色外观下，TexCraft 可为 PDF 重新着色，让页面不再刺眼；PDF 文件本身不会更改。",
+    ),
+    ("Image grading in dark mode", "深色模式下的图像调色"),
+    ("Grade Entire Viewer Output", "为整个查看器输出调色"),
+    ("No Grading", "不调色"),
+    // Typesetting
+    (
+        "Save edited files before a full typeset. Live previews never save: they typeset the text in the editor.",
+        "完整排版前存储编辑过的文件；实时预览只排版编辑器中的文本。",
+    ),
+    ("Save files before typesetting", "排版前存储文件"),
+    (
+        "How long the live preview waits after a keystroke. Immediately starts on the first keystroke and keeps up while you type.",
+        "实时预览在按键后等待的时间。“立即”从首次按键起随键入持续更新。",
+    ),
+    ("Live preview delay", "实时预览延迟"),
+    ("Immediately", "立即"),
+    ("1 second", "1 秒"),
+    (
+        "While the document has errors, the live preview keeps showing the last PDF that typeset cleanly.",
+        "文稿有错误时，实时预览会继续显示上一次成功排版的 PDF。",
+    ),
+    ("Keep the last good preview", "保留上一次成功的预览"),
+    (
+        "Store the preamble in a format file so that live previews only typeset the body (pdfLaTeX).",
+        "将导言区存储为格式文件，让实时预览只排版正文（pdfLaTeX）。",
+    ),
+    ("Precompile the preamble", "预编译导言区"),
+    (
+        "The typesetter, engine, bibliography and index settings of this document.",
+        "此文稿的排版程序、引擎、参考文献和索引设置。",
+    ),
+    ("Typeset Configuration…", "排版配置…"),
+    // Typeset Configuration sheet
+    ("Typesetter", "排版程序"),
+    ("Live Preview Typesetter", "实时预览排版程序"),
+    ("External Typesetter", "外部排版程序"),
+    (
+        "TexCraft runs one fast pass of your TeX engine over the unsaved text after every change, in .texcraft/live. Bibliographies and indices update on a full typeset (⌘T).",
+        "每次更改后，TexCraft 都会在 .texcraft/live 中用你的 TeX 引擎对未存储的文本快速运行一遍。参考文献和索引在完整排版（⌘T）时更新。",
+    ),
+    (
+        "latexmk (or tectonic) runs the full typeset — bibliography, index and reruns — on the saved files, like typesetting in a terminal.",
+        "latexmk（或 tectonic）对已存储的文件运行完整排版（包括参考文献、索引和重复运行），就像在终端中排版一样。",
+    ),
+    (
+        "Realtime Typesetting · Lean · Unsaved Text",
+        "实时排版 · 轻量 · 未存储的文本",
+    ),
+    (
+        "Traditional · Complete · Saved Files",
+        "传统 · 完整 · 已存储的文件",
+    ),
+    (
+        "TexCraft's live typesetter updates the preview as you type. It uses the TeX installation you already have; bibliographies update on a full typeset.",
+        "TexCraft 的实时排版程序会在你键入时更新预览。它使用你已安装的 TeX；参考文献在完整排版时更新。",
+    ),
+    (
+        "External typesetter, such as MacTeX.",
+        "外部排版程序，例如 MacTeX。",
+    ),
+    ("Auto-Typeset", "自动排版"),
+    (
+        "Automatically start a typeset when typing is paused.",
+        "停止键入时自动开始排版。",
+    ),
+    ("Typeset Configuration", "排版配置"),
+    (
+        "When this is enabled, TexCraft reads your document and picks the engine it needs (XeLaTeX for fontspec, ctex or Chinese text; LuaLaTeX for luacode) and sets up Chinese text. Disable it to choose manually.",
+        "启用此项后，TexCraft 会读取你的文稿并选择所需的引擎（使用 fontspec、ctex 或含有中文时选择 XeLaTeX；使用 luacode 时选择 LuaLaTeX），并设置好中文。停用此项可手动选择。",
+    ),
+    ("Auto-Sense", "自动识别"),
+    ("Summary", "概览"),
+    ("Bibliographies", "参考文献"),
+    ("Indices", "索引"),
+    (
+        "This is the engine used for the (optional) compilation of bibliography.",
+        "用于编译参考文献（可选）的引擎。",
+    ),
+    ("Bibliography Engine", "参考文献引擎"),
+    ("Automatic (BibTeX or Biber)", "自动（BibTeX 或 Biber）"),
+    ("None", "无"),
+    (
+        "This is the program used to build the index when the document calls \\makeindex. latexmk runs it as needed during a full typeset.",
+        "文稿调用 \\makeindex 时用于生成索引的程序。latexmk 会在完整排版时按需运行它。",
+    ),
+    ("Index Engine", "索引引擎"),
+    ("Automatic (makeindex)", "自动（makeindex）"),
+    ("Close", "关闭"),
+    // Summary tab
+    (
+        "{engine} (from % !TEX program)",
+        "{engine}（来自 % !TEX program）",
+    ),
+    ("{engine} (Auto-Sense)", "{engine}（自动识别）"),
+    (
+        "The engine that typesets this document.",
+        "排版此文稿的引擎。",
+    ),
+    ("no Chinese fonts found", "未找到中文字体"),
+    (
+        "Chinese text is set up with xeCJK; the file is not changed.",
+        "中文通过 xeCJK 设置；文件本身不会更改。",
+    ),
+    (
+        "LIVE: live preview of the unsaved text",
+        "LIVE：实时预览未存储的文本",
+    ),
+    (
+        "AUTO: full typeset when typing pauses",
+        "AUTO：停止键入时完整排版",
+    ),
+    (
+        "MANUAL: full typeset on ⌘T only",
+        "MANUAL：仅在按下 ⌘T 时完整排版",
+    ),
+    ("What happens while you type.", "键入时会发生什么。"),
+    (
+        "A full typeset (⌘T) runs bibliography, index and reruns as needed.",
+        "完整排版（⌘T）会按需处理参考文献、索引和重复运行。",
+    ),
+    ("{engine} via {tool}", "通过 {tool} 运行 {engine}"),
+    ("How bibliographies are compiled.", "参考文献的编译方式。"),
+    ("Automatically (BibTeX or Biber)", "自动（BibTeX 或 Biber）"),
+    ("Never", "从不"),
+    (
+        "The TeX programs TexCraft found.",
+        "TexCraft 找到的 TeX 程序。",
+    ),
+    // General tab
+    ("{engine} — not installed", "{engine} — 未安装"),
+    (
+        "Auto-Sense picks the engine from the document. Turn Auto-Sense off to choose it yourself.",
+        "自动识别会根据文稿选择引擎。关闭自动识别即可自行选择。",
+    ),
+    ("Typesetting Engine", "排版引擎"),
+    (
+        "The engine used when the document has no % !TEX program comment.",
+        "文稿没有 % !TEX program 注释时使用的引擎。",
+    ),
+    (
+        "Lets packages such as minted and gnuplot run programs. Only enable it for documents you trust.",
+        "允许 minted 和 gnuplot 等宏包运行程序。请仅对你信任的文稿启用。",
+    ),
+    ("Allow shell escape", "允许 shell escape"),
+    // AI: providers and models
+    ("Those models were already added.", "这些模型已经添加过了。"),
+    ("Added 1 model.", "已添加 1 个模型。"),
+    ("Added {n} models.", "已添加 {n} 个模型。"),
+    ("No Providers", "没有服务商"),
+    ("Off", "已关闭"),
+    ("No API key", "没有 API 密钥"),
+    ("1 model", "1 个模型"),
+    ("{n} models", "{n} 个模型"),
+    ("Add a Provider", "添加服务商"),
+    ("Remove the Provider", "移除服务商"),
+    ("Ollama (local)", "Ollama（本地）"),
+    ("Custom (OpenAI-compatible)", "自定义（兼容 OpenAI）"),
+    ("Name", "名称"),
+    ("Provider name", "服务商名称"),
+    ("OpenAI-compatible", "兼容 OpenAI"),
+    ("Base URL", "基础 URL"),
+    ("API Key", "API 密钥"),
+    (
+        "Saved, encrypted on this computer",
+        "已存储，并已在这台电脑上加密",
+    ),
+    ("Change…", "更改…"),
+    ("Remove", "移除"),
+    (
+        "Paste the key from the provider's console",
+        "粘贴服务商控制台中的密钥",
+    ),
+    ("Save", "存储"),
+    ("The key is saved, encrypted.", "密钥已加密存储。"),
+    ("Models", "模型"),
+    (
+        "No models yet: add some from the provider's list.",
+        "还没有模型：请从服务商的列表中添加。",
+    ),
+    ("Edit", "编辑"),
+    ("Add Models…", "添加模型…"),
+    (
+        "Show in the Assistant's model menu",
+        "在 AI 助手的模型菜单中显示",
+    ),
+    (
+        "Add a provider with + (SoCLaaS at NUS, Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, Kimi, Qwen, MiMo, GLM, MiniMax, StepFun, MoleAPI, a local Ollama, or any OpenAI-compatible server), then paste its API key.",
+        "点按 + 添加服务商（NUS 的 SoCLaaS, Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, Kimi, Qwen, MiMo, GLM, MiniMax, StepFun, MoleAPI、本地 Ollama 或任何兼容 OpenAI 的服务器），然后粘贴它的 API 密钥。",
+    ),
+    (
+        "Send the open document with each question",
+        "每个问题都附带打开的文稿",
+    ),
+    // AI: the model editor
+    ("Display Name", "显示名称"),
+    ("Model ID", "模型 ID"),
+    ("Model id", "模型 ID"),
+    ("Context Length", "上下文长度"),
+    ("e.g. 128K", "例如 128K"),
+    ("{n} tokens", "{n} 个 token"),
+    ("Unknown", "未知"),
+    (
+        "Write a number of tokens, 128K or 1M",
+        "填写 token 数，例如 128K 或 1M",
+    ),
+    ("Capabilities", "能力"),
+    ("Vision", "视觉"),
+    ("Reasoning", "推理"),
+    ("Tools", "工具"),
+    ("Embedding", "嵌入"),
+    ("Audio", "音频"),
+    ("Image Generation", "图像生成"),
+    (
+        "Reads images: the Assistant can attach them",
+        "可读取图像：AI 助手可以附加图像",
+    ),
+    ("Reasons before it answers", "回答前先推理"),
+    ("Calls tools", "可调用工具"),
+    ("Makes embeddings (not for chat)", "生成嵌入（不用于对话）"),
+    (
+        "Hears or speaks (not for chat unless it does more)",
+        "处理语音（除非还有其他能力，否则不用于对话）",
+    ),
+    (
+        "Makes images (not for chat unless it does more)",
+        "生成图像（除非还有其他能力，否则不用于对话）",
+    ),
+    (
+        "With Vision the Assistant can attach images to questions.",
+        "具备视觉能力时，AI 助手可以在问题中附加图像。",
+    ),
+    (
+        "Not offered for chat: it only embeds, hears or speaks, or makes images.",
+        "不用于对话：它只能生成嵌入、处理语音或生成图像。",
+    ),
+    ("Done", "完成"),
+];

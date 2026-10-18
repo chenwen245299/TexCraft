@@ -72,9 +72,11 @@ fn civil(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
-/// Date and time in local time, the way the system's locale writes it (roughly).
+/// Date and time in local time, the way the system's locale writes it (roughly); always the
+/// 年月日 way when the interface is in Chinese.
 pub(crate) fn date_time(t: SystemTime) -> String {
-    format_date_time(local_secs(t), cjk_locale())
+    let chinese = texcraft_i18n::language() == texcraft_i18n::Lang::ZhHans;
+    format_date_time(local_secs(t), chinese || cjk_locale())
 }
 
 fn format_date_time(secs: i64, cjk: bool) -> String {
@@ -108,5 +110,17 @@ mod tests {
         assert_eq!(civil(0), (1970, 1, 1));
         assert_eq!(civil(-1), (1969, 12, 31));
         assert_eq!(civil(19_782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn chinese_interface_writes_dates_the_chinese_way() {
+        let _zh = texcraft_i18n::scoped(texcraft_i18n::Lang::ZhHans);
+        let t = UNIX_EPOCH + std::time::Duration::from_secs(1_790_266_914);
+        let s = date_time(t);
+        assert!(
+            s.contains('年') && s.contains('月') && s.contains('日'),
+            "{s}"
+        );
+        assert!(!s.contains(" at "), "{s}");
     }
 }

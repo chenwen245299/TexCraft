@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Align, Color32, Id, Key, Rect, Sense, Stroke, Ui, pos2, vec2};
 use texcraft_engine::{ContentsMode, ResultsMode, SearchMode, Session, SidebarTab};
+use texcraft_i18n::{tr, trf};
 use texcraft_log::Severity;
 use texcraft_project::{FileKind, FileNode};
 use texcraft_syntax::OutlineKind;
@@ -232,7 +233,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
             edit,
             egui::TextEdit::singleline(text)
                 .id(Id::new(("sidebar-filter", tab_key(tab))))
-                .hint_text(egui::RichText::new("Filter").color(t.text_weak))
+                .hint_text(egui::RichText::new(tr("Filter")).color(t.text_weak))
                 .frame(egui::Frame::NONE)
                 .font(egui::FontId::proportional(11.75))
                 .vertical_align(Align::Center),
@@ -248,9 +249,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
                 Sense::click(),
             );
             let tip = if tab == SidebarTab::Files {
-                "New File"
+                tr("New File")
             } else {
-                "Choose the level of detail"
+                tr("Choose the level of detail")
             };
             let resp = resp.on_hover_text(tip);
             icons::gear_solid(&p, gear, t.gear, t.sidebar_bg);
@@ -262,8 +263,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
                         if let Some(dir) = session.project_dir.clone() {
                             let dir = serde_json::json!({ "dir": dir.to_string_lossy() });
                             for (id, label) in [
-                                ("files.newFolder", "Create a new folder"),
-                                ("files.newFile", "Create a new file"),
+                                ("files.newFolder", tr("Create a new folder")),
+                                ("files.newFile", tr("Create a new file")),
                             ] {
                                 if menu::button(ui, t, label)
                                     && let Err(e) = session.run(id, &dir)
@@ -278,11 +279,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                     .show(|ui| {
                         menu::begin(ui, 200.0);
-                        menu::heading(ui, t, "Choose the level of detail");
+                        menu::heading(ui, t, tr("Choose the level of detail"));
                         for (depth, label) in [
-                            (3u8, "Show subsections"),
-                            (4, "Show subsubsections"),
-                            (5, "Show paragraphs"),
+                            (3u8, tr("Show subsections")),
+                            (4, tr("Show subsubsections")),
+                            (5, tr("Show paragraphs")),
                         ] {
                             let on = st.depth() >= depth;
                             let opts = menu::Item {
@@ -408,7 +409,10 @@ fn contents(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
     let files = session.index.files.iter().filter(|f| !f.missing).count();
     let words = session.index.words;
     // Files / Words: label left, value right, 20 pt rows.
-    for (label, value) in [("Files", files.to_string()), ("Words", words.to_string())] {
+    for (label, value) in [
+        (tr("Files"), files.to_string()),
+        (tr("Words"), words.to_string()),
+    ] {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
         let font = egui::FontId::proportional(10.75);
         ui.painter().text(
@@ -441,7 +445,7 @@ fn contents(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
         1
     };
     let w = ui.available_width();
-    if let Some(i) = widgets::segmented_text(ui, t, &["Structure", "Subfiles"], sel, w) {
+    if let Some(i) = widgets::segmented_text(ui, t, &[tr("Structure"), tr("Subfiles")], sel, w) {
         session.view.contents_mode = if i == 0 {
             ContentsMode::Structure
         } else {
@@ -588,7 +592,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
         t,
         st,
         "toc",
-        "Table of Contents",
+        tr("Table of Contents"),
         Some(section_count),
         Some(icons::toc_list),
     ) {
@@ -605,7 +609,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
                 ui,
                 Id::new("toc-begin"),
                 0,
-                "Begin Document",
+                tr("Begin Document"),
                 &hour,
                 None,
                 false,
@@ -627,9 +631,9 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
             let has_children = !node.children.is_empty();
             let open = has_children && (!filter.is_empty() || !st.collapsed.contains(&key));
             let title = if item.kind == OutlineKind::Bibliography {
-                format!("Bibliography: {}", item.title)
+                trf!("Bibliography: {title}", title = item.title)
             } else if item.title.is_empty() {
-                "(untitled)".to_string()
+                tr("(untitled)").to_string()
             } else {
                 item.title.clone()
             };
@@ -695,7 +699,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
                 ui,
                 Id::new("toc-end"),
                 0,
-                "End Document",
+                tr("End Document"),
                 &hour,
                 None,
                 false,
@@ -705,8 +709,9 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
             jump = Some((rp.clone(), l));
         }
     }
-    // (key, title, kind, icon colour, icon)
+    // (key, title, one item's kind, kind, icon colour, icon)
     type Group<'a> = (
+        &'a str,
         &'a str,
         &'a str,
         OutlineKind,
@@ -716,27 +721,30 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
     let groups: [Group<'_>; 3] = [
         (
             "figures",
-            "Figures",
+            tr("Figures"),
+            tr("Figure"),
             OutlineKind::Figure,
             t.syn_math,
             icons::pictures,
         ),
         (
             "tables",
-            "Tables",
+            tr("Tables"),
+            tr("Table"),
             OutlineKind::Table,
             t.success,
             icons::table,
         ),
         (
             "labels",
-            "Labels",
+            tr("Labels"),
+            tr("Label"),
             OutlineKind::Label,
             t.syn_math,
             icons::bookmark_circle,
         ),
     ];
-    for (key, title, kind, color, icon) in groups {
+    for (key, title, singular, kind, color, icon) in groups {
         let items = idx.items(kind);
         if items.is_empty() {
             continue;
@@ -746,9 +754,12 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
                 let name = file_label(path);
                 let label = match kind {
                     OutlineKind::Label => item.title.clone(),
-                    _ if item.title.is_empty() => {
-                        format!("{} ({name}: {})", title.trim_end_matches('s'), item.line)
-                    }
+                    _ if item.title.is_empty() => trf!(
+                        "{kind} ({file}: {line})",
+                        kind = singular,
+                        file = name,
+                        line = item.line
+                    ),
                     _ => item.title.clone(),
                 };
                 if !matches(&label) {
@@ -766,7 +777,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
                     false,
                 );
                 if resp
-                    .on_hover_text(format!("{name}, line {}", item.line))
+                    .on_hover_text(trf!("{file}, line {line}", file = name, line = item.line))
                     .clicked()
                 {
                     jump = Some((path.to_path_buf(), item.line));
@@ -781,7 +792,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
             t,
             st,
             "citations",
-            "Citations",
+            tr("Citations"),
             Some(idx.cites.len()),
             Some(icons::open_book),
         )
@@ -800,7 +811,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
             let resp = row(ui, Id::new(("cite", key)), 0, key, &draw, None, false);
             let resp = match entry {
                 Some(e) => resp.on_hover_text(e),
-                None => resp.on_hover_text("Not found in the bibliography"),
+                None => resp.on_hover_text(tr("Not found in the bibliography")),
             };
             if resp.clicked() {
                 jump = Some((path.clone(), *line));
@@ -811,7 +822,7 @@ fn structure(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSta
         ui.add_space(30.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new("No structure yet")
+                egui::RichText::new(tr("No structure yet"))
                     .size(13.0)
                     .color(t.text_weak),
             )
@@ -868,7 +879,12 @@ fn subfiles(ui: &mut Ui, t: &Tokens, session: &mut Session, filter: &str) {
                     col,
                 );
                 if fi == 0 {
-                    widgets::pill(p, r.right_center() - vec2(10.0, 0.0), "ROOT", t.text_weak);
+                    widgets::pill(
+                        p,
+                        r.right_center() - vec2(10.0, 0.0),
+                        tr("ROOT"),
+                        t.text_weak,
+                    );
                 }
             },
         );
@@ -932,11 +948,12 @@ fn todos(ui: &mut Ui, t: &Tokens, session: &mut Session, filter: &str) {
     ui.add_space(6.0);
     ui.vertical_centered(|ui| {
         let n = items.len();
-        ui.label(
-            egui::RichText::new(format!("{n} TODO{}", if n == 1 { "" } else { "s" }))
-                .size(11.5)
-                .color(t.text_weak),
-        );
+        let count = if n == 1 {
+            trf!("{n} TODO", n = n)
+        } else {
+            trf!("{n} TODOs", n = n)
+        };
+        ui.label(egui::RichText::new(count).size(11.5).color(t.text_weak));
     });
     ui.add_space(4.0);
     let mut jump = None;
@@ -991,11 +1008,11 @@ fn files(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarState, 
         ui.add_space(30.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new("No project folder")
+                egui::RichText::new(tr("No project folder"))
                     .size(13.0)
                     .color(t.text_weak),
             );
-            if ui.button("Open Folder…").clicked() {
+            if ui.button(tr("Open Folder…")).clicked() {
                 let _ = session.run("file.openFolder", &serde_json::Value::Null);
             }
         });
@@ -1084,13 +1101,13 @@ impl FileContext {
     fn role(&self, path: &Path) -> Option<&'static str> {
         let path = texcraft_project::normalize(path);
         if self.root.as_deref() == Some(path.as_path()) {
-            Some("ROOT")
+            Some(tr("ROOT"))
         } else if self.output.as_deref() == Some(path.as_path()) {
-            Some("OUTPUT")
+            Some(tr("OUTPUT"))
         } else if path == self.temp {
-            Some("TEMP")
+            Some(tr("TEMP"))
         } else if self.project.contains(&path) {
-            Some("SUB")
+            Some(tr("SUB"))
         } else {
             None
         }
@@ -1137,18 +1154,18 @@ fn file_menu(
             let dir = serde_json::json!({ "dir": path.to_string_lossy() });
             item(
                 ui,
-                "Create a new folder",
+                tr("Create a new folder"),
                 FileAction::Command("files.newFolder", dir.clone()),
             );
             item(
                 ui,
-                "Create a new file",
+                tr("Create a new file"),
                 FileAction::Command("files.newFile", dir),
             );
         } else if ctx.has_doc {
             item(
                 ui,
-                "Insert in the editor",
+                tr("Insert in the editor"),
                 FileAction::Command("files.insert", arg.clone()),
             );
         } else {
@@ -1156,33 +1173,33 @@ fn file_menu(
                 disabled: true,
                 ..Default::default()
             };
-            menu::item(ui, t, "Insert in the editor", disabled);
+            menu::item(ui, t, tr("Insert in the editor"), disabled);
         }
         menu::separator(ui, t);
         let reveal = if cfg!(windows) {
-            "Show in Explorer"
+            tr("Show in Explorer")
         } else {
-            "Reveal in Finder"
+            tr("Reveal in Finder")
         };
         item(ui, reveal, FileAction::Command("files.reveal", arg.clone()));
         item(
             ui,
-            "Copy Full Path",
+            tr("Copy Full Path"),
             FileAction::Command("files.copyPath", arg.clone()),
         );
         if !is_project {
             menu::separator(ui, t);
-            item(ui, "Rename", FileAction::Rename(path.to_path_buf()));
+            item(ui, tr("Rename"), FileAction::Rename(path.to_path_buf()));
             item(
                 ui,
-                "Duplicate",
+                tr("Duplicate"),
                 FileAction::Command("files.duplicate", arg.clone()),
             );
             menu::separator(ui, t);
             let trash = if cfg!(windows) {
-                "Move to Recycle Bin"
+                tr("Move to Recycle Bin")
             } else {
-                "Move to Trash"
+                tr("Move to Trash")
             };
             item(ui, trash, FileAction::Command("files.trash", arg.clone()));
         }
@@ -1378,12 +1395,12 @@ fn node_matches(n: &FileNode, filter: &str) -> bool {
 fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
     ui.add_space(6.0);
     let header = match (&session.typeset.finished_at, &session.typeset.last) {
-        (Some(at), Some(last)) => format!(
-            "Last typeset Today at {} (Duration {:.1} seconds)",
-            crate::clock::clock(*at),
-            last.duration.as_secs_f32()
+        (Some(at), Some(last)) => trf!(
+            "Last typeset Today at {time} (Duration {seconds} seconds)",
+            time = crate::clock::clock(*at),
+            seconds = format!("{:.1}", last.duration.as_secs_f32())
         ),
-        _ => "Not typeset yet".to_string(),
+        _ => tr("Not typeset yet").to_string(),
     };
     ui.horizontal(|ui| {
         ui.add_space(10.0);
@@ -1398,7 +1415,7 @@ fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
             1
         };
         let w = ui.available_width() - 10.0;
-        if let Some(i) = widgets::segmented_text(ui, t, &["Issues", "Log"], sel, w) {
+        if let Some(i) = widgets::segmented_text(ui, t, &[tr("Issues"), tr("Log")], sel, w) {
             session.view.results_mode = if i == 0 {
                 ResultsMode::Issues
             } else {
@@ -1426,20 +1443,43 @@ fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
     }
     let (e, w, b) = session.issue_counts();
     if session.typeset.is_running() && session.typeset.last.is_none() {
-        ui.vertical_centered(|ui| ui.label(egui::RichText::new("Typesetting…").color(t.text_weak)));
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(tr("Typesetting…")).color(t.text_weak))
+        });
         return;
     }
     let summary_color = if e > 0 { t.error } else { t.success };
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        let mut s = format!(
-            "{e} error{} and {w} warning{}",
-            if e == 1 { "" } else { "s" },
-            if w == 1 { "" } else { "s" }
-        );
-        if b > 0 {
-            s.push_str(&format!(", {b} bad box{}", if b == 1 { "" } else { "es" }));
-        }
+        let errors = if e == 1 {
+            trf!("{n} error", n = e)
+        } else {
+            trf!("{n} errors", n = e)
+        };
+        let warnings = if w == 1 {
+            trf!("{n} warning", n = w)
+        } else {
+            trf!("{n} warnings", n = w)
+        };
+        let s = if b > 0 {
+            let boxes = if b == 1 {
+                trf!("{n} bad box", n = b)
+            } else {
+                trf!("{n} bad boxes", n = b)
+            };
+            trf!(
+                "{errors} and {warnings}, {boxes}",
+                errors = errors,
+                warnings = warnings,
+                boxes = boxes
+            )
+        } else {
+            trf!(
+                "{errors} and {warnings}",
+                errors = errors,
+                warnings = warnings
+            )
+        };
         ui.label(egui::RichText::new(s).size(11.5).color(summary_color));
     });
     if session.typeset.issues.is_empty() {
@@ -1447,7 +1487,7 @@ fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new("Typeset Successful")
+                    egui::RichText::new(tr("Typeset Successful"))
                         .size(17.0)
                         .color(t.text_weak.gamma_multiply(0.8)),
                 )
@@ -1474,9 +1514,11 @@ fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
                     _ => t.success,
                 };
                 let place = match (&issue.file, issue.line) {
-                    (Some(f), Some(l)) => format!("{} (line {l})", file_label(f)),
+                    (Some(f), Some(l)) => {
+                        trf!("{file} (line {line})", file = file_label(f), line = l)
+                    }
                     (Some(f), None) => file_label(f),
-                    _ => "Log".to_string(),
+                    _ => tr("Log").to_string(),
                 };
                 let resp = widgets::list_row(ui, t, 38.0, false, Id::new(("issue", i)), |p, r| {
                     let ir =
@@ -1527,7 +1569,8 @@ fn search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarState)
             1
         };
         let w = ui.available_width() - 10.0;
-        if let Some(i) = widgets::segmented_text(ui, t, &["Text Search", "Jump to"], sel, w) {
+        if let Some(i) = widgets::segmented_text(ui, t, &[tr("Text Search"), tr("Jump to")], sel, w)
+        {
             session.view.search_mode = if i == 0 {
                 SearchMode::Text
             } else {
@@ -1597,7 +1640,7 @@ fn search_box(
     let icon_rect = Rect::from_min_size(rect.min, vec2(icon_w, h));
     let menu = options.then(|| {
         ui.interact(icon_rect, id.with("options"), Sense::click())
-            .on_hover_text("Search options")
+            .on_hover_text(tr("Search options"))
     });
     let ink = if menu
         .as_ref()
@@ -1661,9 +1704,9 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
     let mut run = false;
     let id = Id::new("global-search-field");
     let hint = if st.search_regex {
-        "Search project (regex)"
+        tr("Search project (regex)")
     } else {
-        "Search project"
+        tr("Search project")
     };
     let (resp, options) = search_box(
         ui,
@@ -1697,14 +1740,14 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
                 checked: Some(on),
                 ..Default::default()
             };
-            if menu::item(ui, t, "Ignoring Case", check(!st.search_case)).clicked() {
+            if menu::item(ui, t, tr("Ignoring Case"), check(!st.search_case)).clicked() {
                 st.search_case = !st.search_case;
                 run = true;
             }
             if menu::item(
                 ui,
                 t,
-                "Treat Search Term as a Regex",
+                tr("Treat Search Term as a Regex"),
                 check(st.search_regex),
             )
             .clicked()
@@ -1713,14 +1756,14 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
                 run = true;
             }
             menu::separator(ui, t);
-            menu::heading(ui, t, "Recent Searches");
+            menu::heading(ui, t, tr("Recent Searches"));
             if st.recent_searches.is_empty() {
                 let none = menu::Item {
                     checked: Some(false),
                     disabled: true,
                     ..Default::default()
                 };
-                menu::item(ui, t, "No Recent Searches", none);
+                menu::item(ui, t, tr("No Recent Searches"), none);
             }
             for q in st.recent_searches.clone() {
                 if menu::item(ui, t, &q, check(false)).clicked() {
@@ -1734,16 +1777,16 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
                 disabled: st.recent_searches.is_empty(),
                 ..Default::default()
             };
-            if menu::item(ui, t, "Clear Recent Searches", clear).clicked() {
+            if menu::item(ui, t, tr("Clear Recent Searches"), clear).clicked() {
                 st.recent_searches.clear();
             }
         });
     }
     ui.add_space(6.0);
     let hint = if st.search_regex {
-        "Replace ($1, $2…)"
+        tr("Replace ($1, $2…)")
     } else {
-        "Replace"
+        tr("Replace")
     };
     search_box(
         ui,
@@ -1756,12 +1799,12 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
     ui.add_space(7.0);
     let buttons = [
         widgets::Capsule {
-            label: "Replace All",
+            label: tr("Replace All"),
             default: false,
             enabled: !st.results.is_empty(),
         },
         widgets::Capsule {
-            label: "Search",
+            label: tr("Search"),
             default: true,
             enabled: !st.search_query.is_empty(),
         },
@@ -1784,11 +1827,21 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
         let status = if let Some(e) = &st.search_error {
             egui::RichText::new(e).color(t.error)
         } else if st.searched.is_some() {
-            egui::RichText::new(format!(
-                "{total} result{} in {} file{}",
-                if total == 1 { "" } else { "s" },
-                st.results.len(),
-                if st.results.len() == 1 { "" } else { "s" }
+            let n = st.results.len();
+            let files = if n == 1 {
+                trf!("{n} file", n = n)
+            } else {
+                trf!("{n} files", n = n)
+            };
+            let results = if total == 1 {
+                trf!("{n} result", n = total)
+            } else {
+                trf!("{n} results", n = total)
+            };
+            egui::RichText::new(trf!(
+                "{results} in {files}",
+                results = results,
+                files = files
             ))
             .color(t.text_weak)
         } else {
@@ -1800,14 +1853,14 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new("Text Search")
+                egui::RichText::new(tr("Text Search"))
                     .size(17.0)
                     .color(t.text_weak.gamma_multiply(0.8)),
             )
         });
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new("Search every file in the project")
+                egui::RichText::new(tr("Search every file in the project"))
                     .size(11.0)
                     .color(t.text_weak),
             )
@@ -1909,7 +1962,7 @@ fn build_regex(st: &SidebarState) -> Result<regex::Regex, String> {
         .case_insensitive(!st.search_case)
         .size_limit(1 << 20)
         .build()
-        .map_err(|e| format!("Invalid pattern: {e}"))
+        .map_err(|e| trf!("Invalid pattern: {e}", e = e))
 }
 
 fn run_search(session: &mut Session, st: &mut SidebarState) {
@@ -1999,10 +2052,11 @@ fn replace_all(session: &mut Session, st: &mut SidebarState) {
         let _ = session.run("edit.setText", &serde_json::json!({ "text": new }));
     }
     session.active = active.min(session.docs.len().saturating_sub(1));
-    session.set_status(format!(
-        "Replaced {count} occurrence{} (unsaved)",
-        if count == 1 { "" } else { "s" }
-    ));
+    session.set_status(if count == 1 {
+        trf!("Replaced {n} occurrence (unsaved)", n = count)
+    } else {
+        trf!("Replaced {n} occurrences (unsaved)", n = count)
+    });
 }
 
 struct Tag {
@@ -2020,7 +2074,7 @@ fn tag_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSt
         ui,
         t,
         &mut st.tag_query,
-        "Sections, labels, citations, files, lines",
+        tr("Sections, labels, citations, files, lines"),
         id,
         FieldIcon::Search,
     );
@@ -2054,10 +2108,10 @@ fn tag_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSt
             .and_then(|d| d.typeset_path().map(Path::to_path_buf))
     {
         tags.push(Tag {
-            title: format!("Line {n}"),
+            title: trf!("Line {n}", n = n),
             path: p,
             line: n,
-            kind: "line",
+            kind: tr("line"),
         });
     }
     for f in &idx.files {
@@ -2066,15 +2120,15 @@ fn tag_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSt
                 title: file_label(&f.path),
                 path: f.path.clone(),
                 line: 1,
-                kind: "file",
+                kind: tr("file"),
             });
         }
         for i in &f.outline {
             let kind = match i.kind {
-                k if k.is_sectioning() => "section",
-                OutlineKind::Label => "label",
-                OutlineKind::Figure => "figure",
-                OutlineKind::Table => "table",
+                k if k.is_sectioning() => tr("section"),
+                OutlineKind::Label => tr("label"),
+                OutlineKind::Figure => tr("figure"),
+                OutlineKind::Table => tr("table"),
                 _ => continue,
             };
             if !i.title.is_empty() && (q.is_empty() || i.title.to_lowercase().contains(&q)) {
@@ -2094,7 +2148,7 @@ fn tag_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSt
                 title: e.key.clone(),
                 path: bib.clone(),
                 line: e.line,
-                kind: "citation",
+                kind: tr("citation"),
             });
         }
     }
@@ -2103,9 +2157,13 @@ fn tag_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSt
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new(format!("{} results", tags.len()))
-                .size(11.0)
-                .color(t.text_weak),
+            egui::RichText::new(if tags.len() == 1 {
+                trf!("{n} result", n = tags.len())
+            } else {
+                trf!("{n} results", n = tags.len())
+            })
+            .size(11.0)
+            .color(t.text_weak),
         );
     });
     let mut jump = None;

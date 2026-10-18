@@ -1,5 +1,6 @@
 //! The PDF viewer pane: header bar (zoom, page navigation, scroll lock, pause, page modes),
-//! pages rendered on a background thread, SyncTeX highlight and ⌘-click inverse search.
+//! pages rendered on a background thread, SyncTeX highlight and ⌘-click inverse search, text
+//! selection (drag, double/triple click) and copying.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,12 +10,14 @@ use egui::{
     Align, Color32, ColorImage, Id, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Ui, pos2, vec2,
 };
-use texcraft_engine::{Grading, PageMode, Session, Zoom};
-use texcraft_pdf::{PageSize, RenderEvent, RenderWorker, RenderedPage};
+use texcraft_engine::{Grading, PageMode, PdfPoint, Session, TextUnit, Zoom};
+use texcraft_i18n::{tr, trf};
+use texcraft_pdf::{PageSize, PageText, RenderEvent, RenderWorker, RenderedPage, TextPos};
 use texcraft_synctex::PdfRect;
 
+use crate::pdf_select::{self, PagePoint, Selection};
 use crate::theme::{HEADER_HEIGHT, Tokens};
-use crate::{icons, menu, widgets};
+use crate::{flash, icons, menu, widgets};
 
 /// Space around the pages (fit width fills the pane edge to edge, like the target).
 const MARGIN: f32 = 0.0;
@@ -58,6 +61,26 @@ pub struct PdfView {
     edit_at: Option<Instant>,
     /// Keystroke-to-pixels time of the last live update.
     pub latency: Option<Duration>,
+    /// Text of pages of `texts_doc` (for selecting and copying), extracted by the worker.
+    texts: HashMap<usize, Arc<PageText>>,
+    /// The document `texts` belong to.
+    texts_doc: u64,
+    /// Bumped whenever `texts` changes.
+    texts_version: u64,
+    /// Pages whose text was asked for (document, page).
+    text_requested: std::collections::HashSet<(u64, usize)>,
+    /// The text selection.
+    selection: Option<Selection>,
+    /// A drag is extending the selection.
+    selecting: bool,
+    /// The last press (input time, position, count): double and triple clicks.
+    last_press: Option<(f64, Pos2, u8)>,
+    /// The user's last click was in the PDF: ⌘C copies its selection.
+    pub active: bool,
+    /// The selection last resolved, with the `texts_version` it was resolved against.
+    resolved: Option<(Option<(TextPos, TextPos)>, u64)>,
+    /// Pages on screen last frame (0-based page, rect in window points), for the control channel.
+    shown: Vec<(usize, Rect)>,
 }
 
 impl PdfView {
@@ -101,7 +124,13 @@ impl PdfView {
                 self.edit_at = session.pdf.edit_at;
                 self.error = None;
             }
-            Err(e) => self.error = Some(format!("Cannot read {}: {e}", path.display())),
+            Err(e) => {
+                self.error = Some(trf!(
+                    "Cannot read {path}: {e}",
+                    path = path.display(),
+                    e = e
+                ));
+            }
         }
     }
 
@@ -168,6 +197,18 @@ impl PdfView {
                         );
                     }
                 }
+                RenderEvent::Text { doc, page, text } => {
+                    if doc == self.loaded_doc
+                        && let Ok(text) = text
+                    {
+                        if self.texts_doc != doc {
+                            self.texts.clear();
+                            self.texts_doc = doc;
+                        }
+                        self.texts.insert(page, text);
+                        self.texts_version += 1;
+                    }
+                }
                 RenderEvent::Failed { doc, page, error } => {
                     if doc == self.opened_generation && page.is_none() {
                         self.error = Some(error.to_string());
@@ -178,6 +219,116 @@ impl PdfView {
                 }
             }
         }
+    }
+}
+
+impl PdfView {
+    /// Drops the text of an older document.
+    fn sync_texts(&mut self) {
+        if self.texts_doc != self.loaded_doc {
+            self.texts.clear();
+            self.texts_doc = self.loaded_doc;
+            self.texts_version += 1;
+        }
+    }
+
+    /// Selects text from one point to another (`pdf.selectText`), or clears the selection.
+    pub fn select(&mut self, sel: Option<(PdfPoint, PdfPoint, TextUnit)>) {
+        let point = |p: PdfPoint| PagePoint {
+            page: p.page.saturating_sub(1) as usize,
+            x: p.x,
+            y: p.y,
+        };
+        self.selection = sel.map(|(from, to, unit)| Selection {
+            anchor: point(from),
+            focus: point(to),
+            unit: pdf_select::granularity(unit),
+        });
+        self.selecting = false;
+        self.active = self.selection.is_some();
+    }
+
+    /// The selected glyphs, if any (as far as the pages' text is known).
+    pub fn selected_range(&self) -> Option<(TextPos, TextPos)> {
+        self.selection
+            .as_ref()
+            .and_then(|s| pdf_select::resolve(s, &self.texts))
+    }
+
+    /// Highlight boxes of the selection on 0-based `page`, in PDF points from its top-left
+    /// corner (for tests and the control channel).
+    pub fn selection_rects(&self, page: usize) -> Vec<texcraft_pdf::TextRect> {
+        match (self.selected_range(), self.texts.get(&page)) {
+            (Some(range), Some(text)) => text.rects(pdf_select::page_range(range, page, text)),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The selection waits for the text of one of its pages.
+    fn text_pending(&self, sel: &Option<Selection>) -> bool {
+        sel.as_ref().is_some_and(|s| {
+            !self.texts.contains_key(&s.anchor.page) || !self.texts.contains_key(&s.focus.page)
+        })
+    }
+
+    /// The selection for `state.inspect`: its ends, highlight boxes per page (PDF points) and
+    /// which pages' text is loaded.
+    pub fn inspect_selection(&self) -> serde_json::Value {
+        let range = self.selected_range();
+        let rects: serde_json::Map<String, serde_json::Value> = range
+            .map(|(a, b)| a.page..=b.page)
+            .into_iter()
+            .flatten()
+            .map(|k| {
+                let boxes: Vec<[f32; 4]> = self
+                    .selection_rects(k)
+                    .iter()
+                    .map(|r| [r.x0, r.y0, r.x1, r.y1])
+                    .collect();
+                ((k + 1).to_string(), serde_json::json!(boxes))
+            })
+            .collect();
+        let mut pages: Vec<usize> = self.texts.keys().map(|k| k + 1).collect();
+        pages.sort_unstable();
+        let shown: serde_json::Map<String, serde_json::Value> = self
+            .shown
+            .iter()
+            .map(|(k, r)| {
+                let rect = [r.min.x, r.min.y, r.max.x, r.max.y];
+                ((k + 1).to_string(), serde_json::json!(rect))
+            })
+            .collect();
+        serde_json::json!({
+            // Window points of the visible pages, and points per PDF point.
+            "pageRects": shown,
+            "scale": self.last_scale,
+            "active": self.active,
+            "selecting": self.selecting,
+            "range": range.map(|(a, b)| [[a.page + 1, a.index], [b.page + 1, b.index]]),
+            "rects": rects,
+            "textPages": pages,
+        })
+    }
+
+    /// ⌘C goes to the PDF: there is selected text and the user's last click was in the PDF.
+    pub fn owns_copy(&self, session: &Session) -> bool {
+        self.active && !session.pdf.selected_text.is_empty()
+    }
+
+    /// Keeps `Session::pdf.selected_text` in step with the selection.
+    fn publish_selection(&mut self, session: &mut Session) {
+        let range = self.selected_range();
+        let key = Some((range, self.texts_version));
+        if self.resolved == key {
+            return;
+        }
+        self.resolved = key;
+        session.pdf.selected_text = match range {
+            Some((a, b)) => {
+                texcraft_pdf::selected_text(a, b, |p| self.texts.get(&p).map(AsRef::as_ref))
+            }
+            None => String::new(),
+        };
     }
 }
 
@@ -208,6 +359,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
     let ctx = ui.ctx().clone();
     let dark_grade = t.dark && session.view.grading == Grading::Entire;
     view.poll(&ctx, dark_grade);
+    view.sync_texts();
     // Regrade when the appearance changed.
     if view.textures.values().any(|tex| tex.graded != dark_grade) {
         view.textures.clear();
@@ -324,7 +476,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
         session.typeset.last_latency = Some(l);
     }
     let mut want: Vec<usize> = Vec::new();
-    let mut inverse: Option<(u32, f32, f32)> = None;
+    let mut inverse: Option<(u32, f32, f32, Option<texcraft_engine::sync::SyncHint>)> = None;
+    let mut copy = false;
     let mut zoom_by: Option<f32> = None;
     let mut thumb_pick: Option<usize> = None;
 
@@ -339,13 +492,113 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
         }
     }
     let out = scroll.show(&mut child, |ui| {
-        let (content, resp) = ui.allocate_exact_size(vec2(content_w, content_h), Sense::click());
+        let (content, resp) =
+            ui.allocate_exact_size(vec2(content_w, content_h), Sense::click_and_drag());
         let origin = content.min.to_vec2();
         if !thumbs {
             ui.painter().rect_filled(content, 0.0, t.page_gap);
         }
         let clip = ui.clip_rect();
+        // The page under a screen point (with `clamp`, the nearest page, the point moved onto
+        // it), in PDF points.
+        let page_at = |pos: Pos2, clamp: bool| -> Option<PagePoint> {
+            let mut best: Option<(f32, usize, Rect)> = None;
+            for (k, r) in rects.iter().enumerate() {
+                if *r == Rect::NOTHING {
+                    continue;
+                }
+                let sr = r.translate(origin);
+                let d = sr.distance_to_pos(pos);
+                if (d == 0.0 || clamp) && best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, k, sr));
+                }
+            }
+            best.map(|(_, k, sr)| {
+                let q = sr.clamp(pos);
+                PagePoint {
+                    page: k,
+                    x: (q.x - sr.left()) / scale,
+                    y: (q.y - sr.top()) / scale,
+                }
+            })
+        };
+        // ---- Text selection: press and drag; double-click words, triple-click lines.
+        let (pressed, down, cmd, time, press_pos, pointer) = ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers.command,
+                i.time,
+                i.pointer.press_origin(),
+                i.pointer.interact_pos(),
+            )
+        });
+        if !thumbs {
+            if pressed && !cmd && resp.hovered() {
+                if let Some(pos) = press_pos.or(pointer) {
+                    let count = pdf_select::press_count(view.last_press, time, pos);
+                    view.last_press = Some((time, pos, count));
+                    view.selection = page_at(pos, false).map(|at| Selection {
+                        anchor: at,
+                        focus: at,
+                        unit: pdf_select::unit_for(count),
+                    });
+                    view.selecting = view.selection.is_some();
+                    view.active = true;
+                    resp.request_focus();
+                }
+            } else if pressed && press_pos.is_some_and(|p| !body.contains(p)) {
+                view.active = false;
+            }
+            if view.selecting {
+                if down {
+                    if let Some(pos) = pointer {
+                        if let (Some(at), Some(sel)) = (page_at(pos, true), &mut view.selection) {
+                            sel.focus = at;
+                        }
+                        // Past the top or bottom edge: scroll along.
+                        let dy = if pos.y < clip.top() {
+                            clip.top() - pos.y
+                        } else if pos.y > clip.bottom() {
+                            clip.bottom() - pos.y
+                        } else {
+                            0.0
+                        };
+                        if dy != 0.0 {
+                            ui.scroll_with_delta_animation(
+                                vec2(0.0, (dy * 0.4).clamp(-30.0, 30.0)),
+                                egui::style::ScrollAnimation::none(),
+                            );
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                } else {
+                    view.selecting = false;
+                    if view.selected_range().is_none() && !view.text_pending(&view.selection) {
+                        view.selection = None;
+                    }
+                }
+            }
+            if view.active
+                && view.selection.is_some()
+                && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                view.selection = None;
+            }
+            copy = view.active
+                && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+            // The text cursor over text.
+            if !cmd
+                && (view.selecting || resp.hovered())
+                && let Some(at) = pointer.and_then(|pos| page_at(pos, false))
+                && let Some(text) = view.texts.get(&at.page)
+                && (view.selecting || text.line_at(at.x, at.y, 1.0).is_some())
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
+        }
         let p = ui.painter();
+        view.shown.clear();
         for (k, r) in rects.iter().enumerate() {
             if *r == Rect::NOTHING {
                 continue;
@@ -356,6 +609,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
             }
             if sr.intersects(clip) {
                 want.push(k);
+                view.shown.push((k, sr));
             }
             let paper = if dark_grade {
                 Color32::from_gray(46)
@@ -387,14 +641,34 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
                 );
             }
         }
+        // The text selection, over the ink (dimmer while the focus is elsewhere).
+        if let Some(range) = view.selected_range().filter(|_| !thumbs) {
+            let fill = if view.active {
+                t.selection
+            } else {
+                t.selection.gamma_multiply(0.5)
+            };
+            for k in range.0.page..=range.1.page {
+                let (Some(text), Some(r)) = (view.texts.get(&k), rects.get(k)) else {
+                    continue;
+                };
+                let sr = r.translate(origin);
+                if *r == Rect::NOTHING || !sr.intersects(clip) {
+                    continue;
+                }
+                for b in text.rects(pdf_select::page_range(range, k, text)) {
+                    let hl = Rect::from_min_max(
+                        sr.min + vec2(b.x0 * scale, b.y0 * scale),
+                        sr.min + vec2(b.x1 * scale, b.y1 * scale),
+                    );
+                    p.rect_filled(hl, 0.0, fill);
+                }
+            }
+        }
         // SyncTeX flash.
         if let Some((frects, started)) = &view.flash {
             let age = started.elapsed().as_secs_f32();
-            let alpha = if age < 1.2 {
-                1.0
-            } else {
-                (1.0 - (age - 1.2) / 0.6).max(0.0)
-            };
+            let alpha = flash::alpha(age);
             if alpha > 0.0 {
                 for fr in frects {
                     if let Some(page_rect) = rects.get(fr.page.saturating_sub(1) as usize) {
@@ -413,7 +687,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
                         );
                     }
                 }
-                ui.ctx().request_repaint_after(Duration::from_millis(30));
+                if let Some(next) = flash::next_frame(age) {
+                    ui.ctx().request_repaint_after(next);
+                }
             } else {
                 view.flash = None;
             }
@@ -455,7 +731,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
                 if sr.contains(pointer) {
                     let x = (pointer.x - sr.left()) / scale;
                     let y = (pointer.y - sr.top()) / scale;
-                    inverse = Some((k as u32 + 1, x, y));
+                    // The PDF text there lets the editor land on the clicked word.
+                    let hint = view
+                        .texts
+                        .get(&k)
+                        .and_then(|text| pdf_select::sync_hint(text, x, y));
+                    inverse = Some((k as u32 + 1, x, y, hint));
                 }
             }
         }
@@ -485,9 +766,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
     if let Some(z) = zoom_by {
         session.view.zoom = Zoom::Fixed((scale * z / fit_w).clamp(0.1, 8.0));
     }
-    if let Some((page, x, y)) = inverse
-        && let Err(e) = session.inverse_sync(page, x, y)
+    if let Some((page, x, y, hint)) = inverse
+        && let Err(e) = session.inverse_sync_with(page, x, y, hint.as_ref())
     {
+        session.set_status(e.to_string());
+    }
+    view.publish_selection(session);
+    if copy && let Err(e) = session.run("pdf.copySelection", &serde_json::Value::Null) {
         session.set_status(e.to_string());
     }
 
@@ -513,9 +798,37 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
                 view.requested.insert(k, (render_scale, view.loaded_doc));
             }
         }
+        // Text of the visible pages and of the selection's ends, after the renders.
+        let mut need = want.clone();
+        if let Some(sel) = &view.selection {
+            need.extend([sel.anchor.page, sel.focus.page]);
+        }
+        for k in need.into_iter().filter(|&k| k < view.pages.len()) {
+            if !view.texts.contains_key(&k) && view.text_requested.insert((view.loaded_doc, k)) {
+                worker.text(view.loaded_doc, k);
+            }
+        }
         // Drop textures far from the view.
         let cur = view.current_page;
         view.textures.retain(|&k, _| k + 8 >= cur && k <= cur + 8);
+        // And text, unless the selection is on it.
+        let keep = view.selection.map(|s| {
+            (
+                s.anchor.page.min(s.focus.page),
+                s.anchor.page.max(s.focus.page),
+            )
+        });
+        let near = |k: usize| {
+            (k + 24 >= cur && k <= cur + 24) || keep.is_some_and(|(a, b)| k >= a && k <= b)
+        };
+        let before = view.texts.len();
+        view.texts.retain(|&k, _| near(k));
+        if view.texts.len() != before {
+            view.texts_version += 1;
+        }
+        let doc = view.loaded_doc;
+        view.text_requested
+            .retain(|&(d, k)| d == doc && (near(k) || view.texts.contains_key(&k)));
     }
 }
 
@@ -533,7 +846,7 @@ fn empty_state(ui: &mut Ui, t: &Tokens, session: &Session, view: &PdfView, body:
         p.text(
             c + vec2(0.0, 14.0),
             egui::Align2::CENTER_CENTER,
-            "Typesetting…",
+            tr("Typesetting…"),
             egui::FontId::proportional(14.0),
             t.text_weak,
         );
@@ -550,14 +863,14 @@ fn empty_state(ui: &mut Ui, t: &Tokens, session: &Session, view: &PdfView, body:
         p.text(
             c - vec2(0.0, 10.0),
             egui::Align2::CENTER_CENTER,
-            "No PDF yet",
+            tr("No PDF yet"),
             egui::FontId::proportional(18.0),
             t.text_weak.gamma_multiply(0.8),
         );
         p.text(
             c + vec2(0.0, 14.0),
             egui::Align2::CENTER_CENTER,
-            "Typeset with ⌘T to see your document here",
+            tr("Typeset with ⌘T to see your document here"),
             egui::FontId::proportional(12.0),
             t.text_weak,
         );
@@ -628,7 +941,7 @@ fn header_bar(
         pl + 12.0,
         16.0,
         "grid",
-        "Page Thumbnails",
+        tr("Page Thumbnails"),
         has,
         &|p, r, c| icons::grid_rounded(p, r, if thumbs { t.accent } else { c }),
     ) {
@@ -638,7 +951,7 @@ fn header_bar(
         pl + 33.25,
         15.0,
         "zoom-out",
-        "Zoom Out (⌘−)",
+        tr("Zoom Out (⌘−)"),
         has,
         &|p, r, c| icons::magnifier(p, r, c, Some('-')),
     ) {
@@ -656,7 +969,7 @@ fn header_bar(
             ui.id().with("pdf-pct"),
             Sense::click(),
         )
-        .on_hover_text("Zoom");
+        .on_hover_text(tr("Zoom"));
     p.galley(pct_rect.min, pct, t.pdf_icon);
     egui::Popup::from_toggle_button_response(&pct_resp)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
@@ -681,8 +994,8 @@ fn header_bar(
             }
             menu::separator(ui, t);
             for (zoom, label) in [
-                (Zoom::FitWidth, "Zoom to Fit Width"),
-                (Zoom::FitPage, "Zoom to Fit Page"),
+                (Zoom::FitWidth, tr("Zoom to Fit Width")),
+                (Zoom::FitPage, tr("Zoom to Fit Page")),
             ] {
                 let opts = menu::Item {
                     checked: Some(session.view.zoom == zoom),
@@ -697,7 +1010,7 @@ fn header_bar(
         pl + 81.5,
         15.0,
         "zoom-in",
-        "Zoom In (⌘+)",
+        tr("Zoom In (⌘+)"),
         has,
         &|p, r, c| icons::magnifier(p, r, c, Some('+')),
     ) {
@@ -709,7 +1022,7 @@ fn header_bar(
         pl + 109.0,
         17.0,
         "first",
-        "First Page",
+        tr("First Page"),
         has && cur > 0,
         &|p, r, c| icons::chevron_double(p, r, c, false),
     ) {
@@ -719,7 +1032,7 @@ fn header_bar(
         pl + 127.0,
         15.5,
         "prev",
-        "Previous Page",
+        tr("Previous Page"),
         has && cur > 0,
         &|p, r, c| icons::chevron_thin(p, r, c, false),
     ) {
@@ -731,7 +1044,7 @@ fn header_bar(
         pr - 153.0,
         15.5,
         "next",
-        "Next Page",
+        tr("Next Page"),
         has && cur < last,
         &|p, r, c| icons::chevron_thin(p, r, c, true),
     ) {
@@ -741,7 +1054,7 @@ fn header_bar(
         pr - 135.0,
         17.0,
         "last",
-        "Last Page",
+        tr("Last Page"),
         has && cur < last,
         &|p, r, c| icons::chevron_double(p, r, c, true),
     ) {
@@ -756,7 +1069,7 @@ fn header_bar(
         pr - 104.5,
         15.0,
         "lock",
-        "Scroll Lock: the PDF follows the editor",
+        tr("Scroll Lock: the PDF follows the editor"),
         true,
         &|p, r, c| icons::sync_lock(p, r, if lock { t.accent } else { c }),
     ) {
@@ -766,7 +1079,7 @@ fn header_bar(
         pr - 81.0,
         15.0,
         "open",
-        "Open PDF in Default Viewer",
+        tr("Open PDF in Default Viewer"),
         session.pdf.path.is_some(),
         &|p, r, c| icons::open_external(p, r, c),
     ) {
@@ -777,7 +1090,7 @@ fn header_bar(
         pr - 58.25,
         16.5,
         "window",
-        "Show the PDF in a Separate Window",
+        tr("Show the PDF in a Separate Window"),
         has,
         &|p, r, c| icons::windows_two(p, r, if detached { t.accent } else { c }),
     ) {
@@ -786,9 +1099,9 @@ fn header_bar(
     let live = session.settings.live_typeset;
     let paused = session.live_paused;
     let pause_tip = if paused {
-        "Resume Auto-Typeset"
+        tr("Resume Auto-Typeset")
     } else {
-        "Pause Auto-Typeset"
+        tr("Pause Auto-Typeset")
     };
     if button(pr - 34.25, 16.6, "pause", pause_tip, live, &|p, r, c| {
         if paused {
@@ -802,7 +1115,7 @@ fn header_bar(
     let dots_r = Rect::from_center_size(pos2(pr - 11.0, cy), vec2(20.0, 22.0));
     let dots = ui
         .interact(dots_r, ui.id().with("pdf-more"), Sense::click())
-        .on_hover_text("More");
+        .on_hover_text(tr("More"));
     if dots.hovered() {
         p.rect_filled(dots_r, 5.0, t.row_hover);
     }
@@ -813,7 +1126,7 @@ fn header_bar(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             menu::begin(ui, 250.0);
-            menu::heading(ui, t, "Select Page Mode");
+            menu::heading(ui, t, tr("Select Page Mode"));
             for id in [
                 "pdf.singleContinuous",
                 "pdf.twoContinuous",
@@ -822,10 +1135,10 @@ fn header_bar(
                 menu::command(ui, t, session, id, None, true);
             }
             menu::separator(ui, t);
-            menu::heading(ui, t, "Image Grading Type in Dark Mode");
+            menu::heading(ui, t, tr("Image Grading Type in Dark Mode"));
             for (grading, label) in [
-                (Grading::Entire, "Grade Entire Viewer Output"),
-                (Grading::None, "No Grading"),
+                (Grading::Entire, tr("Grade Entire Viewer Output")),
+                (Grading::None, tr("No Grading")),
             ] {
                 let opts = menu::Item {
                     checked: Some(session.view.grading == grading),
@@ -843,7 +1156,7 @@ fn header_bar(
         let font = egui::FontId::proportional(10.75);
         let label = widgets::elide(
             &p,
-            &format!("Page {} of {}", cur + 1, n),
+            &trf!("Page {page} of {pages}", page = cur + 1, pages = n),
             &font,
             right_start - left_end - 8.0,
         );

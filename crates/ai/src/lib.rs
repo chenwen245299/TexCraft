@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use texcraft_i18n::{tr, trf};
 
 /// The wire format a provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -33,8 +34,16 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Shown in Settings.
+    /// Shown in Settings (in the interface language).
     pub fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic Messages API",
+            Self::OpenAi => tr("OpenAI-compatible"),
+        }
+    }
+
+    /// Its English name, the same in every interface language (`state.inspect`).
+    pub fn name(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic Messages API",
             Self::OpenAi => "OpenAI-compatible",
@@ -280,13 +289,12 @@ impl Config {
     /// Writes `path`, readable by the owner only (it holds API keys).
     pub fn save(&self, path: &Path) -> Result<(), AiError> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| err(format!("cannot save: {e}")))?;
+            std::fs::create_dir_all(dir).map_err(save_failed)?;
         }
-        let text =
-            serde_json::to_string_pretty(self).map_err(|e| err(format!("cannot save: {e}")))?;
+        let text = serde_json::to_string_pretty(self).map_err(save_failed)?;
         let tmp = path.with_extension("json.tmp");
         write_private(&tmp, text.as_bytes())?;
-        std::fs::rename(&tmp, path).map_err(|e| err(format!("cannot save: {e}")))
+        std::fs::rename(&tmp, path).map_err(save_failed)
     }
 
     /// Adds a provider from `preset` with a unique id; returns its index.
@@ -373,15 +381,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AiError> {
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| err(format!("cannot save: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| err(format!("cannot save: {e}")))
+        .map_err(save_failed)?;
+    f.write_all(bytes).map_err(save_failed)
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AiError> {
     // On Windows the file inherits the user profile folder's permissions (owner only).
-    std::fs::write(path, bytes).map_err(|e| err(format!("cannot save: {e}")))
+    std::fs::write(path, bytes).map_err(save_failed)
 }
 
 /// Where API keys are kept: encrypted with AES-256-GCM in `api_keys.json` under a random
@@ -430,14 +437,14 @@ impl KeyStore {
         if let Ok(text) = std::fs::read_to_string(&path) {
             return unhex(&text)
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                .ok_or_else(|| err("the key store's master key is damaged"));
+                .ok_or_else(|| err(tr("the key store's master key is damaged")));
         }
         if !create {
-            return Err(err("no key store yet"));
+            return Err(err(tr("no key store yet")));
         }
         let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|e| err(format!("no random numbers: {e}")))?;
-        std::fs::create_dir_all(&self.dir).map_err(|e| err(format!("cannot save: {e}")))?;
+        getrandom::fill(&mut key).map_err(|e| err(trf!("no random numbers: {e}", e = e)))?;
+        std::fs::create_dir_all(&self.dir).map_err(save_failed)?;
         write_private(&path, hex(&key).as_bytes())?;
         Ok(key)
     }
@@ -450,11 +457,11 @@ impl KeyStore {
     }
 
     fn write_map(&self, map: &std::collections::BTreeMap<String, String>) -> Result<(), AiError> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| err(format!("cannot save: {e}")))?;
+        std::fs::create_dir_all(&self.dir).map_err(save_failed)?;
         let text = serde_json::to_string_pretty(map).map_err(|e| err(e.to_string()))?;
         let tmp = self.dir.join("api_keys.json.tmp");
         write_private(&tmp, text.as_bytes())?;
-        std::fs::rename(&tmp, self.map_path()).map_err(|e| err(format!("cannot save: {e}")))
+        std::fs::rename(&tmp, self.map_path()).map_err(save_failed)
     }
 
     /// Stores `key` for provider `id` (replacing any earlier one).
@@ -462,9 +469,9 @@ impl KeyStore {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         let master = self.master(true)?;
         let cipher = aes_gcm::Aes256Gcm::new_from_slice(&master)
-            .map_err(|_| err("cannot set up encryption"))?;
+            .map_err(|_| err(tr("cannot set up encryption")))?;
         let mut nonce = [0u8; 12];
-        getrandom::fill(&mut nonce).map_err(|e| err(format!("no random numbers: {e}")))?;
+        getrandom::fill(&mut nonce).map_err(|e| err(trf!("no random numbers: {e}", e = e)))?;
         let sealed = cipher
             .encrypt(
                 &aes_gcm::Nonce::from(nonce),
@@ -473,7 +480,7 @@ impl KeyStore {
                     aad: id.as_bytes(),
                 },
             )
-            .map_err(|_| err("encryption failed"))?;
+            .map_err(|_| err(tr("encryption failed")))?;
         let mut map = self.read_map();
         map.insert(id.to_string(), format!("{}:{}", hex(&nonce), hex(&sealed)));
         self.write_map(&map)
@@ -541,6 +548,11 @@ impl std::fmt::Display for AiError {
 
 fn err(msg: impl Into<String>) -> AiError {
     AiError(msg.into())
+}
+
+/// A file of the settings or the key store could not be written.
+fn save_failed(e: impl std::fmt::Display) -> AiError {
+    err(trf!("cannot save: {e}", e = e))
 }
 
 /// Who wrote a message.
@@ -867,11 +879,11 @@ impl SseParser {
                         let from = block
                             .pointer("/from/model")
                             .and_then(Value::as_str)
-                            .unwrap_or("the model");
+                            .unwrap_or_else(|| tr("the model"));
                         let to = block
                             .pointer("/to/model")
                             .and_then(Value::as_str)
-                            .unwrap_or("another model");
+                            .unwrap_or_else(|| tr("another model"));
                         out.push(Event::Fallback(format!("{from} → {to}")));
                     }
                     "text" => {
@@ -944,7 +956,7 @@ impl SseParser {
                 let msg = v
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .unwrap_or("the provider reported an error");
+                    .unwrap_or_else(|| tr("the provider reported an error"));
                 vec![Event::Failed(msg.to_string())]
             }
             _ => Vec::new(),
@@ -1032,7 +1044,7 @@ pub fn error_message(body: &str) -> String {
         }
     }
     if body.is_empty() {
-        "The provider did not answer. Check the base URL, API key and network.".into()
+        tr("The provider did not answer. Check the base URL, API key and network.").into()
     } else {
         body.chars().take(400).collect()
     }
@@ -1157,7 +1169,7 @@ fn spawn_curl(
         if let Some(p) = &body_file {
             let _ = std::fs::remove_file(p);
         }
-        err(format!("cannot run curl: {e}"))
+        err(trf!("cannot run curl: {e}", e = e))
     })?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(config.as_bytes());
@@ -1250,7 +1262,7 @@ pub fn start(req: &ChatRequest, waker: Arc<dyn Fn() + Send + Sync>) -> Job {
         });
     if let Err(e) = spawned {
         let (tx2, rx2) = channel();
-        let _ = tx2.send(Event::Failed(format!("cannot start the request: {e}")));
+        let _ = tx2.send(Event::Failed(trf!("cannot start the request: {e}", e = e)));
         return Job {
             rx: rx2,
             child: Arc::new(Mutex::new(None)),

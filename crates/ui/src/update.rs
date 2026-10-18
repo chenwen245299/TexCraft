@@ -12,6 +12,7 @@ use egui::{
 };
 use texcraft_engine::update::REPO_URL;
 use texcraft_engine::{CURRENT_VERSION, Session, UpdateStatus};
+use texcraft_i18n::{tr, trf};
 
 use crate::prefs::{Pal, pal};
 use crate::theme::{Tokens, editor_font, semibold};
@@ -303,17 +304,21 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
     let inner_w = W - 2.0 * PAD;
     let notes = release.as_ref().map(|r| {
         let text = if r.notes.trim().is_empty() {
-            format!("A new version v{} is available. Update now?", r.version)
+            trf!(
+                "A new version v{version} is available. Update now?",
+                version = r.version
+            )
         } else {
             r.notes.clone()
         };
         layout_notes(ui, t, p, &text, inner_w)
     });
     let message = match &status {
-        UpdateStatus::Checking | UpdateStatus::Idle => "Checking for updates…".to_string(),
-        UpdateStatus::UpToDate => {
-            format!("You are up to date: TexCraft {CURRENT_VERSION} is the newest version.")
-        }
+        UpdateStatus::Checking | UpdateStatus::Idle => tr("Checking for updates…").to_string(),
+        UpdateStatus::UpToDate => trf!(
+            "You are up to date: TexCraft {version} is the newest version.",
+            version = CURRENT_VERSION
+        ),
         UpdateStatus::Failed(msg) if release.is_none() => msg.clone(),
         _ => String::new(),
     };
@@ -360,9 +365,9 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
         tx = badge.right() + 10.0;
     }
     let title = if release.is_some() {
-        "Release Notes"
+        tr("Release Notes")
     } else {
-        "Check for Updates"
+        tr("Check for Updates")
     };
     ui.painter().text(
         pos2(tx, hy),
@@ -435,13 +440,13 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
         hairline(ui, p, x0, x1, y);
         for (i, (text, label, url)) in [
             (
-                "If you find TexCraft useful, please star the project on GitHub.",
-                "★  Star",
+                tr("If you find TexCraft useful, please star the project on GitHub."),
+                tr("★  Star"),
                 REPO_URL.to_string(),
             ),
             (
-                "Have a feature request or found a bug? Open a GitHub issue.",
-                "Issues",
+                tr("Have a feature request or found a bug? Open a GitHub issue."),
+                tr("Issues"),
                 format!("{REPO_URL}/issues"),
             ),
         ]
@@ -493,9 +498,9 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
     let right = x1 - PAD;
     match &status {
         UpdateStatus::Downloading { done, total, .. } => {
-            let label = format!(
-                "Downloading… {}%",
-                (done.saturating_mul(100))
+            let label = trf!(
+                "Downloading… {percent}%",
+                percent = (done.saturating_mul(100))
                     .checked_div(*total)
                     .unwrap_or(0)
                     .min(100)
@@ -521,14 +526,14 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
                 FontId::proportional(12.0),
                 p.desc,
             );
-            let tip = format!("{} of {}", mb(*done), mb(*total));
+            let tip = trf!("{done} of {total}", done = mb(*done), total = mb(*total));
             ui.interact(bar, Id::new("update-progress"), Sense::hover())
                 .on_hover_text(tip);
         }
         UpdateStatus::Checking => {
-            let r = footer_rects(ui, right, cy, &["Cancel"]);
+            let r = footer_rects(ui, right, cy, &[tr("Cancel")]);
             if let Some(b) = r.first()
-                && flat_button(ui, t, p, "cancel", *b, "Cancel", false)
+                && flat_button(ui, t, p, "cancel", *b, tr("Cancel"), false)
             {
                 let _ = session.run("app.cancelUpdate", &serde_json::Value::Null);
                 close = true;
@@ -537,7 +542,7 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
         UpdateStatus::Available(_) | UpdateStatus::Ready(_) => {
             // Skip, as a quiet text button on the left.
             let skip = ui.painter().layout_no_wrap(
-                "Skip this version".into(),
+                tr("Skip this version").into(),
                 FontId::proportional(12.0),
                 p.note,
             );
@@ -550,10 +555,14 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
                 close = true;
             }
             let ready = matches!(status, UpdateStatus::Ready(_));
-            let primary = if ready { "Restart Now" } else { "Update Now" };
-            let r = footer_rects(ui, right, cy, &["Later", primary]);
+            let primary = if ready {
+                tr("Restart Now")
+            } else {
+                tr("Update Now")
+            };
+            let r = footer_rects(ui, right, cy, &[tr("Later"), primary]);
             if let Some(b) = r.first()
-                && flat_button(ui, t, p, "later", *b, "Later", false)
+                && flat_button(ui, t, p, "later", *b, tr("Later"), false)
             {
                 close = true;
             }
@@ -573,16 +582,16 @@ fn window(ui: &mut Ui, t: &Tokens, p: &Pal, session: &mut Session) -> bool {
                 ui.painter().text(
                     pos2(r.first().map_or(right, |b| b.left()) - 10.0, cy),
                     Align2::RIGHT_CENTER,
-                    "or installs when you quit",
+                    tr("or installs when you quit"),
                     FontId::proportional(11.5),
                     p.note,
                 );
             }
         }
         _ => {
-            let r = footer_rects(ui, right, cy, &["OK"]);
+            let r = footer_rects(ui, right, cy, &[tr("OK")]);
             if let Some(b) = r.first()
-                && flat_button(ui, t, p, "ok", *b, "OK", true)
+                && flat_button(ui, t, p, "ok", *b, tr("OK"), true)
             {
                 close = true;
             }

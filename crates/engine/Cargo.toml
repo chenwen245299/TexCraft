@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 texcraft-syntax.workspace = true
+texcraft-i18n.workspace = true
 texcraft-log.workspace = true
 texcraft-synctex.workspace = true
 texcraft-project.workspace = true
@@ -18,7 +19,6 @@ texcraft-git.workspace = true
 texcraft-ai.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 
 [lints]
 workspace = true

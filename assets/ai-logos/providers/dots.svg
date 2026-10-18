@@ -7,7 +7,7 @@
   <title>Minimal sail icon</title>
   <g transform="translate(68 -24.6) scale(4)">
     <path
-      fill="#000000"
+      fill="currentColor"
       fill-rule="evenodd"
       clip-rule="evenodd"
       d="M40.1 163.4
@@ -29,7 +29,7 @@
          Z"/>
 
     <path
-      fill="#000000"
+      fill="currentColor"
       d="M75.4 212.9 H166.7 L163.0 233.4 H79.8 Z"/>
   </g>
 </svg>

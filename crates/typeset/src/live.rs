@@ -28,6 +28,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use texcraft_i18n::{tr, trf};
 use texcraft_project::Engine;
 
 /// What a live typeset needs.
@@ -640,7 +641,10 @@ pub fn live_command(
     let mut args = Vec::new();
     let prog = match req.engine {
         Engine::Tectonic => {
-            let prog = tc.tectonic.clone().ok_or("Tectonic is not installed.")?;
+            let prog = tc
+                .tectonic
+                .clone()
+                .ok_or_else(|| tr("Tectonic is not installed.").to_string())?;
             args.extend(
                 [
                     "-X",
@@ -664,9 +668,9 @@ pub fn live_command(
         Engine::LuaLatex => tc.lualatex.clone(),
     };
     let prog = prog.ok_or_else(|| {
-        format!(
-            "{} is not installed. Install MacTeX or TeX Live.",
-            req.engine.label()
+        trf!(
+            "{engine} is not installed. Install MacTeX or TeX Live.",
+            engine = req.engine.label()
         )
     })?;
     if let Some(f) = format {

@@ -10,6 +10,7 @@ use egui::text::{CCursor, LayoutJob, TextFormat};
 use egui::text_selection::CCursorRange;
 use egui::{Align, Color32, Galley, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke, Ui, vec2};
 use texcraft_engine::{Selection, Session, edit};
+use texcraft_i18n::{tr, trf};
 use texcraft_log::Severity;
 use texcraft_syntax::completion::{
     Accept, COMMANDS, CompletionContext, ENVIRONMENTS, completion_edit, context_at, expand_snippet,
@@ -103,6 +104,46 @@ pub struct EditorState {
     pub caret_moved: bool,
     /// Spell checking.
     pub spell: SpellState,
+    /// The source inverse search landed on, flashed for a moment.
+    pub flash: Option<SourceFlash>,
+}
+
+/// A brief highlight of characters `start..end` of document `doc` (an empty range: the caret's
+/// row), started at `at`; it holds, then fades like the PDF's SyncTeX flash.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceFlash {
+    /// Document index.
+    pub doc: usize,
+    /// First character.
+    pub start: usize,
+    /// End (exclusive).
+    pub end: usize,
+    /// When it started.
+    pub at: std::time::Instant,
+}
+
+/// Galley-relative boxes over characters `start..end`: one per row it touches, the row's
+/// height and as wide as the characters on it.
+pub fn flash_rects(galley: &Galley, start: usize, end: usize) -> Vec<Rect> {
+    use egui::epaint::text::CharIndex;
+    let mut out = Vec::new();
+    let mut row_start = 0usize;
+    for row in &galley.rows {
+        let n = row.char_count_excluding_newline().0;
+        let row_end = row_start + n;
+        let (lo, hi) = (start.max(row_start), end.min(row_end));
+        if lo < hi {
+            let r = row.rect();
+            let x0 = row.pos.x + row.x_offset(CharIndex(lo - row_start));
+            let x1 = row.pos.x + row.x_offset(CharIndex(hi - row_start));
+            out.push(Rect::from_min_max(pos(x0, r.top()), pos(x1, r.bottom())));
+        }
+        if row_start > end {
+            break;
+        }
+        row_start = row_end + usize::from(row.ends_with_newline);
+    }
+    out
 }
 
 /// Spell-checking state: the word list (loaded in the background), verdicts per word, the
@@ -691,7 +732,7 @@ fn jump_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
     x += 17.5;
     let dirty = doc.is_dirty() && !doc.is_pristine() && doc.path.is_some();
     let label = if dirty {
-        format!("{name} — Edited")
+        trf!("{name} — Edited", name = name)
     } else {
         name
     };
@@ -713,7 +754,7 @@ fn jump_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
     let br = Rect::from_center_size(pos(header.right() - 17.5, cy), vec2(26.0, 20.0));
     let resp = ui
         .interact(br, Id::new("symbols-button"), Sense::click())
-        .on_hover_text("Symbols");
+        .on_hover_text(tr("Symbols"));
     if st.symbols_open || resp.hovered() {
         ui.painter().rect_filled(br, 4.0, t.row_hover);
     }
@@ -765,7 +806,7 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
             vec2(w, 22.0),
             egui::TextEdit::singleline(&mut st.find.query)
                 .id(id)
-                .hint_text("Find")
+                .hint_text(tr("Find"))
                 .font(egui::FontId::proportional(12.0)),
         );
         if st.find.focus {
@@ -779,12 +820,12 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
         let count = if st.find.query.is_empty() {
             String::new()
         } else if matches.is_empty() {
-            "No matches".to_string()
+            tr("No matches").to_string()
         } else {
-            format!(
-                "{} of {}",
-                st.find.current.min(matches.len() - 1) + 1,
-                matches.len()
+            trf!(
+                "{current} of {total}",
+                current = st.find.current.min(matches.len() - 1) + 1,
+                total = matches.len()
             )
         };
         ui.label(egui::RichText::new(count).size(11.0).color(t.text_weak));
@@ -792,7 +833,7 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
             ui,
             t,
             vec2(22.0, 22.0),
-            "Previous",
+            tr("Previous"),
             false,
             !matches.is_empty(),
             icons::chevron_left,
@@ -805,7 +846,7 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
             ui,
             t,
             vec2(22.0, 22.0),
-            "Next",
+            tr("Next"),
             false,
             !matches.is_empty(),
             icons::chevron_right,
@@ -818,12 +859,12 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
             &mut st.find.case_sensitive,
             egui::RichText::new("Aa").size(11.0),
         )
-        .on_hover_text("Match case");
+        .on_hover_text(tr("Match case"));
         ui.checkbox(
             &mut st.find.replace_open,
-            egui::RichText::new("Replace").size(11.0),
+            egui::RichText::new(tr("Replace")).size(11.0),
         );
-        if ui.button("Done").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+        if ui.button(tr("Done")).clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
             st.find.open = false;
             st.focus = true;
         }
@@ -835,17 +876,17 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
             ui.add_sized(
                 vec2(w, 22.0),
                 egui::TextEdit::singleline(&mut st.find.replacement)
-                    .hint_text("Replace")
+                    .hint_text(tr("Replace"))
                     .font(egui::FontId::proportional(12.0)),
             );
             if ui
-                .add_enabled(!matches.is_empty(), egui::Button::new("Replace"))
+                .add_enabled(!matches.is_empty(), egui::Button::new(tr("Replace")))
                 .clicked()
             {
                 replace_one = true;
             }
             if ui
-                .add_enabled(!matches.is_empty(), egui::Button::new("Replace All"))
+                .add_enabled(!matches.is_empty(), egui::Button::new(tr("Replace All")))
                 .clicked()
             {
                 replace_all = true;
@@ -867,10 +908,11 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
         }
         out.push_str(text.get(last..).unwrap_or(""));
         let _ = session.run("edit.setText", &serde_json::json!({ "text": out }));
-        session.set_status(format!(
-            "Replaced {n} occurrence{}",
-            if n == 1 { "" } else { "s" }
-        ));
+        session.set_status(if n == 1 {
+            trf!("Replaced {n} occurrence", n = n)
+        } else {
+            trf!("Replaced {n} occurrences", n = n)
+        });
         st.push_selection = Some(session.active);
         return;
     }
@@ -984,7 +1026,7 @@ fn symbols_popover(
                         .show(ui, |ui| {
                             for cat in crate::symbols::CATEGORIES {
                                 ui.label(
-                                    egui::RichText::new(cat.name)
+                                    egui::RichText::new(tr(cat.name))
                                         .size(11.0)
                                         .strong()
                                         .color(t.text_weak),
@@ -1066,7 +1108,7 @@ pub fn candidates(session: &Session, ctx: &CompletionContext) -> Vec<Candidate> 
                         s,
                         Candidate {
                             label: format!("\\{}", c.name),
-                            detail: c.detail.to_string(),
+                            detail: tr(c.detail).to_string(),
                             info: format!("\\{}", expand_snippet(c.snippet).0),
                             insert: Insert::Command(c.snippet.to_string()),
                         },
@@ -1083,8 +1125,8 @@ pub fn candidates(session: &Session, ctx: &CompletionContext) -> Vec<Candidate> 
                         s,
                         Candidate {
                             label: format!("\\{name}"),
-                            detail: "user command".into(),
-                            info: "Defined in this project".into(),
+                            detail: tr("user command").into(),
+                            info: tr("Defined in this project").into(),
                             insert: Insert::Command(name.clone()),
                         },
                     ));
@@ -1098,7 +1140,7 @@ pub fn candidates(session: &Session, ctx: &CompletionContext) -> Vec<Candidate> 
                         s,
                         Candidate {
                             label: e.name.to_string(),
-                            detail: e.detail.to_string(),
+                            detail: tr(e.detail).to_string(),
                             info: format!("\\begin{{{}}} … \\end{{{}}}", e.name, e.name),
                             insert: Insert::Environment(e.name.to_string()),
                         },
@@ -1119,9 +1161,14 @@ pub fn candidates(session: &Session, ctx: &CompletionContext) -> Vec<Candidate> 
                             label: key.clone(),
                             detail: format!("{fname}:{line}"),
                             info: if section.is_empty() {
-                                format!("{fname}, line {line}")
+                                trf!("{file}, line {line}", file = fname, line = line)
                             } else {
-                                format!("In “{section}” — {fname}, line {line}")
+                                trf!(
+                                    "In “{section}” — {file}, line {line}",
+                                    section = section,
+                                    file = fname,
+                                    line = line
+                                )
                             },
                             insert: Insert::Key(key),
                         },
@@ -1619,6 +1666,8 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let band_idx = ui.painter().add(egui::Shape::Noop);
+            // Where inverse search landed, under the text and the selection.
+            let flash_idx = ui.painter().add(egui::Shape::Noop);
             // The selection, under the text (see `paint_selection`).
             let sel_idx = ui.painter().add(egui::Shape::Noop);
             ui.horizontal_top(|ui| {
@@ -1679,7 +1728,14 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                     .id(id)
                     .font(font.clone())
                     .frame(egui::Frame::NONE)
-                    .lock_focus(true)
+                    // Tab indents, and Escape stays here too (it dismisses an AI suggestion,
+                    // closes or opens the completion list) instead of dropping the focus.
+                    .event_filter(egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    })
                     .desired_width(wrap_width)
                     .desired_rows(40)
                     .margin(egui::Margin {
@@ -1716,6 +1772,46 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                 let galley = out.galley.clone();
                 let gpos = out.galley_pos;
                 let clip = ui.clip_rect();
+                // Inverse search: the line or sentence it landed on holds, then fades.
+                if let Some(f) = st.flash.filter(|f| f.doc == active) {
+                    let age = f.at.elapsed().as_secs_f32();
+                    let alpha = crate::flash::alpha(age);
+                    if alpha <= 0.0 || changed {
+                        st.flash = None;
+                    } else {
+                        // Characters of an inline suggestion shift the layout after it.
+                        let shift = |c: usize| match ghost_chars {
+                            Some((at, n)) if c >= at => c + n,
+                            _ => c,
+                        };
+                        // One solid band over the rows the target covers, across the text
+                        // column (an empty line: its row).
+                        let rows = flash_rects(&galley, shift(f.start), shift(f.end));
+                        let (top, bottom) = match (rows.first(), rows.last()) {
+                            (Some(a), Some(b)) => (a.top(), b.bottom()),
+                            _ => {
+                                let c = galley.pos_from_cursor(CCursor::new(shift(f.start)));
+                                (c.top(), c.bottom())
+                            }
+                        };
+                        let band = Rect::from_min_max(
+                            pos(gpos.x - 3.0, gpos.y + top),
+                            // Short of the scroll bar, as in the target.
+                            pos(clip.right() - 14.0, gpos.y + bottom),
+                        );
+                        ui.painter().set(
+                            flash_idx,
+                            egui::Shape::rect_filled(
+                                band,
+                                0.0,
+                                t.source_flash.gamma_multiply(alpha),
+                            ),
+                        );
+                        if let Some(next) = crate::flash::next_frame(age) {
+                            ui.ctx().request_repaint_after(next);
+                        }
+                    }
+                }
                 let caret_row_y = out
                     .cursor_range
                     .map(|c| galley.pos_from_cursor(c.primary).translate(gpos.to_vec2()));
@@ -1873,6 +1969,12 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
         st.completion = None;
         session.forward_sync(true);
     }
+    // The completion list and an AI suggestion would both take Tab: while the list is up no
+    // suggestion shows and none is asked for (typing after it closes asks again). Nor while
+    // the keys go elsewhere (the find bar, the AI panel): the suggestion follows the caret.
+    if st.completion.is_some() || !has_focus {
+        session.inline_dismiss();
+    }
     spell_menu(ui, t, session, st, active);
 
     // ---- Completion popup.
@@ -1901,7 +2003,7 @@ fn spell_menu(ui: &Ui, t: &Tokens, session: &mut Session, st: &mut EditorState, 
                             disabled: true,
                             ..Default::default()
                         };
-                        crate::menu::item(ui, t, "No Guesses Found", none);
+                        crate::menu::item(ui, t, tr("No Guesses Found"), none);
                     }
                     for g in &spell.guesses {
                         let strong = crate::menu::Item {
@@ -1913,10 +2015,10 @@ fn spell_menu(ui: &Ui, t: &Tokens, session: &mut Session, st: &mut EditorState, 
                         }
                     }
                     crate::menu::separator(ui, t);
-                    if crate::menu::button(ui, t, "Learn Spelling") {
+                    if crate::menu::button(ui, t, tr("Learn Spelling")) {
                         learn = true;
                     }
-                    if crate::menu::button(ui, t, "Ignore Spelling") {
+                    if crate::menu::button(ui, t, tr("Ignore Spelling")) {
                         ignore = true;
                     }
                     crate::menu::separator(ui, t);
@@ -2001,7 +2103,7 @@ fn command_item(
         disabled: !session.is_enabled(id),
         ..Default::default()
     };
-    crate::menu::item(ui, t, spec.label, opts)
+    crate::menu::item(ui, t, spec.label(), opts)
         .clicked()
         .then_some(id)
 }
@@ -2071,10 +2173,10 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
                         );
                     }
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} of {}   ⇥ insert   ⎋ close",
-                            c.selected + 1,
-                            c.items.len()
+                        egui::RichText::new(trf!(
+                            "{current} of {total}   ⇥ insert   ⎋ close",
+                            current = c.selected + 1,
+                            total = c.items.len()
                         ))
                         .size(10.0)
                         .color(t.text_weak),
@@ -2086,6 +2188,86 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typing plain text waits for an AI suggestion; typing a command opens the completion list
+    /// and waits for none (both would take Tab). Escape closes the list and the editor keeps the
+    /// keys; with the keys elsewhere no suggestion is waited for.
+    #[test]
+    fn completion_list_holds_ai_suggestions() {
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        // A local model: suggestions need no key. Nothing is sent (the session never ticks).
+        let Some(local) = texcraft_ai::PRESETS.iter().find(|p| p.id == "ollama") else {
+            panic!("no local preset");
+        };
+        let i = session.ai.config.add(local);
+        session.ai.config.providers[i].base_url = "http://127.0.0.1:9/v1".into();
+        session.ai.config.providers[i].models = vec!["local-model".into()];
+        session.ai.config.normalize();
+        session.ai.config.inline.enabled = true;
+        assert!(session.inline_available());
+        assert!(
+            session
+                .run("edit.setText", &serde_json::json!({ "text": "" }))
+                .is_ok()
+        );
+        let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let t = Tokens::light();
+        let mut st = EditorState::default();
+        // One frame with `events`; `focus`: give the editor the keys (true), take them (false).
+        let frame = |session: &mut Session,
+                     st: &mut EditorState,
+                     events: Vec<egui::Event>,
+                     focus: Option<bool>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                match focus {
+                    Some(true) => ui.memory_mut(|m| m.request_focus(id)),
+                    Some(false) => ui.memory_mut(|m| m.surrender_focus(id)),
+                    None => {}
+                }
+                show(ui, &t, session, st);
+            });
+            out.textures_delta.clear();
+        };
+        let text = |s: &str| vec![egui::Event::Text(s.into())];
+        let waiting = |s: &Session| s.inspect()["ai"]["inline"]["waiting"].as_bool();
+        frame(&mut session, &mut st, Vec::new(), Some(true));
+        frame(&mut session, &mut st, text("Hello "), None);
+        assert_eq!(session.doc().map(|d| d.text.as_str()), Some("Hello "));
+        assert!(st.completion.is_none());
+        assert_eq!(waiting(&session), Some(true), "plain typing waits");
+        frame(&mut session, &mut st, text("\\sec"), None);
+        assert!(st.completion.is_some(), "the completion list is up");
+        assert_eq!(
+            waiting(&session),
+            Some(false),
+            "no suggestion over the list"
+        );
+        let escape = vec![egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }];
+        frame(&mut session, &mut st, escape, None);
+        assert!(st.completion.is_none(), "Escape closes the list");
+        assert!(
+            ctx.memory(|m| m.has_focus(id)),
+            "and the editor keeps the keys"
+        );
+        frame(&mut session, &mut st, text(" and"), None);
+        assert_eq!(waiting(&session), Some(true));
+        frame(&mut session, &mut st, Vec::new(), Some(false));
+        assert_eq!(waiting(&session), Some(false), "the keys went elsewhere");
+    }
 
     /// Soft wrap with a hanging indent: first rows as wide as unwrapped text allows, the rest
     /// indented, every character in place (the ghost text's first row ended a few characters

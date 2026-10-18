@@ -2,6 +2,7 @@
 
 use egui::{Align, Color32, Rect, Sense, Stroke, Ui, ViewportCommand, pos2, vec2};
 use texcraft_engine::{Layout, Session};
+use texcraft_i18n::{tr, trf};
 use texcraft_project::TypesetMode;
 use texcraft_syntax::OutlineKind;
 
@@ -14,6 +15,18 @@ fn run(session: &mut Session, id: &str) {
     }
 }
 
+/// The engine's summary of a full typeset (its status message), in English.
+const TYPESET_SUMMARY: &str = "Typeset in {seconds} s — {errors}, {warnings}";
+
+/// Whether a status message is the summary of a full typeset ("Typeset in 0.4 s — …"), in
+/// English or in the interface language (the text before the first placeholder).
+fn is_typeset_summary(msg: &str) -> bool {
+    let prefix = |template: &'static str| template.split('{').next().unwrap_or("");
+    [prefix(TYPESET_SUMMARY), prefix(tr(TYPESET_SUMMARY))]
+        .iter()
+        .any(|p| !p.trim().is_empty() && msg.starts_with(p))
+}
+
 /// Short description of the tool chain the next typeset runs, e.g. `pdfLaTeX > Bibliography`.
 pub fn chain_label(session: &Session) -> String {
     let mut s = session.effective_engine().label().to_string();
@@ -23,7 +36,8 @@ pub fn chain_label(session: &Session) -> String {
             .any(|i| i.kind == OutlineKind::Bibliography)
     });
     if has_bib {
-        s.push_str(" > Bibliography");
+        s.push_str(" > ");
+        s.push_str(tr("Bibliography"));
     }
     s
 }
@@ -173,7 +187,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     let shown = session.view.sidebar;
     let resp = ui
         .interact(disc, ui.id().with("tb-sidebar"), Sense::click())
-        .on_hover_text("Show / Hide Sidebar (⌘1)");
+        .on_hover_text(tr("Show / Hide Sidebar (⌘1)"));
     if shown {
         p.circle_filled(disc.center(), 15.5, t.accent);
     } else if resp.hovered() {
@@ -190,9 +204,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     // Typeset gears (turn while a full typeset runs; click again to abort it).
     let gears = Rect::from_min_size(pos2(gears_x, cy - 12.0), vec2(24.0, 24.0));
     let tip = if running {
-        "Abort Typesetting (⌘T)"
+        tr("Abort Typesetting (⌘T)")
     } else {
-        "Typeset (⌘T)"
+        tr("Typeset (⌘T)")
     };
     let enabled = session.is_enabled("typeset.run");
     if hit(ui, t, gears.expand(3.0), "tb-gears", tip, enabled, 8.0).clicked() {
@@ -217,24 +231,43 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
         }
     };
     let auto_tip = if paused {
-        "Auto-typeset is paused (resume it in the PDF toolbar)".to_string()
+        tr("Auto-typeset is paused (resume it in the PDF toolbar)").to_string()
     } else {
         match mode {
             TypesetMode::Live => {
                 let speed = match (session.typeset.last_latency, session.typeset.last_live) {
                     (Some(l), _) => format!(
-                        "\nLast update: {:.2} s from keystroke to PDF",
-                        l.as_secs_f32()
+                        "\n{}",
+                        trf!(
+                            "Last update: {seconds} s from keystroke to PDF",
+                            seconds = format!("{:.2}", l.as_secs_f32())
+                        )
                     ),
-                    (None, Some(d)) => format!("\nLast pass took {:.2} s", d.as_secs_f32()),
+                    (None, Some(d)) => format!(
+                        "\n{}",
+                        trf!(
+                            "Last pass took {seconds} s",
+                            seconds = format!("{:.2}", d.as_secs_f32())
+                        )
+                    ),
                     _ => String::new(),
                 };
-                format!("LIVE: the PDF follows your typing without saving{speed}\nClick for AUTO")
+                format!(
+                    "{}{speed}\n{}",
+                    tr("LIVE: the PDF follows your typing without saving"),
+                    tr("Click for AUTO")
+                )
             }
-            TypesetMode::Auto => {
-                "AUTO: a full typeset starts when typing pauses\nClick for MANUAL".to_string()
-            }
-            TypesetMode::Manual => "MANUAL: typeset with ⌘T\nClick for LIVE".to_string(),
+            TypesetMode::Auto => format!(
+                "{}\n{}",
+                tr("AUTO: a full typeset starts when typing pauses"),
+                tr("Click for MANUAL")
+            ),
+            TypesetMode::Manual => format!(
+                "{}\n{}",
+                tr("MANUAL: typeset with ⌘T"),
+                tr("Click for LIVE")
+            ),
         }
     };
     let mode_resp = ui
@@ -277,7 +310,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
         t,
         sl.expand(5.0),
         "tb-sliders",
-        "Typeset Configuration",
+        tr("Typeset Configuration"),
         true,
         6.0,
     )
@@ -293,7 +326,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     let tip = if running {
         icons::spinner(&p, st, t.text_weak, ui.input(|i| i.time) as f32 * 6.0);
         ui.ctx().request_repaint();
-        "Typesetting…".to_string()
+        tr("Typesetting…").to_string()
     } else if errors > 0 {
         p.text(
             st.center(),
@@ -302,10 +335,20 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             egui::FontId::proportional(14.0),
             t.error,
         );
-        format!(
-            "{errors} error{}, {warnings} warning{}",
-            if errors == 1 { "" } else { "s" },
-            if warnings == 1 { "" } else { "s" }
+        let errors_text = if errors == 1 {
+            trf!("{n} error", n = errors)
+        } else {
+            trf!("{n} errors", n = errors)
+        };
+        let warnings_text = if warnings == 1 {
+            trf!("{n} warning", n = warnings)
+        } else {
+            trf!("{n} warnings", n = warnings)
+        };
+        trf!(
+            "{errors}, {warnings}",
+            errors = errors_text,
+            warnings = warnings_text
         )
     } else if session.typeset.last.is_some() {
         icons::check_thin(&p, st, t.success);
@@ -314,11 +357,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             .status
             .as_ref()
             .map(|(m, _)| m.as_str())
-            .filter(|m| m.starts_with("Typeset in "))
-            .map_or_else(|| "Typeset successfully".to_string(), str::to_string)
+            .filter(|m| is_typeset_summary(m))
+            .map_or_else(|| tr("Typeset successfully").to_string(), str::to_string)
     } else {
         icons::check_thin(&p, st, t.chain_weak);
-        "Not typeset yet".to_string()
+        tr("Not typeset yet").to_string()
     };
     if hit(ui, t, st.expand(5.0), "tb-status", &tip, true, 6.0).clicked() {
         session.view.sidebar = true;
@@ -329,7 +372,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     // target's toolbar shows only the status icon, whose tooltip carries it).
     if let Some((msg, at)) = &session.status
         && at.elapsed().as_secs_f32() < 4.0
-        && !msg.starts_with("Typeset in ")
+        && !is_typeset_summary(msg)
     {
         let x0 = cap_end + 14.0;
         let w = (rect.right() - 300.0 - x0).max(0.0);
@@ -365,7 +408,15 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     for r in [share, view, nav] {
         p.add(capsule_shape(r, t));
     }
-    let share_resp = hit(ui, t, share.shrink(3.0), "tb-share", "Export", true, 15.0);
+    let share_resp = hit(
+        ui,
+        t,
+        share.shrink(3.0),
+        "tb-share",
+        tr("Export"),
+        true,
+        15.0,
+    );
     icons::share_stacked(
         &p,
         share.center() + vec2(0.25, 0.25),
@@ -376,7 +427,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             menu::begin(ui, 210.0);
-            menu::heading(ui, t, "Export files");
+            menu::heading(ui, t, tr("Export files"));
             menu::command(ui, t, session, "file.revealPdf", None, false);
             menu::command(ui, t, session, "file.exportPdf", None, false);
             menu::command(
@@ -384,7 +435,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
                 t,
                 session,
                 "file.saveAs",
-                Some("Save Source As…"),
+                Some(tr("Save Source As…")),
                 false,
             );
         });
@@ -400,7 +451,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
         view.left() + 107.75,
     ];
     let widths = [36.0, 48.0, 36.0];
-    let tips = ["Editor Only (⌘2)", "Editor and PDF (⌘3)", "PDF Only (⌘4)"];
+    let tips = [
+        tr("Editor Only (⌘2)"),
+        tr("Editor and PDF (⌘3)"),
+        tr("PDF Only (⌘4)"),
+    ];
     let ids = ["view.editorOnly", "view.split", "view.pdfOnly"];
     for i in 0..3 {
         let seg = Rect::from_center_size(pos2(centers[i], cy), vec2(widths[i], 28.0));
@@ -429,13 +484,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     let back = Rect::from_center_size(pos2(nav.left() + 13.5, cy), vec2(20.0, 26.0));
     let fwd = Rect::from_center_size(pos2(nav.left() + 40.5, cy), vec2(20.0, 26.0));
     let newt = Rect::from_center_size(pos2(nav.left() + 75.5, cy), vec2(28.0, 26.0));
-    if hit(ui, t, back, "tb-back", "Back", back_en, 8.0).clicked() {
+    if hit(ui, t, back, "tb-back", tr("Back"), back_en, 8.0).clicked() {
         run(session, "nav.back");
     }
-    if hit(ui, t, fwd, "tb-fwd", "Forward", fwd_en, 8.0).clicked() {
+    if hit(ui, t, fwd, "tb-fwd", tr("Forward"), fwd_en, 8.0).clicked() {
         run(session, "nav.forward");
     }
-    if hit(ui, t, newt, "tb-new", "New Document (⌘N)", true, 8.0).clicked() {
+    if hit(ui, t, newt, "tb-new", tr("New Document (⌘N)"), true, 8.0).clicked() {
         run(session, "file.new");
     }
     let grey = |en: bool| if en { t.toolbar_fg } else { t.nav_disabled };
@@ -529,4 +584,39 @@ pub fn tabs(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect) {
 /// Height of the toolbar.
 pub fn height() -> f32 {
     TOOLBAR_HEIGHT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use texcraft_i18n::Lang;
+
+    /// The status icon and the transient message tell the typeset summary from other status
+    /// messages in either language.
+    #[test]
+    fn typeset_summary_is_recognised_in_both_languages() {
+        let summary = |lang| {
+            let _scope = texcraft_i18n::scoped(lang);
+            texcraft_i18n::fill(
+                tr(TYPESET_SUMMARY),
+                &[
+                    ("seconds", &"0.4"),
+                    ("errors", &"0 errors"),
+                    ("warnings", &"1 warning"),
+                ],
+            )
+        };
+        let en = summary(Lang::En);
+        let zh = summary(Lang::ZhHans);
+        assert!(en.starts_with("Typeset in "));
+        assert_ne!(en, zh);
+        for lang in Lang::ALL {
+            let _scope = texcraft_i18n::scoped(lang);
+            assert!(is_typeset_summary(&en), "{lang:?}");
+            assert!(!is_typeset_summary("Renamed to a.tex"));
+            assert!(!is_typeset_summary(""));
+        }
+        let _zh = texcraft_i18n::scoped(Lang::ZhHans);
+        assert!(is_typeset_summary(&zh), "{zh}");
+    }
 }

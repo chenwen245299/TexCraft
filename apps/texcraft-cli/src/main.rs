@@ -7,7 +7,7 @@
 //! texcraft-cli issues <file.log> [--base DIR]
 //! texcraft-cli forward <file.synctex.gz> <source.tex> <line>
 //! texcraft-cli inverse <file.synctex.gz> <page> <x> <y>
-//! texcraft-cli commands
+//! texcraft-cli commands [--lang en|zh-Hans]
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use texcraft_project::Engine;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  texcraft-cli typeset <file.tex> [--engine pdflatex|xelatex|lualatex|tectonic] [--live]\n  texcraft-cli outline <file.tex>\n  texcraft-cli issues <file.log> [--base DIR]\n  texcraft-cli forward <file.synctex.gz> <source.tex> <line>\n  texcraft-cli inverse <file.synctex.gz> <page> <x> <y>\n  texcraft-cli commands"
+        "usage:\n  texcraft-cli typeset <file.tex> [--engine pdflatex|xelatex|lualatex|tectonic] [--live]\n  texcraft-cli outline <file.tex>\n  texcraft-cli issues <file.log> [--base DIR]\n  texcraft-cli forward <file.synctex.gz> <source.tex> <line>\n  texcraft-cli inverse <file.synctex.gz> <page> <x> <y>\n  texcraft-cli commands [--lang en|zh-Hans]"
     );
     ExitCode::from(2)
 }
@@ -205,21 +205,35 @@ fn inverse(args: &[String]) -> Result<Value, String> {
     })
 }
 
-fn commands() -> Value {
-    Value::Array(
+/// Every command; labels and menu titles in English unless `--lang` asks for another language.
+fn commands(args: &[String]) -> Result<Value, String> {
+    let mut lang = texcraft_i18n::Lang::En;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--lang" => {
+                let tag = it.next().ok_or("--lang needs a value")?;
+                lang = texcraft_i18n::Lang::from_tag(tag)
+                    .ok_or_else(|| format!("unknown language {tag} (en, zh-Hans)"))?;
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    let _lang = texcraft_i18n::scoped(lang);
+    Ok(Value::Array(
         texcraft_engine::registry()
             .iter()
             .map(|c| {
                 json!({
                     "id": c.id,
-                    "label": c.label,
+                    "label": c.label(),
                     "menu": c.menu.title(),
                     "shortcut": c.shortcut.map(texcraft_engine::Shortcut::display),
                     "params": c.params,
                 })
             })
             .collect(),
-    )
+    ))
 }
 
 fn main() -> ExitCode {
@@ -234,7 +248,7 @@ fn main() -> ExitCode {
         "issues" => issues(rest),
         "forward" => forward(rest),
         "inverse" => inverse(rest),
-        "commands" => Ok(commands()),
+        "commands" => commands(rest),
         "-h" | "--help" | "help" => return usage(),
         other => Err(format!("unknown subcommand {other}")),
     };

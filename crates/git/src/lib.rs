@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use texcraft_i18n::tr;
+
 /// A git error, shown to the user (git's own message when it has one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitError(pub String);
@@ -67,17 +69,17 @@ impl ChangeKind {
         }
     }
 
-    /// A short description for tool tips.
+    /// A short description for tool tips (in the interface language).
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Modified => "Modified",
-            Self::Added => "Index Added",
-            Self::Deleted => "Deleted",
-            Self::Renamed => "Renamed",
-            Self::Copied => "Copied",
-            Self::TypeChanged => "Type Changed",
-            Self::Untracked => "Untracked",
-            Self::Conflicted => "Conflict",
+            Self::Modified => tr("Modified"),
+            Self::Added => tr("Index Added"),
+            Self::Deleted => tr("Deleted"),
+            Self::Renamed => tr("Renamed"),
+            Self::Copied => tr("Copied"),
+            Self::TypeChanged => tr("Type Changed"),
+            Self::Untracked => tr("Untracked"),
+            Self::Conflicted => tr("Conflict"),
         }
     }
 
@@ -456,19 +458,19 @@ pub enum Op {
 }
 
 impl Op {
-    /// What the sidebar shows while it runs.
+    /// What the sidebar shows while it runs (in the interface language).
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Refresh => "Refreshing",
-            Self::Init => "Initializing",
-            Self::Stage(_) | Self::StageAll => "Staging",
-            Self::Unstage(_) | Self::UnstageAll => "Unstaging",
-            Self::Discard(_) => "Discarding",
-            Self::Commit { .. } => "Committing",
-            Self::Pull => "Pulling",
-            Self::Push => "Pushing",
-            Self::Fetch => "Fetching",
-            Self::Diff { .. } => "Reading changes",
+            Self::Refresh => tr("Refreshing"),
+            Self::Init => tr("Initializing"),
+            Self::Stage(_) | Self::StageAll => tr("Staging"),
+            Self::Unstage(_) | Self::UnstageAll => tr("Unstaging"),
+            Self::Discard(_) => tr("Discarding"),
+            Self::Commit { .. } => tr("Committing"),
+            Self::Pull => tr("Pulling"),
+            Self::Push => tr("Pushing"),
+            Self::Fetch => tr("Fetching"),
+            Self::Diff { .. } => tr("Reading changes"),
         }
     }
 }

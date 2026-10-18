@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use texcraft_ai::{ChatRequest, Config, Event, Image, Job, KeyStore, Model, Role, Turn};
+use texcraft_i18n::{tr, trf};
 
 use crate::{CommandError, Effect, Session, edit};
 
@@ -109,25 +110,29 @@ impl Session {
         if !self.ai_reads_images() {
             let label = self
                 .ai_model()
-                .map_or_else(|| "This model".to_string(), |m| m.label().to_string());
-            return Err(CommandError::Failed(format!(
-                "{label} does not read images: pick a model with Vision (Settings → AI)."
+                .map_or_else(|| tr("This model").to_string(), |m| m.label().to_string());
+            return Err(CommandError::Failed(trf!(
+                "{model} does not read images: pick a model with Vision (Settings → AI).",
+                model = label
             )));
         }
         let Some(media_type) = texcraft_ai::image_media_type(&bytes) else {
-            return Err(CommandError::Failed(format!(
-                "{name} is not a PNG, JPEG, GIF or WebP image."
+            return Err(CommandError::Failed(trf!(
+                "{name} is not a PNG, JPEG, GIF or WebP image.",
+                name = name
             )));
         };
         if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(CommandError::Failed(format!(
-                "{name} is larger than {} MB.",
-                MAX_IMAGE_BYTES / (1024 * 1024)
+            return Err(CommandError::Failed(trf!(
+                "{name} is larger than {mb} MB.",
+                name = name,
+                mb = MAX_IMAGE_BYTES / (1024 * 1024)
             )));
         }
         if self.ai.draft_images.len() >= MAX_IMAGES {
-            return Err(CommandError::Failed(format!(
-                "A question takes at most {MAX_IMAGES} images."
+            return Err(CommandError::Failed(trf!(
+                "A question takes at most {n} images.",
+                n = MAX_IMAGES
             )));
         }
         self.ai.draft_images.push(Image {
@@ -146,9 +151,10 @@ impl Session {
         let meta =
             std::fs::metadata(path).map_err(|e| CommandError::Failed(format!("{name}: {e}")))?;
         if meta.len() > MAX_IMAGE_BYTES as u64 {
-            return Err(CommandError::Failed(format!(
-                "{name} is larger than {} MB.",
-                MAX_IMAGE_BYTES / (1024 * 1024)
+            return Err(CommandError::Failed(trf!(
+                "{name} is larger than {mb} MB.",
+                name = name,
+                mb = MAX_IMAGE_BYTES / (1024 * 1024)
             )));
         }
         let bytes =
@@ -172,13 +178,13 @@ impl Session {
     /// Stores the API key of provider `id` (encrypted; it cannot be read back from the app).
     pub fn ai_set_key(&mut self, id: &str, key: &str) -> Result<(), CommandError> {
         if key.trim().is_empty() {
-            return Err(CommandError::Failed("the key is empty".into()));
+            return Err(CommandError::Failed(tr("the key is empty").into()));
         }
         let keys = self
             .ai
             .keys
             .as_ref()
-            .ok_or_else(|| CommandError::Failed("keys cannot be saved here".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("keys cannot be saved here").into()))?;
         keys.save(id, key).map_err(|e| CommandError::Failed(e.0))?;
         keys.mark(&mut self.ai.config);
         Ok(())
@@ -261,11 +267,11 @@ impl Session {
     pub fn ai_send(&mut self, text: &str) -> Result<(), CommandError> {
         let text = text.trim();
         if text.is_empty() && self.ai.draft_images.is_empty() {
-            return Err(CommandError::Failed("Type a question first.".into()));
+            return Err(CommandError::Failed(tr("Type a question first.").into()));
         }
         if self.ai.job.is_some() {
             return Err(CommandError::Failed(
-                "Wait for the answer, or stop it first.".into(),
+                tr("Wait for the answer, or stop it first.").into(),
             ));
         }
         let (provider, model) = self
@@ -274,13 +280,15 @@ impl Session {
             .selection()
             .map(|(p, m)| (p.clone(), m.to_string()))
             .ok_or_else(|| {
-                CommandError::Failed("Add a provider and a model in Settings → AI first.".into())
+                CommandError::Failed(
+                    tr("Add a provider and a model in Settings → AI first.").into(),
+                )
             })?;
         let api_key = self.ai_key_for(&provider);
         if api_key.is_empty() && !texcraft_ai::is_local(&provider) {
-            return Err(CommandError::Failed(format!(
-                "Enter the API key of {} in Settings → AI.",
-                provider.name
+            return Err(CommandError::Failed(trf!(
+                "Enter the API key of {provider} in Settings → AI.",
+                provider = provider.name
             )));
         }
         let images = std::mem::take(&mut self.ai.draft_images);
@@ -289,8 +297,9 @@ impl Session {
                 .ai_model()
                 .map_or_else(|| model.clone(), |m| m.label().to_string());
             self.ai.draft_images = images;
-            return Err(CommandError::Failed(format!(
-                "{label} does not read images: pick a model with Vision, or remove the images."
+            return Err(CommandError::Failed(trf!(
+                "{model} does not read images: pick a model with Vision, or remove the images.",
+                model = label
             )));
         }
         self.ai
@@ -375,9 +384,9 @@ impl Session {
             m.pending = false;
             m.thinking = false;
             if m.text.is_empty() {
-                m.error = Some("Stopped.".into());
+                m.error = Some(tr("Stopped.").into());
             } else {
-                m.note = Some("Stopped".into());
+                m.note = Some(tr("Stopped").into());
                 m.blocks.clear();
             }
         }
@@ -428,7 +437,9 @@ impl Session {
                     m.text.push_str(&t);
                 }
                 Event::Thinking => m.thinking = m.text.is_empty(),
-                Event::Fallback(what) => m.note = Some(format!("Declined, answered by {what}")),
+                Event::Fallback(what) => {
+                    m.note = Some(trf!("Declined, answered by {model}", model = what));
+                }
                 Event::Done { blocks, model } => {
                     m.pending = false;
                     m.thinking = false;
@@ -437,7 +448,7 @@ impl Session {
                         m.model = Some(model);
                     }
                     if m.text.trim().is_empty() {
-                        m.error = Some("The model sent an empty answer.".into());
+                        m.error = Some(tr("The model sent an empty answer.").into());
                     }
                     self.ai.job = None;
                 }
@@ -448,8 +459,8 @@ impl Session {
                     m.text.clear();
                     m.blocks.clear();
                     m.error = Some(match category {
-                        Some(c) => format!("The model declined this request ({c})."),
-                        None => "The model declined this request.".into(),
+                        Some(c) => trf!("The model declined this request ({reason}).", reason = c),
+                        None => tr("The model declined this request.").into(),
                     });
                     self.ai.job = None;
                 }
@@ -471,7 +482,7 @@ impl Session {
     pub fn ai_insert(&mut self, index: usize) -> Result<(), CommandError> {
         let text = self
             .ai_snippet(index)
-            .ok_or_else(|| CommandError::Failed("nothing to insert".into()))?;
+            .ok_or_else(|| CommandError::Failed(tr("nothing to insert").into()))?;
         self.edit_active(|t, sel| edit::replace_selection(t, sel, &text))?;
         if let Some(line) = self.doc().map(|d| d.caret_line()) {
             self.effect(Effect::RevealLine {

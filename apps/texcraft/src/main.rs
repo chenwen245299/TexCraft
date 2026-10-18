@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use egui::{Event, Key, Modifiers, ViewportCommand};
 use serde_json::{Value, json};
-use texcraft_engine::{NativeEdit, Session, View, registry};
+use texcraft_engine::{LanguageChoice, NativeEdit, Session, View, registry};
+use texcraft_i18n::tr;
 use texcraft_ui::{Request, Workbench};
 
 const STORAGE_KEY: &str = "texcraft-state-v2";
@@ -46,6 +47,7 @@ struct Options {
     screenshot_delay: Duration,
     size: Option<(f32, f32)>,
     theme: Option<String>,
+    lang: Option<LanguageChoice>,
     welcome: bool,
     commands: Vec<String>,
 }
@@ -87,6 +89,13 @@ fn parse_args() -> Result<Options, String> {
                 ));
             }
             "--theme" => o.theme = Some(value("--theme")?),
+            "--lang" => {
+                let v = value("--lang")?;
+                o.lang = Some(
+                    LanguageChoice::from_arg(&v)
+                        .ok_or_else(|| format!("unknown --lang {v} (system, en, zh-Hans)"))?,
+                );
+            }
             "--run" => o.commands.push(value("--run")?),
             "--no-welcome" => o.welcome = false,
             "--write-icon" => {
@@ -97,7 +106,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "texcraft [FILE_OR_FOLDER…] [--control PORT] [--control-token-file PATH] [--screenshot OUT.png] [--screenshot-delay-ms N] [--size WxH] [--theme light|dark] [--run COMMAND_ID] [--no-welcome]"
+                    "texcraft [FILE_OR_FOLDER…] [--control PORT] [--control-token-file PATH] [--screenshot OUT.png] [--screenshot-delay-ms N] [--size WxH] [--theme light|dark] [--lang system|en|zh-Hans] [--run COMMAND_ID] [--no-welcome]"
                 );
                 std::process::exit(0);
             }
@@ -150,6 +159,11 @@ impl App {
             Arc::new(move || ctx.request_repaint()) as Arc<dyn Fn() + Send + Sync>
         };
         let mut session = Session::new(waker);
+        // The Language setting's System choice follows these.
+        session.system_languages = texcraft_macos::preferred_languages();
+        if session.system_languages.is_empty() {
+            session.system_languages = texcraft_i18n::languages_from_env(|k| std::env::var(k).ok());
+        }
         // AI Assistant providers live next to the app's settings (owner-only file: API keys).
         if let Some(dir) = eframe::storage_dir("TexCraft") {
             session.load_ai_config(dir.join("ai.json"));
@@ -193,6 +207,12 @@ impl App {
             Some("light") => session.view.theme = texcraft_engine::ThemeChoice::Light,
             _ => {}
         }
+        // `--lang` sets the Language setting (as choosing it in Settings would).
+        if let Some(lang) = opts.lang {
+            session.view.language = lang;
+        }
+        // Before anything shows text: the menu bar, the welcome window, status messages.
+        texcraft_i18n::set_language(session.lang());
         let mut opened = false;
         for p in &opts.paths {
             match session.open_path(p) {
@@ -265,6 +285,20 @@ impl App {
         }
     }
 
+    /// Makes the Language setting the interface language: every string drawn from now on, and
+    /// the native menu bar, which is rebuilt.
+    fn apply_language(&mut self, ctx: &egui::Context) {
+        let lang = self.session.lang();
+        if lang != texcraft_i18n::language() {
+            texcraft_i18n::set_language(lang);
+            ctx.request_repaint();
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(m) = &mut self.menu {
+            m.set_language(lang);
+        }
+    }
+
     /// Runs a command chosen in the native menu bar (macOS only).
     #[cfg(target_os = "macos")]
     fn run_command(&mut self, id: &str) {
@@ -291,17 +325,17 @@ impl App {
                 Request::Open => {
                     if let Some(paths) = rfd::FileDialog::new()
                         .add_filter(
-                            "TeX documents",
+                            tr("TeX documents"),
                             &["tex", "ltx", "bib", "sty", "cls", "dtx", "txt", "md", "pdf"],
                         )
-                        .add_filter("All files", &["*"])
+                        .add_filter(tr("All files"), &["*"])
                         .pick_files()
                     {
                         let typeset_first = self.session.pdf.path.is_none();
                         for p in paths {
                             if let Err(e) = self.session.open_path(&p) {
                                 self.bench.dialog = texcraft_ui::dialogs::Dialog::Alert {
-                                    title: "Cannot open".into(),
+                                    title: tr("Cannot open").into(),
                                     message: e.to_string(),
                                 };
                             }
@@ -334,7 +368,7 @@ impl App {
                         .unwrap_or_else(|| "Untitled.tex".into());
                     let mut dialog = rfd::FileDialog::new()
                         .set_file_name(name)
-                        .add_filter("TeX document", &["tex"]);
+                        .add_filter(tr("TeX document"), &["tex"]);
                     if let Some(dir) = &self.session.project_dir {
                         dialog = dialog.set_directory(dir);
                     }
@@ -386,7 +420,7 @@ impl App {
                         .iter()
                         .map(|c| {
                             json!({
-                                "id": c.id, "label": c.label, "menu": c.menu.title(),
+                                "id": c.id, "label": c.label(), "labelEn": c.label_en(), "menu": c.menu.title(),
                                 "shortcut": c.shortcut.map(texcraft_engine::Shortcut::display),
                                 "params": c.params,
                                 "enabled": self.session.is_enabled(c.id),
@@ -409,13 +443,19 @@ impl App {
                         "pdfPages": self.bench.pdf.page_count(),
                         "pdfCurrentPage": self.bench.pdf.current_page + 1,
                         "pdfRenderedPages": self.bench.pdf.rendered_pages(),
+                        "pdfSelection": self.bench.pdf.inspect_selection(),
+                        // Where inverse search landed (characters of a document), while it shows.
+                        "sourceFlash": self.bench.editor.flash.map(|f| json!({
+                            "doc": f.doc, "start": f.start, "end": f.end,
+                            "ageMs": f.at.elapsed().as_millis(),
+                        })),
                         "dialog": format!("{:?}", self.bench.dialog),
                         "settings": {
                             "open": self.bench.prefs.open,
                             "pane": format!("{:?}", self.bench.prefs.pane),
                             // Whether the native Settings window was found and its button placed.
                             "windowButtons": self.bench.prefs.open && !self.bench.prefs.inline
-                                && texcraft_macos::place_traffic_lights_titled(texcraft_ui::prefs::SETTINGS_TITLE, 51.0, 19.0, true),
+                                && texcraft_macos::place_traffic_lights_titled(tr(texcraft_ui::prefs::SETTINGS_TITLE), 51.0, 19.0, true),
                         },
                         "outerRect": ctx.input(|i| i.viewport().outer_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()])),
                         "fullScreen": ctx.input(|i| i.viewport().fullscreen),
@@ -642,8 +682,10 @@ impl App {
                     }
                 }
                 "ui.pointer" => {
-                    // {x, y, click?: "primary" | "secondary"} in points: moves the pointer there
-                    // (hover) and optionally clicks (press this frame, release the next).
+                    // {x, y, click?: "primary" | "secondary", command?} in points: moves the
+                    // pointer there (hover) and optionally clicks (press this frame, release the
+                    // next), with ⌘ held when `command` (inverse search in the PDF).
+                    let command = p.params.get("command").and_then(Value::as_bool) == Some(true);
                     let f = |n: &str| p.params.get(n).and_then(Value::as_f64);
                     match (f("x"), f("y")) {
                         (Some(x), Some(y)) => {
@@ -657,13 +699,24 @@ impl App {
                                 pos,
                                 button: button.unwrap_or(egui::PointerButton::Primary),
                                 pressed,
-                                modifiers: Modifiers::NONE,
+                                modifiers: if command {
+                                    Modifiers::COMMAND
+                                } else {
+                                    Modifiers::NONE
+                                },
                             };
                             let mut first = vec![Event::PointerMoved(pos)];
                             if button.is_some() {
+                                if command {
+                                    first.insert(0, Event::ModifiersChanged(Modifiers::COMMAND));
+                                }
                                 first.push(press(true));
                                 self.pending_pointer.push_back(first);
                                 self.pending_pointer.push_back(vec![press(false)]);
+                                if command {
+                                    self.pending_pointer
+                                        .push_back(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+                                }
                             } else {
                                 self.pending_pointer.push_back(first);
                             }
@@ -921,6 +974,7 @@ impl eframe::App for App {
             }
         }
         self.handle_control(&ctx, frame);
+        self.apply_language(&ctx);
 
         // Closing with unsaved changes: ask first.
         if ctx.input(|i| i.viewport().close_requested())
@@ -936,6 +990,8 @@ impl eframe::App for App {
         }
 
         self.bench.ui(ui, &mut self.session);
+        // A language chosen this frame (Settings, a menu, a command) shows from the next one.
+        self.apply_language(&ctx);
         self.handle_requests(&ctx);
         self.handle_deferred(&ctx);
 

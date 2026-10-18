@@ -24,6 +24,8 @@ crates/
   syntax log synctex   L0  pure leaf crates: LaTeX lexer/outline/completion data, TeX log
                            parser, SyncTeX parser. No workspace deps, no I/O beyond what the
                            API takes, compile for wasm32.
+  i18n                 L0  interface languages: `tr("English")` / `trf!` and the zh-Hans
+                           catalogue (src/zh_hans/), used by every layer above
   pdf project          L1  hayro-based PDF rendering (render worker), project model
                            (root file, magic comments, file tree, settings)
   typeset              L2  runs the TeX engines (latexmk / tectonic) off the UI thread
@@ -60,11 +62,17 @@ A crate may depend only on lower layers. Nothing below `ui` may use egui, eframe
    `.log` files from deliberately broken documents). Fixtures live in the crate's `tests/data/`.
 6. **The UI is thin and data-driven.** Colours and metrics come from `ui::theme::Tokens`,
    never hard-coded in widgets.
-7. **Verify UI changes visually.** Start an isolated instance (`scripts/parity/run-dev-app.sh`),
+7. **Every user-visible string is translatable.** Write it in English inside `tr("…")`, or
+   `trf!("… {name} …", name = value)` with named placeholders, and add its Simplified Chinese to
+   the area's table in `crates/i18n/src/zh_hans/`. `cargo test -p texcraft-i18n` scans the
+   workspace and fails on a string without a translation. Ids, paths, LaTeX, proper names and
+   anything sent to an AI model stay as they are. Size widgets from the translated text.
+8. **Verify UI changes visually.** Start an isolated instance (`scripts/parity/run-dev-app.sh`),
    drive it over the control channel and take `ui.screenshot` (separate windows have an `inline`
    mode: `ui.prefs`, `ui.welcome`). Compare side by side with the target (`scripts/parity/`) and
-   look at the PNG. Measure, don't guess: sizes and font sizes come from the target's screenshots.
-8. **Performance is a feature.** Typesetting and PDF rendering never block the UI thread.
+   look at the PNG (in both languages: `run-dev-app.sh --lang zh-Hans`). Measure, don't guess:
+   sizes and font sizes come from the target's screenshots.
+9. **Performance is a feature.** Typesetting and PDF rendering never block the UI thread.
    Keystrokes stay under one frame on a 5,000-line document.
 
 ## 4. Before you finish a task

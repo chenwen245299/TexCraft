@@ -11,6 +11,7 @@ use egui::{
 };
 use texcraft_ai::Role;
 use texcraft_engine::Session;
+use texcraft_i18n::tr;
 
 use crate::menu::{self, ButtonKind};
 use crate::theme::{Tokens, editor_font, semibold};
@@ -127,13 +128,16 @@ fn paint_image(ui: &Ui, t: &Tokens, img: &texcraft_ai::Image, r: Rect) {
     );
 }
 
-/// Questions offered on an empty conversation.
-const SUGGESTIONS: [&str; 4] = [
-    "Find and fix the errors in this document",
-    "Explain the selected LaTeX",
-    "Write a table for my results",
-    "Improve the wording of the selection",
-];
+/// Questions offered on an empty conversation, in the interface language (a click sends one as
+/// the user's question, so it goes in the language they would type it in).
+fn suggestions() -> [&'static str; 4] {
+    [
+        tr("Find and fix the errors in this document"),
+        tr("Explain the selected LaTeX"),
+        tr("Write a table for my results"),
+        tr("Improve the wording of the selection"),
+    ]
+}
 
 fn send(session: &mut Session, st: &mut AiPanelState, text: Option<&str>) {
     let params = match text {
@@ -168,13 +172,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
             let (r, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::hover());
             paint_app_icon(ui, r);
             ui.add_space(4.0);
-            ui.label(RichText::new("AI Assistant").font(semibold(13.0)).color(t.sidebar_text));
+            ui.label(
+                RichText::new(tr("AI Assistant"))
+                    .font(semibold(13.0))
+                    .color(t.sidebar_text),
+            );
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
-                    RichText::new(
+                    RichText::new(tr(
                         "Connect a provider — SoCLaaS (NUS), Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Kimi, Qwen, MiMo, GLM, MiniMax, StepFun or a local Ollama — to ask about your document, fix errors and write LaTeX.",
-                    )
+                    ))
                     .size(11.5)
                     .color(t.text_weak),
                 )
@@ -184,7 +192,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
             let w = (ui.available_width() - 10.0).clamp(80.0, 200.0);
             let (r, _) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
             let mut b = ui.new_child(egui::UiBuilder::new().max_rect(r));
-            if menu::dialog_button(&mut b, t, "Set Up a Provider…", ButtonKind::Default, w) {
+            if menu::dialog_button(&mut b, t, tr("Set Up a Provider…"), ButtonKind::Default, w) {
                 let _ = session.run("ai.settings", &serde_json::Value::Null);
             }
         });
@@ -292,8 +300,8 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
     let new_r = Rect::from_center_size(pos2(r.right() - 44.0, r.center().y), vec2(22.0, 22.0));
     let set_r = Rect::from_center_size(pos2(r.right() - 18.0, r.center().y), vec2(22.0, 22.0));
     for (rect, id, tip) in [
-        (new_r, "ai-new", "New Conversation"),
-        (set_r, "ai-settings", "AI Settings…"),
+        (new_r, "ai-new", tr("New Conversation")),
+        (set_r, "ai-settings", tr("AI Settings…")),
     ] {
         let resp = ui
             .interact(rect, Id::new(id), Sense::click())
@@ -318,14 +326,14 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
     // The model menu.
     let label = session
         .ai_model()
-        .map_or_else(|| "No model".to_string(), |m| m.label().to_string());
+        .map_or_else(|| tr("No model").to_string(), |m| m.label().to_string());
     let menu_r = Rect::from_min_max(
         pos2(r.left() + 28.0, r.center().y - 11.0),
         pos2(new_r.left() - 6.0, r.center().y + 11.0),
     );
     let resp = ui
         .interact(menu_r, Id::new("ai-model"), Sense::click())
-        .on_hover_text("Choose the model");
+        .on_hover_text(tr("Choose the model"));
     if resp.hovered() {
         p.rect_filled(menu_r, 5.0, t.row_hover);
     }
@@ -391,13 +399,13 @@ fn empty_conversation(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut A
         paint_app_icon(ui, r);
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Ask about your document")
+            RichText::new(tr("Ask about your document"))
                 .font(semibold(13.0))
                 .color(t.sidebar_text),
         );
     });
     ui.add_space(12.0);
-    for s in SUGGESTIONS {
+    for s in suggestions() {
         let w = ui.available_width();
         let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
         let card = r.shrink2(vec2(10.0, 2.5));
@@ -687,7 +695,7 @@ fn answer(
                     pos2(bar.left() + 9.0, bar.center().y),
                     Align2::LEFT_CENTER,
                     if lang.is_empty() {
-                        "code"
+                        tr("code")
                     } else {
                         lang.as_str()
                     },
@@ -703,7 +711,7 @@ fn answer(
                     t,
                     copy_r,
                     Id::new(("ai-copy", index, k)),
-                    "Copy",
+                    tr("Copy"),
                     icons::copy,
                 ) {
                     ui.ctx().copy_text(body.clone());
@@ -736,7 +744,7 @@ fn answer(
             ui.painter().text(
                 pos2(r.left() + x + 17.0, r.center().y),
                 Align2::LEFT_CENTER,
-                "Thinking…",
+                tr("Thinking…"),
                 FontId::proportional(11.0),
                 t.text_weak,
             );
@@ -770,7 +778,7 @@ fn answer(
         t,
         b,
         Id::new(("ai-copy-msg", index)),
-        "Copy",
+        tr("Copy"),
         icons::copy,
     ) {
         let _ = session.run("ai.copy", &serde_json::json!({ "index": index }));
@@ -860,7 +868,7 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
                 .on_hover_text(&img.name);
             let xresp = ui
                 .interact(xr, Id::new(("ai-draft-x", k)), Sense::click())
-                .on_hover_text("Remove");
+                .on_hover_text(tr("Remove"));
             if resp.hovered() || xresp.hovered() {
                 p.circle_filled(xr.center(), 7.5, Color32::from_black_alpha(170));
                 icons::close(&p, xr.shrink(4.0), Color32::WHITE);
@@ -898,7 +906,7 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
             let resp = ui.add(
                 egui::TextEdit::multiline(&mut session.ai.draft)
                     .id(id)
-                    .hint_text("Ask about your LaTeX…")
+                    .hint_text(tr("Ask about your LaTeX…"))
                     .font(FontId::proportional(12.0))
                     .frame(egui::Frame::NONE)
                     .margin(vec2(0.0, 0.0))
@@ -919,7 +927,7 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
     let chip_text = if include {
         doc_name
     } else {
-        "No document".into()
+        tr("No document").into()
     };
     let f = FontId::proportional(10.5);
     let tw = p
@@ -933,9 +941,9 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
     let resp = ui
         .interact(chip_r, Id::new("ai-doc-chip"), Sense::click())
         .on_hover_text(if include {
-            "The open document goes along with each question. Click to leave it out."
+            tr("The open document goes along with each question. Click to leave it out.")
         } else {
-            "Questions go without the document. Click to include it."
+            tr("Questions go without the document. Click to include it.")
         });
     p.rect(
         chip_r,
@@ -973,7 +981,7 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
     let can_send = !session.ai.draft.trim().is_empty() || !session.ai.draft_images.is_empty();
     let bresp = ui
         .interact(b, Id::new("ai-send"), Sense::click())
-        .on_hover_text(if busy { "Stop" } else { "Send (↩)" });
+        .on_hover_text(if busy { tr("Stop") } else { tr("Send (↩)") });
     if busy {
         icons::stop(&p, b, t.text, t.filter_bg);
         if bresp.clicked() {
@@ -1014,9 +1022,9 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
             field.center(),
             Align2::CENTER_CENTER,
             if reads {
-                "Drop images to attach"
+                tr("Drop images to attach")
             } else {
-                "This model does not read images"
+                tr("This model does not read images")
             },
             semibold(12.0),
             if reads { t.accent } else { t.error },

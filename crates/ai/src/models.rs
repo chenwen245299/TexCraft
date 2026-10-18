@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use texcraft_i18n::tr;
 
 use crate::{AiError, err};
 
@@ -40,15 +41,15 @@ impl Capability {
         Capability::ImageGen,
     ];
 
-    /// Its name in Settings and menus.
+    /// Its name in Settings and menus (in the interface language; stored by its serde name).
     pub fn label(self) -> &'static str {
         match self {
-            Capability::Vision => "Vision",
-            Capability::Reasoning => "Reasoning",
-            Capability::ToolCalling => "Tools",
-            Capability::Embedding => "Embedding",
-            Capability::Audio => "Audio",
-            Capability::ImageGen => "Image Generation",
+            Capability::Vision => tr("Vision"),
+            Capability::Reasoning => tr("Reasoning"),
+            Capability::ToolCalling => tr("Tools"),
+            Capability::Embedding => tr("Embedding"),
+            Capability::Audio => tr("Audio"),
+            Capability::ImageGen => tr("Image Generation"),
         }
     }
 
@@ -226,13 +227,13 @@ impl<'de> Deserialize<'de> for Model {
 /// capabilities from the id when the item says nothing (off for SoCLaaS, whose ids are aliases
 /// its operators can repoint; its display names and descriptions still count).
 pub fn parse_models(body: &str, trust_ids: bool) -> Result<Vec<Model>, AiError> {
-    let v: Value =
-        serde_json::from_str(body).map_err(|_| err("the provider sent an unexpected answer"))?;
+    let v: Value = serde_json::from_str(body)
+        .map_err(|_| err(tr("the provider sent an unexpected answer")))?;
     let list = v
         .get("data")
         .or_else(|| v.get("models"))
         .and_then(Value::as_array)
-        .ok_or_else(|| err("the provider sent no model list"))?;
+        .ok_or_else(|| err(tr("the provider sent no model list")))?;
     let mut out: Vec<Model> = Vec::new();
     for item in list {
         let Some(id) = item
@@ -846,5 +847,26 @@ mod tests {
             ..Model::default()
         };
         assert_eq!(m.summary(), "Vision · Reasoning · 128K");
+    }
+
+    /// Labels follow the interface language; what is stored and reported does not.
+    #[test]
+    fn labels_are_translated_and_stored_names_are_not() {
+        use crate::Kind;
+        let _zh = texcraft_i18n::scoped(texcraft_i18n::Lang::ZhHans);
+        let m = Model {
+            id: "m".into(),
+            capabilities: vec![Capability::Vision, Capability::Reasoning],
+            context_length: Some(131072),
+            ..Model::default()
+        };
+        assert_eq!(m.summary(), "视觉 · 推理 · 128K");
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["capabilities"],
+            json!(["vision", "reasoning"])
+        );
+        assert_eq!(Kind::OpenAi.label(), "兼容 OpenAI");
+        assert_eq!(Kind::OpenAi.name(), "OpenAI-compatible");
+        assert_eq!(Kind::Anthropic.label(), Kind::Anthropic.name());
     }
 }

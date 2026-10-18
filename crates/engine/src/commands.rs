@@ -6,11 +6,12 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use texcraft_i18n::{tr, trf};
 use texcraft_project::{Engine, TypesetMode};
 
 use crate::{
-    CommandError, ContentsMode, Effect, Grading, Layout, NativeEdit, PageMode, ResultsMode,
-    SearchMode, Session, SidebarTab, ThemeChoice, Zoom, edit,
+    CommandError, ContentsMode, Effect, Grading, LanguageChoice, Layout, NativeEdit, PageMode,
+    PdfPoint, ResultsMode, SearchMode, Session, SidebarTab, TextUnit, ThemeChoice, Zoom, edit,
 };
 
 /// A top-level menu.
@@ -49,19 +50,25 @@ impl Menu {
         Self::Help,
     ];
 
-    /// Title in the menu bar.
+    /// Title in the menu bar, in the interface language.
     pub fn title(self) -> &'static str {
         match self {
             Self::App => "TexCraft",
-            Self::File => "File",
-            Self::Edit => "Edit",
-            Self::Snippets => "Snippets",
-            Self::Typeset => "Typeset",
-            Self::Workspace => "Workspace",
-            Self::Window => "Window",
-            Self::Help => "Help",
+            Self::File => tr("File"),
+            Self::Edit => tr("Edit"),
+            Self::Snippets => tr("Snippets"),
+            Self::Typeset => tr("Typeset"),
+            Self::Workspace => tr("Workspace"),
+            Self::Window => tr("Window"),
+            Self::Help => tr("Help"),
             Self::None => "",
         }
+    }
+
+    /// Title in the menu bar in English (machine-readable listings).
+    pub fn title_en(self) -> &'static str {
+        let _en = texcraft_i18n::scoped(texcraft_i18n::Lang::En);
+        self.title()
     }
 }
 
@@ -185,8 +192,8 @@ type StateFn = fn(&Session) -> bool;
 pub struct CommandSpec {
     /// Stable id (`typeset.run`).
     pub id: &'static str,
-    /// Menu / tooltip label.
-    pub label: &'static str,
+    /// Menu / tooltip label in English (the catalogue key): [`CommandSpec::label`] translates.
+    label: &'static str,
     /// Which menu shows it.
     pub menu: Menu,
     /// Separator group within the menu (a separator is drawn when it changes).
@@ -201,6 +208,18 @@ pub struct CommandSpec {
     pub run: RunFn,
     /// Parameter documentation (empty when it takes none).
     pub params: &'static str,
+}
+
+impl CommandSpec {
+    /// Menu / tooltip label in the interface language.
+    pub fn label(&self) -> &'static str {
+        tr(self.label)
+    }
+
+    /// Menu / tooltip label in English.
+    pub fn label_en(&self) -> &'static str {
+        self.label
+    }
 }
 
 impl std::fmt::Debug for CommandSpec {
@@ -228,6 +247,9 @@ fn has_inline_suggestion(s: &Session) -> bool {
 
 fn has_pdf(s: &Session) -> bool {
     s.pdf.path.is_some()
+}
+fn has_pdf_selection(s: &Session) -> bool {
+    !s.pdf.selected_text.is_empty()
 }
 fn is_running(s: &Session) -> bool {
     s.typeset.is_running()
@@ -326,7 +348,7 @@ fn snippet(s: &mut Session, text: &str) -> Result<(), CommandError> {
 
 fn set_engine(s: &mut Session, e: Engine) -> Result<(), CommandError> {
     s.settings.engine = e;
-    s.set_status(format!("Typesetter: {}", e.label()));
+    s.set_status(trf!("Typesetter: {engine}", engine = e.label()));
     Ok(())
 }
 
@@ -590,7 +612,7 @@ static REGISTRY: &[CommandSpec] = &[
             let path = s
                 .doc()
                 .and_then(|d| d.path.clone())
-                .ok_or_else(|| CommandError::Failed("not saved yet".into()))?;
+                .ok_or_else(|| CommandError::Failed(tr("not saved yet").into()))?;
             let text =
                 std::fs::read_to_string(&path).map_err(|e| CommandError::Failed(e.to_string()))?;
             if let Some(d) = s.docs.get_mut(i) {
@@ -683,10 +705,10 @@ static REGISTRY: &[CommandSpec] = &[
                         .pdf
                         .path
                         .clone()
-                        .ok_or_else(|| CommandError::Failed("no PDF yet".into()))?;
+                        .ok_or_else(|| CommandError::Failed(tr("no PDF yet").into()))?;
                     std::fs::copy(&src, dest)
-                        .map_err(|e| CommandError::Failed(format!("export failed: {e}")))?;
-                    s.set_status(format!("Exported {dest}"));
+                        .map_err(|e| CommandError::Failed(trf!("export failed: {e}", e = e)))?;
+                    s.set_status(trf!("Exported {dest}", dest = dest));
                 }
                 None => s.effect(Effect::ExportPdfDialog),
             }
@@ -753,7 +775,7 @@ static REGISTRY: &[CommandSpec] = &[
         always,
         |s, p| {
             let to = s.rename_file(Path::new(param_str(p, "path")?), param_str(p, "name")?)?;
-            s.set_status(format!("Renamed to {}", to.display()));
+            s.set_status(trf!("Renamed to {path}", path = to.display()));
             Ok(())
         },
         params = "{path: string, name: string} — a new name in the same folder"
@@ -767,7 +789,7 @@ static REGISTRY: &[CommandSpec] = &[
         always,
         |s, p| {
             let to = s.duplicate_file(Path::new(param_str(p, "path")?))?;
-            s.set_status(format!("Created {}", to.display()));
+            s.set_status(trf!("Created {path}", path = to.display()));
             Ok(())
         },
         params = "{path: string}"
@@ -900,7 +922,7 @@ static REGISTRY: &[CommandSpec] = &[
                 s.ai.messages
                     .get(i)
                     .map(|m| m.text.clone())
-                    .ok_or_else(|| CommandError::Failed("no such message".into()))?;
+                    .ok_or_else(|| CommandError::Failed(tr("no such message").into()))?;
             s.effect(Effect::CopyText(text));
             Ok(())
         },
@@ -1666,7 +1688,7 @@ static REGISTRY: &[CommandSpec] = &[
         |s, _| {
             let root = s
                 .root_path()
-                .ok_or_else(|| CommandError::Failed("nothing to clean".into()))?;
+                .ok_or_else(|| CommandError::Failed(tr("nothing to clean").into()))?;
             let dir = texcraft_project::build_dir(&root);
             let removed = std::fs::read_dir(&dir)
                 .map(|rd| {
@@ -1677,10 +1699,11 @@ static REGISTRY: &[CommandSpec] = &[
                         .count()
                 })
                 .unwrap_or(0);
-            s.set_status(format!(
-                "Removed {removed} intermediate file{}",
-                if removed == 1 { "" } else { "s" }
-            ));
+            s.set_status(if removed == 1 {
+                trf!("Removed {n} intermediate file", n = removed)
+            } else {
+                trf!("Removed {n} intermediate files", n = removed)
+            });
             Ok(())
         }
     ),
@@ -1759,9 +1782,22 @@ static REGISTRY: &[CommandSpec] = &[
             let page = param_u32(p, "page")?;
             let x = param_f32(p, "x")?;
             let y = param_f32(p, "y")?;
-            s.inverse_sync(page, x, y)
+            let text = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default();
+            let hint = crate::sync::SyncHint {
+                before: text("before").to_string(),
+                word: text("word").to_string(),
+                after: text("after").to_string(),
+                offset: p
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|o| usize::try_from(o).ok())
+                    .unwrap_or(0),
+            };
+            let hint = (!hint.word.is_empty()).then_some(hint);
+            s.inverse_sync_with(page, x, y, hint.as_ref())
         },
-        params = "{page: number (1-based), x: points, y: points from top}"
+        params = "{page: number (1-based), x: points, y: points from top, word?: the PDF text \
+                  clicked, before?, after?: text around it, offset?: characters into word}"
     ),
     cmd!(
         "typeset.revealIssue",
@@ -2125,6 +2161,81 @@ static REGISTRY: &[CommandSpec] = &[
         }
     ),
     cmd!(
+        "pdf.copySelection",
+        "Copy PDF Selection",
+        None,
+        0,
+        None,
+        has_pdf_selection,
+        |s, _| {
+            s.effect(Effect::CopyText(s.pdf.selected_text.clone()));
+            Ok(())
+        }
+    ),
+    cmd!(
+        "pdf.selectText",
+        "Select PDF Text",
+        None,
+        0,
+        None,
+        has_pdf,
+        |s, p| {
+            let point = |prefix: &str| -> Result<PdfPoint, CommandError> {
+                let key = |k: &str| {
+                    if prefix.is_empty() {
+                        k.to_string()
+                    } else {
+                        let mut c = k.chars();
+                        let first = c.next().map(|f| f.to_ascii_uppercase());
+                        format!("{prefix}{}{}", first.unwrap_or_default(), c.as_str())
+                    }
+                };
+                Ok(PdfPoint {
+                    page: param_u32(p, &key("page"))?.max(1),
+                    x: param_f32(p, &key("x"))?,
+                    y: param_f32(p, &key("y"))?,
+                })
+            };
+            let from = point("")?;
+            let mut to = from;
+            if p.get("toX").is_some() || p.get("toY").is_some() {
+                to = PdfPoint {
+                    page: param_u32(p, "toPage").unwrap_or(from.page).max(1),
+                    x: param_f32(p, "toX")?,
+                    y: param_f32(p, "toY")?,
+                };
+            } else if p.get("toPage").is_some() {
+                to = point("to")?;
+            }
+            let unit = match p.get("unit").and_then(Value::as_str).unwrap_or("char") {
+                "char" => TextUnit::Char,
+                "word" => TextUnit::Word,
+                "line" => TextUnit::Line,
+                other => {
+                    return Err(CommandError::Params(format!(
+                        "unit `{other}`: expected char, word or line"
+                    )));
+                }
+            };
+            s.effect(Effect::SelectPdfText(Some((from, to, unit))));
+            Ok(())
+        },
+        params = "{page: number (1-based), x, y: points from top-left, toPage?, toX?, toY?, \
+                  unit?: \"char\" | \"word\" | \"line\"}"
+    ),
+    cmd!(
+        "pdf.clearSelection",
+        "Clear PDF Selection",
+        None,
+        0,
+        None,
+        has_pdf,
+        |s, _| {
+            s.effect(Effect::SelectPdfText(None));
+            Ok(())
+        }
+    ),
+    cmd!(
         "pdf.gotoPage",
         "Go to Page",
         None,
@@ -2245,6 +2356,45 @@ static REGISTRY: &[CommandSpec] = &[
         },
         checked = |s| s.view.theme == ThemeChoice::Dark
     ),
+    cmd!(
+        "view.language.system",
+        "Language: System",
+        Workspace,
+        7,
+        None,
+        always,
+        |s, _| {
+            s.view.language = LanguageChoice::System;
+            Ok(())
+        },
+        checked = |s| s.view.language == LanguageChoice::System
+    ),
+    cmd!(
+        "view.language.en",
+        "Language: English",
+        Workspace,
+        7,
+        None,
+        always,
+        |s, _| {
+            s.view.language = LanguageChoice::English;
+            Ok(())
+        },
+        checked = |s| s.view.language == LanguageChoice::English
+    ),
+    cmd!(
+        "view.language.zhHans",
+        "Language: 简体中文",
+        Workspace,
+        7,
+        None,
+        always,
+        |s, _| {
+            s.view.language = LanguageChoice::ChineseSimplified;
+            Ok(())
+        },
+        checked = |s| s.view.language == LanguageChoice::ChineseSimplified
+    ),
     // ---------------------------------------------------------------- Window
     cmd!(
         "window.nextTab",
@@ -2340,8 +2490,115 @@ mod tests {
                     c.id
                 );
             }
-            assert!(!c.label.is_empty());
+            assert!(!c.label_en().is_empty());
         }
+    }
+
+    /// Every label the menu bar, toolbar and shortcuts list show has a Simplified Chinese
+    /// translation (engine names are proper names), and labels switch with the language.
+    #[test]
+    fn labels_are_translated() {
+        use texcraft_i18n::{Lang, has, scoped};
+        const PROPER_NAMES: [&str; 4] = ["pdfLaTeX", "XeLaTeX", "LuaLaTeX", "Tectonic"];
+        let missing: Vec<&str> = registry()
+            .iter()
+            .map(|c| c.label_en())
+            .filter(|l| !PROPER_NAMES.contains(l) && !has(Lang::ZhHans, l))
+            .collect();
+        assert!(missing.is_empty(), "untranslated labels: {missing:?}");
+        let typeset = registry().iter().find(|c| c.id == "typeset.run");
+        let label = |lang| {
+            let _l = scoped(lang);
+            (
+                typeset.map(CommandSpec::label),
+                Menu::Workspace.title(),
+                Menu::Workspace.title_en(),
+            )
+        };
+        assert_eq!(label(Lang::En), (Some("Typeset"), "Workspace", "Workspace"));
+        assert_eq!(label(Lang::ZhHans), (Some("排版"), "显示", "Workspace"));
+    }
+
+    /// The Language commands set the setting, tick the chosen one, and change what
+    /// `Session::lang` resolves to; System follows the system's preferred languages.
+    #[test]
+    fn language_commands() {
+        use texcraft_i18n::Lang;
+        let mut s = Session::new(std::sync::Arc::new(|| {}));
+        assert_eq!(s.view.language, LanguageChoice::System);
+        assert_eq!(s.lang(), Lang::En, "no system languages: English");
+        s.system_languages = vec!["zh-Hans-CN".into(), "en-CN".into()];
+        assert_eq!(s.lang(), Lang::ZhHans);
+        for (id, choice, lang) in [
+            ("view.language.en", LanguageChoice::English, Lang::En),
+            (
+                "view.language.zhHans",
+                LanguageChoice::ChineseSimplified,
+                Lang::ZhHans,
+            ),
+            ("view.language.system", LanguageChoice::System, Lang::ZhHans),
+        ] {
+            assert!(s.run(id, &Value::Null).is_ok());
+            assert_eq!(s.view.language, choice);
+            assert_eq!(s.lang(), lang, "{id}");
+            for other in [
+                "view.language.system",
+                "view.language.en",
+                "view.language.zhHans",
+            ] {
+                assert_eq!(s.is_checked(other), other == id, "{other} after {id}");
+            }
+        }
+        s.system_languages = vec!["fr-FR".into()];
+        assert_eq!(s.lang(), Lang::En);
+        // The setting is persisted with the view (an old file without it means System).
+        let v = serde_json::to_value(&s.view).unwrap_or_default();
+        assert_eq!(v["language"], "System");
+        let mut zh = s.view.clone();
+        zh.language = LanguageChoice::ChineseSimplified;
+        let json = serde_json::to_value(&zh).unwrap_or_default();
+        assert_eq!(json["language"], "zh-Hans");
+        let back: crate::View = serde_json::from_value(json).unwrap_or_default();
+        assert_eq!(back.language, LanguageChoice::ChineseSimplified);
+        let old: crate::View = serde_json::from_str("{\"sidebar\": false}").unwrap_or_default();
+        assert_eq!(old.language, LanguageChoice::System);
+        assert!(!old.sidebar);
+    }
+
+    #[test]
+    fn language_arguments() {
+        for (arg, choice) in [
+            ("system", Some(LanguageChoice::System)),
+            ("System", Some(LanguageChoice::System)),
+            ("en", Some(LanguageChoice::English)),
+            ("en-US", Some(LanguageChoice::English)),
+            ("zh-Hans", Some(LanguageChoice::ChineseSimplified)),
+            ("zh_CN.UTF-8", Some(LanguageChoice::ChineseSimplified)),
+            ("zh-TW", None),
+            ("klingon", None),
+        ] {
+            assert_eq!(LanguageChoice::from_arg(arg), choice, "{arg}");
+        }
+    }
+
+    /// Error messages are worded in the interface language.
+    #[test]
+    fn errors_are_translated() {
+        use texcraft_i18n::{Lang, scoped};
+        let mut s = Session::new(std::sync::Arc::new(|| {}));
+        let err = s.run("no.such.command", &Value::Null).err();
+        let _zh = scoped(Lang::ZhHans);
+        let shown = err.map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            shown.contains("no.such.command") && !shown.contains("unknown"),
+            "{shown}"
+        );
+        let failed = s.ai_insert(0).err();
+        assert_eq!(
+            failed.map(|e| e.to_string()).as_deref(),
+            Some(texcraft_i18n::tr("nothing to insert"))
+        );
+        assert_ne!(texcraft_i18n::tr("nothing to insert"), "nothing to insert");
     }
 
     #[test]

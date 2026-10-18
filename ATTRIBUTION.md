@@ -31,3 +31,6 @@ templates, demo paper) are MIT OR Apache-2.0.
   and aes-gcm (MIT/Apache-2.0, API keys at rest).
 - Test fixtures under `crates/*/tests/data/` were produced locally with TeX Live 2022 from
   documents written for this project.
+  The text-selection PDFs in `crates/pdf/tests/data/` (TeX Live 2025) embed subsets of fonts
+  shipped with TeX Live: Computer Modern (AMS Type 1, SIL OFL), Latin Modern (GUST Font
+  License) and Fandol (GPL with the font exception).

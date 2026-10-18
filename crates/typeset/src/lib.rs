@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use texcraft_i18n::{tr, trf};
 use texcraft_log::{Issue, LogReport, parse_blg, parse_log};
 use texcraft_project::{BibTool, Engine, build_dir};
 
@@ -103,7 +104,7 @@ impl Toolchain {
             if p.is_some() {
                 n.to_string()
             } else {
-                format!("no {n}")
+                trf!("no {program}", program = n)
             }
         };
         format!(
@@ -205,12 +206,12 @@ pub fn command_line(req: &Request, tc: &Toolchain) -> Result<(PathBuf, Vec<Strin
         .root
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .ok_or_else(|| "the root file has no name".to_string())?;
+        .ok_or_else(|| tr("the root file has no name").to_string())?;
     let out_dir = req.out_dir().to_string_lossy().into_owned();
     match req.engine {
         Engine::Tectonic => {
             let prog = tc.tectonic.clone().ok_or_else(|| {
-                "Tectonic is not installed. Install it (e.g. `brew install tectonic`) or pick another engine.".to_string()
+                tr("Tectonic is not installed. Install it (e.g. `brew install tectonic`) or pick another engine.").to_string()
             })?;
             let mut args = vec![
                 "-X".into(),
@@ -230,12 +231,12 @@ pub fn command_line(req: &Request, tc: &Toolchain) -> Result<(PathBuf, Vec<Strin
         }
         engine => {
             let prog = tc.latexmk.clone().ok_or_else(|| {
-                "No TeX distribution found (latexmk is missing). Install MacTeX (https://tug.org/mactex/) or TeX Live, or choose the Tectonic engine.".to_string()
+                tr("No TeX distribution found (latexmk is missing). Install MacTeX (https://tug.org/mactex/) or TeX Live, or choose the Tectonic engine.").to_string()
             })?;
             if !tc.supports(engine) {
-                return Err(format!(
-                    "{} is not installed in this TeX distribution.",
-                    engine.label()
+                return Err(trf!(
+                    "{engine} is not installed in this TeX distribution.",
+                    engine = engine.label()
                 ));
             }
             let mode = match engine {
@@ -390,7 +391,7 @@ impl Job {
                 Ok(JobEvent::Finished(o)) => return *o,
                 Err(_) => {
                     return Outcome {
-                        error: Some("the typesetting thread stopped unexpectedly".into()),
+                        error: Some(tr("the typesetting thread stopped unexpectedly").into()),
                         ..Outcome::default()
                     };
                 }
@@ -449,7 +450,7 @@ pub fn start(req: Request, tc: &Toolchain, wake: Arc<dyn Fn() + Send + Sync>) ->
         });
     if let Err(e) = spawned {
         let _ = tx.send(JobEvent::Finished(Box::new(Outcome {
-            error: Some(format!("could not start a thread: {e}")),
+            error: Some(trf!("could not start a thread: {e}", e = e)),
             ..Outcome::default()
         })));
         wake();
@@ -477,7 +478,11 @@ fn run(
     };
     let out_dir = req.out_dir();
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
-        outcome.error = Some(format!("cannot create {}: {e}", out_dir.display()));
+        outcome.error = Some(trf!(
+            "cannot create {path}: {e}",
+            path = out_dir.display(),
+            e = e
+        ));
         return outcome;
     }
     if let Some(temp) = out_dir.parent() {
@@ -607,7 +612,11 @@ fn run_process(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            outcome.error = Some(format!("could not run {}: {e}", prog.display()));
+            outcome.error = Some(trf!(
+                "could not run {program}: {e}",
+                program = prog.display(),
+                e = e
+            ));
             return;
         }
     };
@@ -669,7 +678,7 @@ pub fn start_live(req: LiveRequest, tc: &Toolchain, wake: Arc<dyn Fn() + Send + 
         });
     if let Err(e) = spawned {
         let _ = tx.send(JobEvent::Finished(Box::new(Outcome {
-            error: Some(format!("could not start a thread: {e}")),
+            error: Some(trf!("could not start a thread: {e}", e = e)),
             live: true,
             ..Outcome::default()
         })));
@@ -750,7 +759,7 @@ fn run_live(
     }) {
         Ok(t) => t,
         Err(e) => {
-            outcome.error = Some(format!("cannot prepare the live preview: {e}"));
+            outcome.error = Some(trf!("cannot prepare the live preview: {e}", e = e));
             return outcome;
         }
     };
@@ -765,7 +774,7 @@ fn run_live(
     if root_replaced && format.is_none() {
         // No format after all (the preamble loads system fonts, say): typeset the user's root.
         if let Err(e) = live::write_root(req, &root_text) {
-            outcome.error = Some(format!("cannot prepare the live preview: {e}"));
+            outcome.error = Some(trf!("cannot prepare the live preview: {e}", e = e));
             return outcome;
         }
     }

@@ -13,6 +13,7 @@ use egui::{
 };
 use texcraft_ai::{Capability, Model};
 use texcraft_engine::Session;
+use texcraft_i18n::{tr, trf};
 
 use crate::icons;
 use crate::prefs::{Pal, check_box, hairline, push_button, text_field, text_tabs};
@@ -53,11 +54,21 @@ impl Group {
         }
     }
 
-    fn label(self) -> &'static str {
+    /// Its English name: `state.inspect`, the control channel's group names, ids.
+    fn name(self) -> &'static str {
         match self {
             Group::Text => "Text",
             Group::Vision => "Vision",
             Group::Other => "Other",
+        }
+    }
+
+    /// Its name on the tabs and headings, in the interface language.
+    fn label(self) -> &'static str {
+        match self {
+            Group::Text => tr("Text"),
+            Group::Vision => tr("Vision"),
+            Group::Other => tr("Other"),
         }
     }
 }
@@ -137,7 +148,7 @@ impl ModelPicker {
             "text": count(Group::Text),
             "vision": count(Group::Vision),
             "other": count(Group::Other),
-            "group": self.group.map(Group::label),
+            "group": self.group.map(Group::name),
             "shown": matching(&self.models, &self.filter, self.group).len(),
             "ticked": self.ticked.len(),
             "filter": self.filter,
@@ -149,7 +160,7 @@ impl ModelPicker {
     pub fn set_group(&mut self, g: Option<&str>) {
         self.group = Group::ALL
             .into_iter()
-            .find(|x| g.is_some_and(|g| x.label().eq_ignore_ascii_case(g)));
+            .find(|x| g.is_some_and(|g| x.name().eq_ignore_ascii_case(g)));
     }
 
     fn poll(&mut self, ctx: &Context) {
@@ -168,7 +179,7 @@ impl ModelPicker {
             Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
             Err(TryRecvError::Disconnected) => {
                 self.fetch = None;
-                self.error = Some("The model list could not be fetched.".into());
+                self.error = Some(tr("The model list could not be fetched.").into());
             }
         }
     }
@@ -189,7 +200,7 @@ impl ModelPicker {
             .collect();
         self.models = typed.into_iter().chain(list).collect();
         if self.models.is_empty() {
-            self.error = Some("The provider listed no models.".into());
+            self.error = Some(tr("The provider listed no models.").into());
         }
     }
 
@@ -335,7 +346,7 @@ pub(crate) fn show(
             });
     } else {
         let builder = ViewportBuilder::default()
-            .with_title(format!("Add Models — {name}"))
+            .with_title(trf!("Add Models — {name}", name = name))
             .with_inner_size([W, H])
             .with_min_inner_size([400.0, 380.0])
             .with_minimize_button(false)
@@ -412,10 +423,10 @@ fn body(
         pal.label,
     );
     let status = match picker.models.len() {
-        _ if picker.fetch.is_some() => "Fetching…".to_string(),
+        _ if picker.fetch.is_some() => tr("Fetching…").to_string(),
         0 => String::new(),
-        1 => "1 model".to_string(),
-        n => format!("{n} models"),
+        1 => tr("1 model").to_string(),
+        n => trf!("{n} models", n = n),
     };
     p.text(
         pos2(right, logo.center().y),
@@ -435,7 +446,7 @@ fn body(
         sr,
         &mut picker.filter,
         false,
-        "Search, or type a model id",
+        tr("Search, or type a model id"),
     );
     if picker.focus {
         search.request_focus();
@@ -453,7 +464,7 @@ fn body(
         Some(Group::Other),
     ]
     .into_iter()
-    .map(|g| format!("{} {}", g.map_or("All", Group::label), count(g)))
+    .map(|g| format!("{} {}", g.map_or_else(|| tr("All"), Group::label), count(g)))
     .collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let selected = match picker.group {
@@ -487,7 +498,7 @@ fn body(
     y += 32.0;
     if let Some(e) = &picker.error {
         let g = p.layout(
-            format!("{e} You can still type a model id above."),
+            trf!("{e} You can still type a model id above.", e = e),
             FontId::proportional(11.0),
             pal.close,
             right - left,
@@ -520,11 +531,11 @@ fn body(
                 ui.input(|i| i.time) as f32 * 6.0,
             );
             ui.ctx().request_repaint();
-            "Fetching the model list…".to_string()
+            tr("Fetching the model list…").to_string()
         } else if picker.filter.trim().is_empty() {
-            "No models".to_string()
+            tr("No models").to_string()
         } else {
-            format!("No models match “{}”", picker.filter.trim())
+            trf!("No models match “{filter}”", filter = picker.filter.trim())
         };
         p.text(
             list.center() + vec2(0.0, 6.0),
@@ -545,7 +556,7 @@ fn body(
             0.0
         };
         egui::ScrollArea::vertical()
-            .id_salt(("model-picker-list", picker.group.map(Group::label)))
+            .id_salt(("model-picker-list", picker.group.map(Group::name)))
             .auto_shrink([false, false])
             .show_rows(&mut c, ROW_H, rows.len(), |ui, range| {
                 for line in range.filter_map(|k| rows.get(k).copied()) {
@@ -584,7 +595,7 @@ fn body(
                             painter.text(
                                 pos2(r.left() + 30.0, r.center().y),
                                 Align2::LEFT_CENTER,
-                                format!("Add “{id}” by its id"),
+                                trf!("Add “{id}” by its id", id = id),
                                 FontId::proportional(12.0),
                                 pal.accent,
                             );
@@ -629,7 +640,7 @@ fn body(
                     // The display name, the id after it when they differ; at the right "Added",
                     // or what it can do ("Vision · Reasoning · 128K").
                     let tag = if added {
-                        "Added".to_string()
+                        tr("Added").to_string()
                     } else {
                         m.summary()
                     };
@@ -713,7 +724,11 @@ fn body(
     if !selectable.is_empty() {
         let all = selectable.iter().all(|id| picker.ticked.contains(*id));
         let sa = Rect::from_min_size(pos2(left, cy - 11.0), vec2(100.0, 22.0));
-        let label = if all { "Deselect All" } else { "Select All" };
+        let label = if all {
+            tr("Deselect All")
+        } else {
+            tr("Select All")
+        };
         if push_button(ui, pal, Id::new("model-picker-all"), sa, label, 11.5) {
             for id in selectable {
                 if all {
@@ -730,13 +745,20 @@ fn body(
         .filter(|m| !have.iter().any(|h| &h.id == *m))
         .count();
     let add_label = match n {
-        0 => "Add".to_string(),
-        1 => "Add 1 Model".to_string(),
-        n => format!("Add {n} Models"),
+        0 => tr("Add").to_string(),
+        1 => tr("Add 1 Model").to_string(),
+        n => trf!("Add {n} Models", n = n),
     };
     let ar = Rect::from_min_size(pos2(right - 124.0, cy - 11.0), vec2(124.0, 22.0));
     let cr = Rect::from_min_size(pos2(ar.left() - 84.0, cy - 11.0), vec2(76.0, 22.0));
-    if push_button(ui, pal, Id::new("model-picker-cancel"), cr, "Cancel", 11.5) {
+    if push_button(
+        ui,
+        pal,
+        Id::new("model-picker-cancel"),
+        cr,
+        tr("Cancel"),
+        11.5,
+    ) {
         outcome = Outcome::Cancel;
     }
     if accent_button(ui, pal, Id::new("model-picker-add"), ar, &add_label, n > 0)
@@ -912,6 +934,19 @@ mod tests {
         assert_eq!(picker.group, None);
         picker.set_group(None);
         assert_eq!(picker.group, None);
+    }
+
+    /// In Chinese the tabs read 文本/视觉/其他, but the control channel and `state.inspect`
+    /// keep the English group names.
+    #[test]
+    fn group_names_stay_english_in_other_languages() {
+        let _zh = texcraft_i18n::scoped(texcraft_i18n::Lang::ZhHans);
+        let mut picker = ModelPicker::default();
+        picker.set_group(Some("vision"));
+        assert_eq!(picker.group, Some(Group::Vision));
+        assert_eq!(picker.info()["group"], "Vision");
+        assert_eq!(Group::Vision.label(), "视觉");
+        assert_eq!(Group::Vision.name(), "Vision");
     }
 
     /// A long list (OpenRouter serves hundreds) filters by any part of the id.

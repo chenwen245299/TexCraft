@@ -573,3 +573,153 @@ From the user's screenshots of the target's Preferences and Typeset Configuratio
   at most once a minute, as requests go out. Test: old bodies go; fresh ones and other files stay.
 - The Assistant's empty states (setup and "Ask about your document") show the TexCraft icon
   (`assets/icon/texcraft.svg`, 52 pt) instead of the sparkles glyph.
+
+## Windows follow the Appearance choice, not just the system (2026-10-17)
+
+- Appearance Light under a dark macOS (or Dark under a light one) drew the welcome window's
+  light text and filter field on the system's dark translucent material: the tokens followed the
+  choice, the native windows followed the system. `update_theme` now also sets egui's theme
+  preference (Light/Dark/System), which egui sends to every window as `SetTheme` (window
+  appearance → material, window buttons), and re-applies the visuals when egui's theme switches.
+  Test: `appearance_choice_sets_the_window_theme`.
+- Checked by eye in the dev app (Light under a dark system): light material behind the welcome
+  window. `ui.screenshot` captures egui's framebuffer only, not the material.
+- Open: native menus and open/save panels follow the app's appearance, which is still the
+  system's (would need `NSApp.setAppearance` in `crates/macos`).
+
+## Update window on the Settings window; no AI suggestion over the completion list (2026-10-17)
+
+- Check for Updates… in Settings → General drew the update window (an egui modal) on the main
+  window, behind Settings. When the Settings window is in front as the check opens it, it now
+  shows there (as on the welcome window at launch); from the menu or an automatic check, on the
+  main window. Settings closing hands it back to the main window. `apply_effects` takes the
+  context (focus). Test: `update_window_shows_where_it_was_asked_for`.
+- The command completion list and an inline AI suggestion both wanted Tab, and the grey text
+  stayed under the list. While the list is up the editor drops the suggestion and the waiting
+  request (`inline_dismiss`); typing after it closes asks again. Test (drives the editor: plain
+  typing waits, `\sec` opens the list and waits for nothing; fails without the fix):
+  `completion_list_holds_ai_suggestions`.
+- Checked by eye in the dev app: the update window comes up on Settings, in front; `\sec` shows
+  the completion list with no grey suggestion.
+
+## Consistency audit: windows, appearance, editor keys (2026-10-17)
+
+Three read-only audits (multi-window routing, theme colours, editor key/overlay conflicts) after
+the welcome-window and update-window bugs; what landed:
+- The main window comes forward when it gets something to show: a new dialog (About, alerts,
+  save prompts, Go to Line, Typeset Configuration) or a newly opened or created document. Menu
+  commands while Settings, the welcome or the PDF window was in front opened things behind it;
+  at launch (main window hidden behind the welcome window) ⌘N/⌘O/Open Recent filled the hidden
+  window and About/Typeset Configuration never showed. A document now takes the start-up
+  window's place; a dialog shows the main window with the welcome window left up. Focus is only
+  taken from the app's own windows. Test: `main_window_comes_forward_for_documents_and_dialogs`.
+- Update window: it follows each check to the window in front (already open on the main window,
+  then checked from Settings: it moves there); it can no longer draw on Settings and the welcome
+  window at once; Window → Welcome Window while the start-up window is up keeps it the start-up
+  window.
+- Appearance: under System the dark/light choice asks AppKit (`texcraft_macos::system_dark`), as
+  a window with a chosen appearance hears of no system change (Light, macOS switched to light,
+  then System gave dark tokens on light windows). Visuals are re-applied whenever egui's theme
+  differs from the one they were written for (the system theme arrives after start-up: the first
+  frames used egui's stock light visuals). Test: `visuals_follow_egui_into_the_system_theme`.
+- The "dots" logo was pure black, invisible in dark menus: now monochrome (`currentColor`), and
+  `every_logo_renders` fails any untinted logo that draws black only.
+- Editor: Escape stays with the editor (`EventFilter.escape`); before, egui dropped the focus on
+  Escape, so Esc never dismissed the AI suggestion or closed/opened the completion list, and the
+  caret vanished. The AI suggestion is dropped (and not asked for) while the editor hasn't the
+  keys. `completion_list_holds_ai_suggestions` now sends Escape and moves the focus away.
+- Open (proposed as follow-ups): one Escape router (one Esc closes the find bar and the dialog
+  together), exact modifier matching (⇧Tab indents, ⇧↩ sends in the AI panel), Return over a
+  selection, find-bar focus, the completion list outliving its context, the spell menu during
+  typing, shortcuts ignoring focus (⌘/ edits the document from the AI composer), Windows/Linux
+  Ctrl shortcuts; light-mode contrast of status colours (LIVE 2.5:1, warning icon 1.7:1, git M
+  2.9:1), faint line numbers, `t.dark` literal branches to tokens, egui defaults the visuals leave
+  (focus ring, hover fills); welcome-window leftovers (status lost while the main window is
+  hidden, Cancel in Open… leaves an empty main window, closing the start-up window with Settings
+  open quits).
+
+## PDF text selection and copy; inverse search flashes the source (2026-10-18)
+
+- `crates/pdf/src/text.rs`: page text from hayro's `Device::draw_glyph_run` (glyph transform ×
+  advance × font size; Unicode from `ToUnicode`/glyph names, ligatures spelt out). Embedded
+  CID-keyed CFF fonts without `ToUnicode` (xdvipdfmx writes none for Adobe-GB1/Japan1/CNS1/Korea1,
+  e.g. ctex's Fandol): glyph → CID through the CFF charset (`read-fonts` 0.43, already in the tree
+  via skrifa), CID → Unicode through hayro-cmap's Adobe UCS2 tables. Word spaces inferred from
+  gaps (TeX writes no spaces; 0.15 em, 0.6 em between CJK); lines by vertical overlap; a wrapped
+  CJK paragraph copies without a break. Hit-testing: nearest line (vertically, then
+  horizontally), caret by glyph halves; words (CJK runs stop at punctuation), lines, one
+  highlight box per line. The render worker extracts text after pending renders
+  (`RenderWorker::text` → `RenderEvent::Text`), one cache per document; the viewer keeps ±24 pages.
+- Viewer: press-drag selects (pages across, auto-scroll at the edges), double-click words,
+  triple-click lines, click clears, Esc clears, I-beam over text, `t.selection` over the ink
+  (dimmer when the click went elsewhere). ⌘C: the Edit menu's Copy runs `pdf.copySelection`
+  when the last click was in the PDF and its window is in front, else goes to the text widget.
+  New commands `pdf.copySelection`, `pdf.selectText {page,x,y,toPage?,toX?,toY?,unit?}`,
+  `pdf.clearSelection`; `Session::pdf.selected_text`.
+- Inverse search: the viewer sends the clicked word and its neighbours; `engine::sync::locate`
+  finds them in the SyncTeX line (shrinking context until unique), puts the caret on the clicked
+  character and flashes its sentence, else the line (column used when recorded; engines write
+  -1). `Effect::FlashSource` → a solid band across the text column over the rows the target
+  covers, as in the target app: lemon yellow in light (`source_flash`, far more saturated than
+  the Classic cream page and the find-match yellow: `source_flash_is_yellow_and_stands_out`),
+  deep amber in dark so blue syntax colours stay readable.
+  Both flashes share `ui::flash` (hold 1.0 s, smoothstep fade 0.7 s; repaints only while it
+  runs: one at the end of the hold, then per frame). ⌘-click in the separate PDF window brings
+  the main window forward.
+- Control: `ui.pointer {command: true}` (⌘-click), `state.inspect` → `ui.pdfSelection` (range,
+  boxes, page rects, scale, text pages), `ui.sourceFlash`, `pdf.selectedText`.
+- Tests: fixtures `crates/pdf/tests/data/select-{en,zh}.pdf` (pdflatex CM; xelatex ctex Fandol;
+  `generate.py`), positions checked against `pdftotext -bbox`; English/Chinese drags, words,
+  ligatures, wrapped CJK, cross-page, truncated files, worker; `locate` (sentences, repeats,
+  markup, column); engine inverse search on the `single` SyncTeX fixture; selection resolve,
+  multi-click, hints; flash timing; ⌘C routing. Checked live: real drag and ⌘-click on the dev
+  app (caret on 你, sentence flashed; repaints stop after 1.7 s); screenshots of a selection
+  (English, equation, Chinese) and mid-flash, light and dark.
+- Open: links and PDF search; rotated/vertical text uses axis-aligned boxes; CID TrueType fonts
+  without `ToUnicode` (rare) still give no text; Select All in the PDF.
+
+## Simplified Chinese interface (2026-10-18)
+
+- New L0 crate `texcraft-i18n`: user-visible strings are written in English inside `tr("…")`, or
+  `trf!("Renamed to {path}", path = …)` (named placeholders only); the English is the key and the
+  fallback. The language is process-wide, set by the app every frame from `Session::lang()`, so
+  background threads (typesetting, updates) word their errors in it too; tests use a per-thread
+  `scoped` override and never see each other's language.
+- Catalogue `crates/i18n/src/zh_hans/`: ~935 entries in nine area tables (commands, engine, app,
+  workbench, editor, sidebar, git, prefs, ai); macOS vocabulary (设置、存储、拷贝、排版、边栏、文稿),
+  full-width punctuation, a space around Latin words. `tests/catalogue.rs` scans the workspace for
+  `tr`/`trf!` literals: each has an entry, entries keep their placeholders, `trf!` arguments match
+  them, a key has one translation, no entry is stale.
+- Language setting: `View::language` (System / English / 简体中文, persisted, `"zh-Hans"`), a row
+  under Appearance in Settings → General, commands `view.language.system|en|zhHans` (Workspace
+  menu), `texcraft --lang system|en|zh-Hans`, `texcraft-cli commands --lang zh-Hans` (English by
+  default); `state.inspect` → `language {resolved, interface, system}`, `commands.list` gives
+  `label` and `labelEn`. System follows `NSLocale.preferredLanguages`
+  (`texcraft_macos::preferred_languages`; POSIX `LANG`… elsewhere): the first language TexCraft
+  has wins, zh-Hant/TW/HK are not Simplified.
+- Live: egui text changes on the next frame; the native menu bar is rebuilt (AppKit menus can't
+  be retitled), muda's predefined items get our titles. The Settings and welcome window titles,
+  also used to find those windows, go through `tr` at both ends.
+- Engine: `CommandSpec::label()` translates (`label_en()`, field private); `CommandError`'s
+  Display is hand-written (thiserror dropped from the engine); status messages and errors are
+  translated, as are the typeset, update, git and ai crates' messages that reach the UI. JSON for
+  agents stays English (`state.inspect` toolchain, provider kind, model-picker groups).
+- Code that read English text: the toolbar's "Typeset in" summary test, the outline's singular
+  from `trim_end_matches('s')`, git dates cut at " at " — now language-independent.
+- Bundle: `CFBundleLocalizations` (en, zh-Hans) and `.lproj` folders, so AppKit's own menu items
+  and panels follow macOS's language.
+- Tests: catalogue (6), i18n units (7), engine (labels translated, language commands and
+  persistence, `--lang` values, translated errors), `crates/ui/tests/zh_hans.rs` draws every
+  sidebar tab, Settings pane, Typeset Configuration tab, welcome tab, the update window and the
+  dialogs in Chinese (Chinese drawn, landmarks translated) and in English (no Chinese); per-file
+  tests for templates, symbols, clock, toolbar, prefs, models.
+- Checked by eye on offscreen wgpu renders (egui_kittest in a scratch crate; the dev window draws
+  no frames when covered) of the main window, all Settings panes, the sheet, welcome, sidebar tabs
+  and dialogs, Chinese and English (English unchanged but for the Language row), and switching
+  live over the control channel. epaint breaks lines only at spaces, CJK ideographs and ASCII
+  punctuation, so long lists of Latin names use ", " not "、" (it split "Ste|pFun"); a few Settings
+  descriptions were shortened to avoid one-character last lines.
+- Open: the native menu bar not seen by eye (no capture); AppKit's own items (Dictation, Emoji,
+  window tiling, open/save panels) follow macOS's language rather than an in-app choice (would
+  need the app's `AppleLanguages` default and a relaunch); the LIVE/AUTO/MANUAL badge stays
+  English; new files and folders keep English names (`untitled.tex`), TeX prefers ASCII paths.

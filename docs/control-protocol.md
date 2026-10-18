@@ -27,7 +27,7 @@ Replies: `{"id": 1, "ok": true, "result": …}` or `{"id": 1, "ok": false, "erro
 | `editor.getText` | — | the active document's text |
 | `ui.key` | `{text}` or `{key, command?, shift?, alt?, ctrl?}` (egui key names) | types into the focused widget |
 | `ui.fullscreen` | `{on?}` | enters or leaves full screen (toggles without `on`) the way the green window button does (AppKit's `toggleFullScreen:` on macOS); returns `{was, on}` |
-| `ui.pointer` | `{x, y, click?}` (points; `click` `"primary"` or `"secondary"`) | moves the pointer there (hover) and optionally clicks: menus, context menus, tooltips |
+| `ui.pointer` | `{x, y, click?, command?}` (points; `click` `"primary"` or `"secondary"`; `command: true` holds ⌘) | moves the pointer there (hover) and optionally clicks: menus, context menus, tooltips, ⌘-click inverse search in the PDF |
 | `ui.drag` | `{from: [x, y], to: [x, y], steps?}` (points) | presses at `from`, moves to `to` over `steps` frames (default 8), releases: dividers, sliders, text selection |
 | `ui.wait` | `{frames}` | returns after that many frames |
 | `typeset.wait` | `{timeoutMs?}` | waits until no typeset is running or pending; returns the typeset summary |
@@ -37,8 +37,14 @@ Replies: `{"id": 1, "ok": true, "result": …}` or `{"id": 1, "ok": false, "erro
 | `ui.resize` | `{width, height}` | resizes the window |
 
 Useful command ids: `file.openPath {path}`, `edit.setText {text}`, `edit.select {anchor, cursor}`,
-`edit.insertText {text}`, `edit.gotoLine {line}`, `typeset.run`, `typeset.syncPdf`,
-`typeset.inverseSync {page, x, y}`, `typeset.revealIssue {index}`, `pdf.setZoom {zoom}`,
+`edit.insertText {text}`, `edit.gotoLine {line}`, `view.language.system|en|zhHans` (the
+interface language; `state.inspect` → `view.language` is the setting, `language.resolved` what it
+means now, `language.system` the system's preferred languages), `typeset.run`, `typeset.syncPdf`,
+`typeset.inverseSync {page, x, y, word?, before?, after?, offset?}` (with the PDF text clicked
+the caret lands on it and its sentence flashes; `state.inspect` `ui.sourceFlash`),
+`pdf.selectText {page, x, y, toPage?, toX?, toY?, unit?: char|word|line}`, `pdf.clearSelection`,
+`pdf.copySelection` (`pdf.selectedText` and `ui.pdfSelection` in `state.inspect`: the text, its
+glyph range and highlight boxes in PDF points), `typeset.revealIssue {index}`, `pdf.setZoom {zoom}`,
 `pdf.gotoPage {page}`, `view.*`, `typeset.mode.live|auto|manual`, `files.* {path}` (insert,
 reveal, copyPath, rename `{path, name}`, duplicate, trash, newFolder/newFile `{dir}`), `git.*`
 (refresh, init, stage/unstage/discard `{path}`, stageAll, unstageAll, commit `{message?}`, pull,
@@ -46,6 +52,14 @@ push, fetch, diff `{path, staged?}`), `ai.*` (send `{text?}`, stop, clear, inser
 selectModel `{provider, model}`, inline.toggle, inline.trigger (⌥\\), inline.accept (Tab), inline.acceptSentence (⌘→), inline.acceptWord, attachImage `{path}` (PNG/JPEG/GIF/WebP, models with Vision), removeImage `{index}`, inline.dismiss, inline.settings, toggleDocument, settings). `state.inspect` reports `typeset.mode`,
 `git` (branch, staged, changes, busy, error) and `ai` (providers with `hasKey` only — API keys are
 never reported — model, messages). `commands.list` documents the rest.
+
+## Languages
+
+`texcraft --lang zh-Hans` (or `en`, `system`) starts with that Language setting, so screenshots
+can be taken in each language (`scripts/parity/run-dev-app.sh --lang zh-Hans`); `command.run
+view.language.zhHans` switches a running app (from the next frame; the menu bar is rebuilt).
+`commands.list` gives each command's `label` in the current language and `labelEn`.
+`texcraft-cli commands --lang zh-Hans` lists the labels in Chinese (English by default).
 
 ## One-shot screenshots
 

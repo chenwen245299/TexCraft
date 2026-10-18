@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use egui::{Align2, Color32, FontId, Id, Key, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use texcraft_engine::Session;
 use texcraft_git::{Change, ChangeKind};
+use texcraft_i18n::{tr, trf};
 
 use crate::menu::{self, ButtonKind};
 use crate::theme::{GROUP_ROW_HEIGHT, ROW_HEIGHT, SIDEBAR_FONT, Tokens, semibold};
@@ -52,21 +53,29 @@ fn ago(time: i64) -> String {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     let d = now.saturating_sub(time).max(0);
     match d {
-        0..60 => "just now".into(),
-        60..3600 => format!("{} min ago", d / 60),
-        3600..86_400 => format!("{} h ago", d / 3600),
+        0..60 => tr("just now").into(),
+        60..3600 => trf!("{n} min ago", n = d / 60),
+        3600..86_400 => trf!("{n} h ago", n = d / 3600),
         86_400..2_592_000 => {
             let days = d / 86_400;
-            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+            if days == 1 {
+                trf!("{n} day ago", n = days)
+            } else {
+                trf!("{n} days ago", n = days)
+            }
         }
-        _ => crate::clock::date_time(
-            std::time::UNIX_EPOCH
-                + std::time::Duration::from_secs(u64::try_from(time).unwrap_or(0)),
-        )
-        .split(" at ")
-        .next()
-        .unwrap_or("")
-        .to_string(),
+        _ => {
+            let when = crate::clock::date_time(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(u64::try_from(time).unwrap_or(0)),
+            );
+            // The date without the time: "24 Sep 2026 at 16:21:54", "2026年9月24日 16:21:54".
+            let date = when.split(" at ").next().unwrap_or("");
+            match date.split_once("日 ") {
+                Some((ymd, _)) => format!("{ymd}日"),
+                None => date.to_string(),
+            }
+        }
     }
 }
 
@@ -134,8 +143,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         empty(
             ui,
             t,
-            "No Project Folder",
-            "Open a project folder to manage it with Git.",
+            tr("No Project Folder"),
+            tr("Open a project folder to manage it with Git."),
             None,
         );
         return;
@@ -144,8 +153,10 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         empty(
             ui,
             t,
-            "Git Is Not Installed",
-            "Install Git (git-scm.com, or the Xcode Command Line Tools on macOS) to use Source Control.",
+            tr("Git Is Not Installed"),
+            tr(
+                "Install Git (git-scm.com, or the Xcode Command Line Tools on macOS) to use Source Control.",
+            ),
             None,
         );
         return;
@@ -155,9 +166,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
             if empty(
                 ui,
                 t,
-                "No Repository",
-                "The project folder is not a Git repository yet. Initialize one to track the history of your document.",
-                Some("Initialize Repository"),
+                tr("No Repository"),
+                tr(
+                    "The project folder is not a Git repository yet. Initialize one to track the history of your document.",
+                ),
+                Some(tr("Initialize Repository")),
             ) {
                 run(session, "git.init", no_params());
             }
@@ -194,8 +207,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
     let branch = status
         .branch
         .clone()
-        .or_else(|| status.head.as_ref().map(|h| format!("{h} (detached)")))
-        .unwrap_or_else(|| "No commits yet".into());
+        .or_else(|| {
+            status
+                .head
+                .as_ref()
+                .map(|h| trf!("{head} (detached)", head = h))
+        })
+        .unwrap_or_else(|| tr("No commits yet").into());
     let mut sync = String::new();
     if status.behind > 0 {
         sync.push_str(&format!("↓{} ", status.behind));
@@ -271,20 +289,18 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         t,
         r_refresh,
         Id::new("git-refresh"),
-        "Refresh",
+        tr("Refresh"),
         idle,
         icons::refresh,
     ) {
         run(session, "git.refresh", no_params());
     }
-    let pull_tip = if status.behind > 0 {
-        format!(
-            "Pull {} commit{}",
-            status.behind,
-            if status.behind == 1 { "" } else { "s" }
-        )
+    let pull_tip = if status.behind == 1 {
+        trf!("Pull {n} commit", n = status.behind)
+    } else if status.behind > 0 {
+        trf!("Pull {n} commits", n = status.behind)
     } else {
-        "Pull".into()
+        tr("Pull").into()
     };
     if icon_button(
         ui,
@@ -297,16 +313,14 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
     ) {
         run(session, "git.pull", no_params());
     }
-    let push_tip = if status.ahead > 0 {
-        format!(
-            "Push {} commit{}",
-            status.ahead,
-            if status.ahead == 1 { "" } else { "s" }
-        )
+    let push_tip = if status.ahead == 1 {
+        trf!("Push {n} commit", n = status.ahead)
+    } else if status.ahead > 0 {
+        trf!("Push {n} commits", n = status.ahead)
     } else if status.upstream.is_none() {
-        "Publish Branch".into()
+        tr("Publish Branch").into()
     } else {
-        "Push".into()
+        tr("Push").into()
     };
     if icon_button(
         ui,
@@ -321,7 +335,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
     }
     let more = ui
         .interact(r_more, Id::new("git-more"), Sense::click())
-        .on_hover_text("More Actions");
+        .on_hover_text(tr("More Actions"));
     if more.hovered() {
         p.rect_filled(r_more, 5.0, t.row_hover);
     }
@@ -333,9 +347,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         .show(|ui| {
             menu::begin(ui, 190.0);
             for (id, label) in [
-                ("git.pull", "Pull"),
-                ("git.push", "Push"),
-                ("git.fetch", "Fetch"),
+                ("git.pull", tr("Pull")),
+                ("git.push", tr("Push")),
+                ("git.fetch", tr("Fetch")),
             ] {
                 let opts = menu::Item {
                     disabled: !idle,
@@ -346,17 +360,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                 }
             }
             menu::separator(ui, t);
-            if menu::button(ui, t, "Stage All Changes") {
+            if menu::button(ui, t, tr("Stage All Changes")) {
                 run(session, "git.stageAll", no_params());
             }
-            if menu::button(ui, t, "Unstage All Changes") {
+            if menu::button(ui, t, tr("Unstage All Changes")) {
                 run(session, "git.unstageAll", no_params());
             }
             menu::separator(ui, t);
             let reveal = if cfg!(windows) {
-                "Show Repository in Explorer"
+                tr("Show Repository in Explorer")
             } else {
-                "Reveal Repository in Finder"
+                tr("Reveal Repository in Finder")
             };
             if menu::button(ui, t, reveal) {
                 run(
@@ -385,7 +399,10 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                 let edit = ui.add(
                     egui::TextEdit::multiline(&mut session.git.message)
                         .id(Id::new("git-message"))
-                        .hint_text(format!("Message (⌘↩ to commit on “{branch_name}”)"))
+                        .hint_text(trf!(
+                            "Message (⌘↩ to commit on “{branch}”)",
+                            branch = branch_name
+                        ))
                         .font(FontId::proportional(12.0))
                         .frame(egui::Frame::NONE)
                         .desired_rows(2)
@@ -399,11 +416,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
             });
             ui.add_space(6.0);
             let label = if status.is_clean() {
-                "Commit"
+                tr("Commit")
             } else if status.staged.is_empty() {
-                "Commit All"
+                tr("Commit All")
             } else {
-                "Commit"
+                tr("Commit")
             };
             let kind = if status.is_clean() || session.git.message.trim().is_empty() {
                 ButtonKind::Normal
@@ -438,9 +455,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                     t,
                     st,
                     "staged",
-                    "Staged Changes",
+                    tr("Staged Changes"),
                     status.staged.len(),
-                    Some(("Unstage All Changes", false)),
+                    Some((tr("Unstage All Changes"), false)),
                     session,
                 );
                 if open {
@@ -454,9 +471,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                 t,
                 st,
                 "changes",
-                "Changes",
+                tr("Changes"),
                 status.changes.len(),
-                (!status.changes.is_empty()).then_some(("Stage All Changes", true)),
+                (!status.changes.is_empty()).then_some((tr("Stage All Changes"), true)),
                 session,
             );
             if open {
@@ -468,7 +485,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                     ui.painter().text(
                         pos2(r.left() + 30.0, r.center().y),
                         Align2::LEFT_CENTER,
-                        "No changes",
+                        tr("No changes"),
                         FontId::proportional(11.5),
                         t.text_weak,
                     );
@@ -482,7 +499,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                 t,
                 st,
                 "commits",
-                "Commits",
+                tr("Commits"),
                 repo.log.len(),
                 None,
                 session,
@@ -697,7 +714,7 @@ fn change_row(
             t,
             b_open,
             Id::new(("git-open", &c.path, staged)),
-            "Open File",
+            tr("Open File"),
             exists,
             |p, r, col| icons::document_pt(p, r.shrink2(vec2(1.5, 0.0)), col, ""),
         ) {
@@ -714,7 +731,7 @@ fn change_row(
                 t,
                 b_discard,
                 Id::new(("git-discard", &c.path)),
-                "Discard Changes",
+                tr("Discard Changes"),
                 true,
                 icons::discard,
             )
@@ -723,9 +740,9 @@ fn change_row(
             st.confirm_discard = Some((c.path.clone(), c.kind == ChangeKind::Untracked));
         }
         let (tip, id) = if staged {
-            ("Unstage Changes", "git.unstage")
+            (tr("Unstage Changes"), "git.unstage")
         } else {
-            ("Stage Changes", "git.stage")
+            (tr("Stage Changes"), "git.stage")
         };
         if icon_button(
             ui,
@@ -746,9 +763,10 @@ fn change_row(
             run(session, id, path.clone());
         }
     }
+    let kind = c.kind.describe();
     let resp = resp.on_hover_text(match &c.orig {
-        Some(o) => format!("{} ← {o} · {}", c.path, c.kind.describe()),
-        None => format!("{} · {}", c.path, c.kind.describe()),
+        Some(o) => format!("{} ← {o} · {kind}", c.path),
+        None => format!("{} · {kind}", c.path),
     });
     if resp.clicked() && !acted {
         run(
@@ -759,7 +777,7 @@ fn change_row(
     }
     resp.context_menu(|ui| {
         menu::begin(ui, 180.0);
-        if menu::button(ui, t, "Open Changes") {
+        if menu::button(ui, t, tr("Open Changes")) {
             run(
                 session,
                 "git.diff",
@@ -771,7 +789,7 @@ fn change_row(
             disabled: !exists,
             ..Default::default()
         };
-        if menu::item(ui, t, "Open File", open).clicked()
+        if menu::item(ui, t, tr("Open File"), open).clicked()
             && let Some(a) = &abs
             && let Err(e) = session.open_path(a)
         {
@@ -779,23 +797,23 @@ fn change_row(
         }
         menu::separator(ui, t);
         if staged {
-            if menu::button(ui, t, "Unstage Changes") {
+            if menu::button(ui, t, tr("Unstage Changes")) {
                 run(session, "git.unstage", path.clone());
             }
         } else {
-            if menu::button(ui, t, "Stage Changes") {
+            if menu::button(ui, t, tr("Stage Changes")) {
                 run(session, "git.stage", path.clone());
             }
-            if menu::button(ui, t, "Discard Changes") {
+            if menu::button(ui, t, tr("Discard Changes")) {
                 st.confirm_discard = Some((c.path.clone(), c.kind == ChangeKind::Untracked));
             }
         }
         if let Some(a) = &abs {
             menu::separator(ui, t);
             let reveal = if cfg!(windows) {
-                "Show in Explorer"
+                tr("Show in Explorer")
             } else {
-                "Reveal in Finder"
+                tr("Reveal in Finder")
             };
             if menu::button(ui, t, reveal) {
                 run(
@@ -853,16 +871,18 @@ fn dialogs(ctx: &egui::Context, t: &Tokens, session: &mut Session, st: &mut GitP
             .show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.label(
-                    RichText::new(format!("Discard the changes in “{path}”?"))
+                    RichText::new(trf!("Discard the changes in “{path}”?", path = path))
                         .font(semibold(14.0))
                         .color(t.form_label),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(if untracked {
-                        "The file is not in the repository yet: it will be moved to the Trash."
+                        tr("The file is not in the repository yet: it will be moved to the Trash.")
                     } else {
-                        "The file goes back to its last committed (or staged) version. This cannot be undone."
+                        tr(
+                            "The file goes back to its last committed (or staged) version. This cannot be undone.",
+                        )
                     })
                     .size(12.0)
                     .color(t.form_desc),
@@ -871,7 +891,10 @@ fn dialogs(ctx: &egui::Context, t: &Tokens, session: &mut Session, st: &mut GitP
                 match menu::dialog_buttons(
                     ui,
                     t,
-                    &[("Cancel", ButtonKind::Normal), ("Discard", ButtonKind::Default)],
+                    &[
+                        (tr("Cancel"), ButtonKind::Normal),
+                        (tr("Discard"), ButtonKind::Default),
+                    ],
                 ) {
                     Some(0) => close = true,
                     Some(_) => {
@@ -923,7 +946,7 @@ fn dialogs(ctx: &egui::Context, t: &Tokens, session: &mut Session, st: &mut GitP
                             });
                     });
                 ui.add_space(14.0);
-                if menu::dialog_buttons(ui, t, &[("Close", ButtonKind::Default)]).is_some() {
+                if menu::dialog_buttons(ui, t, &[(tr("Close"), ButtonKind::Default)]).is_some() {
                     close = true;
                 }
             });
