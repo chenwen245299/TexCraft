@@ -1679,3 +1679,43 @@ pub fn copy(p: &Painter, r: Rect, c: Color32) {
         w,
     ));
 }
+
+/// A gauge: a dial over a base line, its needle up to the right (the AI Assistant's turns and
+/// steps).
+pub fn gauge(p: &Painter, r: Rect, c: Color32) {
+    let w = s(c, 1.2 * unit(r));
+    // The dial: the circle of radius 6 through (2.5, 11) and (13.5, 11), over the top.
+    let center = (8.0f32, 11.0 - (36.0f32 - 5.5 * 5.5).sqrt());
+    let start = (11.0 - center.1).atan2(2.5 - center.0);
+    let end = (11.0 - center.1).atan2(13.5 - center.0) + std::f32::consts::TAU;
+    let n = 28;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let a = start + (end - start) * i as f32 / n as f32;
+            g(r, center.0 + 6.0 * a.cos(), center.1 + 6.0 * a.sin())
+        })
+        .collect();
+    p.add(Shape::line(pts, w));
+    p.line_segment([g(r, 8.0, 8.0), g(r, 11.0, 5.0)], w);
+    p.line_segment([g(r, 4.0, 11.0), g(r, 12.0, 11.0)], w);
+}
+
+/// A database: a cylinder of two discs (the AI Assistant's token count).
+pub fn database(p: &Painter, r: Rect, c: Color32) {
+    let w = s(c, 1.2 * unit(r));
+    let n = 24;
+    let arc = |cy: f32, from: f32, to: f32| -> Vec<Pos2> {
+        (0..=n)
+            .map(|i| {
+                let a = from + (to - from) * i as f32 / n as f32;
+                g(r, 8.0 + 5.0 * a.cos(), cy + 2.0 * a.sin())
+            })
+            .collect()
+    };
+    let pi = std::f32::consts::PI;
+    p.add(Shape::closed_line(arc(3.5, 0.0, 2.0 * pi), w));
+    p.line_segment([g(r, 3.0, 3.5), g(r, 3.0, 11.5)], w);
+    p.line_segment([g(r, 13.0, 3.5), g(r, 13.0, 11.5)], w);
+    p.add(Shape::line(arc(7.5, 0.0, pi), w));
+    p.add(Shape::line(arc(11.5, 0.0, pi), w));
+}

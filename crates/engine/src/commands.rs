@@ -1092,6 +1092,84 @@ static REGISTRY: &[CommandSpec] = &[
             Ok(())
         }
     ),
+    cmd!(
+        "ai.runAction",
+        "Run AI Action",
+        None,
+        0,
+        None,
+        |s| s.ai_actions_ready(),
+        |s, p| s.ai_run_action(param_str(p, "id")?),
+        params = "{id: string} — a right-click AI action (state.inspect ai.actions.list) on the \
+                  selection, else the paragraph at the caret"
+    ),
+    cmd!(
+        "ai.action.replace",
+        "Replace with the Rewrite",
+        None,
+        0,
+        None,
+        |s| s
+            .ai
+            .action
+            .as_ref()
+            .is_some_and(|r| r.output == texcraft_ai::actions::Output::Rewrite && r.is_ready()),
+        |s, _| s.ai_action_replace(),
+        params = "the right-click action's rewrite (state.inspect ai.actions.run) replaces the \
+                  text it ran on"
+    ),
+    cmd!(
+        "ai.action.copy",
+        "Copy Result",
+        None,
+        0,
+        None,
+        |s| s.ai.action.as_ref().is_some_and(|r| r.is_ready()),
+        |s, _| s.ai_action_copy()
+    ),
+    cmd!(
+        "ai.action.retry",
+        "Try Again",
+        None,
+        0,
+        None,
+        |s| s.ai.action.is_some(),
+        |s, _| s.ai_action_retry()
+    ),
+    cmd!(
+        "ai.action.dismiss",
+        "Discard Result",
+        None,
+        0,
+        None,
+        |s| s.ai.action.is_some(),
+        |s, _| {
+            s.ai_action_dismiss();
+            Ok(())
+        }
+    ),
+    cmd!(
+        "ai.action.toAssistant",
+        "Continue in Assistant",
+        None,
+        0,
+        None,
+        |s| s.ai.action.as_ref().is_some_and(|r| r.is_ready()),
+        |s, _| s.ai_action_to_assistant(),
+        params = "carries the right-click action's question and answer into the conversation"
+    ),
+    cmd!(
+        "ai.actionSettings",
+        "Edit AI Actions…",
+        None,
+        0,
+        None,
+        always,
+        |s, _| {
+            s.effect(Effect::AiActionSettings);
+            Ok(())
+        }
+    ),
     // ------------------------------------------------- Source Control (sidebar Git tab)
     cmd!("git.refresh", "Refresh", None, 0, None, always, |s, _| s
         .git_run(texcraft_git::Op::Refresh)),

@@ -13,9 +13,15 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Listed the project's files", "列出了项目文件"),
     ("Listed {folder}", "列出了 {folder}"),
     ("Read {file}", "读取了 {file}"),
-    ("Read {file}, lines {first}–{last}", "读取了 {file} 第 {first}–{last} 行"),
+    (
+        "Read {file}, lines {first}–{last}",
+        "读取了 {file} 第 {first}–{last} 行",
+    ),
     ("Searched for “{text}”", "搜索了“{text}”"),
-    ("Stopped after {n} rounds of reading files", "读取文件 {n} 轮后停止"),
+    (
+        "Stopped after {n} rounds of reading files",
+        "读取文件 {n} 轮后停止",
+    ),
     (
         "The model kept reading files without answering.",
         "模型一直在读取文件，没有给出回答。",
@@ -154,4 +160,44 @@ pub(super) const ENTRIES: super::Entries = &[
         "服务商返回了无法识别的回应",
     ),
     ("the provider sent no model list", "服务商没有返回模型列表"),
+    // The usage row and context meter under the question box (ai_panel.rs)
+    ("{n} turn", "{n} 轮"),
+    ("{n} turns", "{n} 轮"),
+    ("{n} step", "{n} 步"),
+    ("{n} steps", "{n} 步"),
+    (
+        "Turns: questions asked. Steps: requests to the model, including the rounds after it read project files. Tools called: {tools}.",
+        "轮：发送的问题；步：模型请求次数（含读取项目文件后的继续回答）。已调用 {tools} 次工具。",
+    ),
+    (
+        "Average output speed of the latest answer, including waiting and reasoning, excluding the time tools took.",
+        "最近一次回答的平均输出速度，含等待与思考，不含工具执行时间。",
+    ),
+    (
+        "What this conversation's requests used: {input} input and {output} output tokens.",
+        "本对话已记录请求的累计用量：输入 {input}、输出 {output} tokens。",
+    ),
+    ("Cache hit {n}%", "缓存命中 {n}%"),
+    (
+        "Cached input tokens out of all input tokens, weighted by usage. Shown only when every request reported its cache hits.",
+        "缓存命中输入 tokens / 总输入 tokens，按用量加权。仅在所有已记录请求都报告了缓存数据时显示。",
+    ),
+    (
+        "What the provider billed for this conversation: ${amount}.",
+        "服务商为本对话计费：${amount}。",
+    ),
+    ("Context window", "上下文窗口"),
+    ("{percent}% used", "已用 {percent}%"),
+    ("Remaining tokens", "剩余 token"),
+    ("System prompt and document", "系统提示与文档"),
+    ("Tool definitions", "工具定义"),
+    ("Conversation and tool results", "对话与工具结果"),
+    (
+        "The model's context length is not known; {n} tokens are assumed. Set it in Settings → AI.",
+        "模型未提供上下文长度，暂按 {n} tokens 估算。可在“设置 → AI”中填写。",
+    ),
+    (
+        "Images are estimated: what they take depends on how the model reads them.",
+        "图片的 token 用量为估算，实际用量取决于模型处理方式。",
+    ),
 ];

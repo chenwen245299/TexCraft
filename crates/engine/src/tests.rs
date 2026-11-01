@@ -880,7 +880,7 @@ fn source_control_stages_commits_and_discards() {
 
 /// A local OpenAI-compatible server that answers one request with `answer` (streamed) and
 /// returns the request it saw.
-fn fake_ai_server(answer: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+pub(crate) fn fake_ai_server(answer: &'static str) -> (u16, std::thread::JoinHandle<String>) {
     fake_ai_stream(serde_json::json!({ "content": answer }))
 }
 
@@ -1615,4 +1615,201 @@ fn an_opened_file_keeps_its_own_projects_pdf() {
     std::fs::write(&next_pdf, b"%PDF-1.5").unwrap();
     finish_with_pdf(&mut s, &main_b, &next_pdf, true);
     assert_eq!(s.pdf.path.as_deref(), Some(next_pdf.as_path()));
+}
+
+/// Ticks the way the UI does until no typeset runs, waits or is about to start (or a minute
+/// passes): the engine's own catch-up and settle passes included.
+fn until_idle(s: &mut Session) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        s.tick(Instant::now());
+        let busy = s.typeset.is_running()
+            || s.typeset.queued
+            || s.typeset.queued_live
+            || s.typeset.live_due.is_some();
+        if !busy || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A saved project with a table of contents and a section titled `title`, open in LIVE mode
+/// and typeset until idle. None when TeX is not installed.
+fn live_contents_project(name: &str) -> Option<(Session, PathBuf)> {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping: no TeX");
+        return None;
+    }
+    let main = temp_dir(name).join("main.tex");
+    std::fs::write(&main, contents_doc("Intro")).unwrap();
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    s.run("file.openPath", &json!({"path": main.to_string_lossy()}))
+        .unwrap();
+    until_idle(&mut s);
+    Some((s, main))
+}
+
+fn contents_doc(title: &str) -> String {
+    format!(
+        "\\documentclass{{article}}\n\\usepackage{{hyperref}}\n\\begin{{document}}\n\\tableofcontents\n\\section{{{title}}}\nBody text.\n\\end{{document}}\n"
+    )
+}
+
+/// The open documents' current text has been typeset, and the last pass's PDF is in the pane.
+fn assert_preview_current(s: &Session) {
+    assert!(!s.live_behind(), "an edit no pass typeset");
+    assert!(s.docs.iter().all(|d| d.revision == d.typeset_revision));
+    let o = s.typeset.last.as_ref().unwrap();
+    assert!(o.live && o.success, "{:?}", o.report.issues);
+    assert!(!o.read_back_changed, "the last pass settled the .aux/.toc");
+    assert_eq!(s.pdf.path, o.pdf);
+}
+
+#[test]
+fn the_live_preview_settles_its_table_of_contents() {
+    // One engine run shows the contents the previous run wrote: the pass after opening has
+    // none, and a renamed section kept its old title there. The engine runs another pass.
+    let Some((mut s, main)) = live_contents_project("live-settle") else {
+        return;
+    };
+    let live_toc = main.parent().unwrap().join(".texcraft/live/main.toc");
+    assert!(s.typeset.runs >= 2, "the pass after opening is settled");
+    assert_preview_current(&s);
+    s.run("edit.setText", &json!({"text": contents_doc("Renamed")}))
+        .unwrap();
+    let runs = s.typeset.runs;
+    until_idle(&mut s);
+    assert_eq!(s.typeset.runs, runs + 2, "the edit's pass, one to settle");
+    assert_eq!(s.typeset.settle_passes, 1);
+    assert_preview_current(&s);
+    let toc = std::fs::read_to_string(&live_toc).unwrap();
+    assert!(toc.contains("Renamed"));
+    // Body text that moves no label or heading costs one pass, as before.
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Renamed").replace("Body text.", "Body text, longer.")}),
+    )
+    .unwrap();
+    let runs = s.typeset.runs;
+    until_idle(&mut s);
+    assert_eq!(s.typeset.runs, runs + 1);
+    assert_preview_current(&s);
+    assert_eq!(s.typeset.catch_ups, 0, "nothing was missed");
+}
+
+#[test]
+fn a_corrected_heading_reaches_the_pdf_after_a_half_typed_one() {
+    // The reported failure: `\section{file_name}` (half-typed: errors, the last good PDF stays)
+    // corrected to `\section{file\_name}`. That pass reads the contents file the half-typed
+    // one wrote and fails too, so the last good PDF ("Intro") stayed up with typing over.
+    let Some((mut s, _)) = live_contents_project("live-corrected") else {
+        return;
+    };
+    let generation = s.pdf.generation;
+    s.run("edit.setText", &json!({"text": contents_doc("file_name")}))
+        .unwrap();
+    until_idle(&mut s);
+    assert!(s.issue_counts().0 > 0);
+    assert_eq!(s.pdf.generation, generation, "the last good PDF stays up");
+    let corrected = contents_doc("file\\_name");
+    s.run("edit.setText", &json!({ "text": corrected }))
+        .unwrap();
+    until_idle(&mut s);
+    assert!(s.pdf.generation > generation, "the fix reached the PDF");
+    assert_eq!(s.issue_counts().0, 0);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn an_edit_that_asked_for_no_pass_is_typeset_when_idle() {
+    // Revert to Saved changes the text without asking for a pass; the engine notices.
+    let Some((mut s, _)) = live_contents_project("live-revert") else {
+        return;
+    };
+    s.run("edit.setText", &json!({"text": contents_doc("Edited")}))
+        .unwrap();
+    until_idle(&mut s);
+    let runs = s.typeset.runs;
+    s.run("file.revert", &Value::Null).unwrap();
+    assert!(s.live_behind());
+    until_idle(&mut s);
+    assert!(s.typeset.runs > runs);
+    assert_eq!(s.typeset.catch_ups, 1);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn a_live_pass_that_gave_way_to_an_unsaving_typeset_is_caught_up() {
+    // ⌘T during a live pass with "save before typesetting" off: the full typeset shows the
+    // saved file, so the unsaved edit the stopped live pass carried is typeset afterwards.
+    let Some((mut s, _)) = live_contents_project("live-gave-way") else {
+        return;
+    };
+    s.settings.save_before_typeset = false;
+    s.run("edit.setText", &json!({"text": contents_doc("Unsaved")}))
+        .unwrap();
+    s.tick(Instant::now());
+    assert!(s.typeset.live_job && s.typeset.is_running());
+    s.typeset().unwrap();
+    let mut full_done = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        s.tick(Instant::now());
+        full_done |= s.typeset.last.as_ref().is_some_and(|o| !o.live);
+        if full_done && !s.typeset.is_running() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    until_idle(&mut s);
+    assert!(full_done, "the full typeset ran");
+    assert_eq!(s.typeset.catch_ups, 1);
+    assert_preview_current(&s);
+    assert!(s.doc().unwrap().is_dirty(), "nothing was saved");
+}
+
+#[test]
+fn a_stopped_live_pass_waits_for_the_next_edit() {
+    let Some((mut s, _)) = live_contents_project("live-stopped") else {
+        return;
+    };
+    s.run("edit.setText", &json!({"text": contents_doc("Stopped")}))
+        .unwrap();
+    s.tick(Instant::now());
+    assert!(s.typeset.is_running());
+    s.stop_typeset();
+    until_idle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().cancelled);
+    assert!(s.live_behind(), "the stopped text is not typeset…");
+    assert_eq!(s.typeset.catch_ups, 0, "…and not started again by itself");
+    s.run("edit.setText", &json!({"text": contents_doc("Typed on")}))
+        .unwrap();
+    until_idle(&mut s);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn a_live_pass_that_cannot_start_is_not_retried_every_frame() {
+    // A chapter whose root does not exist: the pass fails to start, and the check that keeps
+    // the preview current must not start it again on every frame.
+    let mut s = session();
+    let chapter = temp_dir("live-noroot").join("chapter.tex");
+    std::fs::write(&chapter, "% !TEX root = missing.tex\nText.\n").unwrap();
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    s.run("file.openPath", &json!({"path": chapter.to_string_lossy()}))
+        .unwrap();
+    s.run(
+        "edit.setText",
+        &json!({"text": "% !TEX root = missing.tex\nMore text.\n"}),
+    )
+    .unwrap();
+    for _ in 0..50 {
+        s.tick(Instant::now());
+    }
+    assert!(!s.typeset.is_running());
+    assert!(s.live_behind());
+    assert_eq!(s.typeset.catch_ups, 0);
+    assert!(s.status.is_some(), "the failure was reported");
 }

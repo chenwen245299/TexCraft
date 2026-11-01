@@ -130,6 +130,11 @@ pub struct Tokens {
     pub warning: Color32,
     /// Success green.
     pub success: Color32,
+    /// The AI Assistant's context meter: the system prompt's share (Argus's purple), the tools'
+    /// (orange) and the conversation's (green).
+    pub context_system: Color32,
+    pub context_tools: Color32,
+    pub context_messages: Color32,
     /// Editor background.
     pub editor_bg: Color32,
     /// Editor plain text.
@@ -270,6 +275,9 @@ impl Tokens {
             error: hex(0xE0393E),
             warning: hex(0xE8A317),
             success: hex(0x41B862),
+            context_system: hex(0xA855F7),
+            context_tools: hex(0xF59E0B),
+            context_messages: hex(0x22C55E),
             editor_bg: hex(0xFFFFFF),
             editor_text: hex(0x000000),
             syn_command: hex(0x0E6FD0),
@@ -361,6 +369,9 @@ impl Tokens {
             error: hex(0xFF5F57),
             warning: hex(0xF5B83D),
             success: hex(0x6CC24A),
+            context_system: hex(0xA855F7),
+            context_tools: hex(0xF59E0B),
+            context_messages: hex(0x22C55E),
             editor_bg: hex(0x2E2E2E),
             editor_text: hex(0xB4B4B4),
             syn_command: hex(0x00A0BE),

@@ -161,6 +161,62 @@ pub fn write_root(req: &LiveRequest, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Extensions of the files a pass writes and the next pass reads back: labels and citations,
+/// contents, lists of figures, tables, algorithms and listings, hyperref's bookmarks, beamer's
+/// navigation.
+const READ_BACK: &[&str] = &[
+    "aux", "toc", "lof", "lot", "loa", "lol", "out", "nav", "snm",
+];
+
+/// Larger files are not compared (none of these gets near it).
+const READ_BACK_MAX: u64 = 8 << 20;
+
+/// What the files a pass reads back from the previous one (see [`READ_BACK`]) contain: their
+/// paths and content hashes, in the folder the engine runs in (`cwd`) and in the project's
+/// folders (`\include`d files write their `.aux` there). A pass that changes it typesets
+/// differently when run again over the same text: a single live pass leaves the contents,
+/// references and outline one edit behind, and a pass reading files a half-typed edit broke
+/// fails even though the text is fine now.
+pub fn read_back_state(req: &LiveRequest, cwd: &Path) -> Vec<(PathBuf, u64)> {
+    let live = req.live_dir();
+    let mut folders = vec![cwd.to_path_buf()];
+    folders.extend(
+        req.dirs
+            .iter()
+            .filter(|d| is_safe_rel(d))
+            .map(|d| live.join(d)),
+    );
+    folders.sort();
+    folders.dedup();
+    let mut state = Vec::new();
+    for folder in folders {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let read_back = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| READ_BACK.contains(&e));
+            if !read_back
+                || !entry
+                    .metadata()
+                    .is_ok_and(|m| m.is_file() && m.len() <= READ_BACK_MAX)
+            {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                let mut h = DefaultHasher::new();
+                bytes.hash(&mut h);
+                state.push((path, h.finish()));
+            }
+        }
+    }
+    state.sort();
+    state
+}
+
 /// The root as XeTeX reads it with a precompiled preamble. XeTeX cannot store system (OpenType)
 /// fonts in a format, and LaTeX selects one as soon as the class sets the type size. So, on the
 /// root's first line (line numbers stay put), the preamble is read with TFM fonts (OT1) and,
@@ -480,6 +536,17 @@ pub fn missing_files(log: &str) -> Vec<String> {
                 .map(str::to_string)
         } else if l.contains("Fatal format file error") || l.contains("kpathsea: Running mktex") {
             Some("<environment>".to_string())
+        } else if l.contains("pdfTeX error") {
+            // The PDF backend could not read a font, encoding or image file (`(file
+            // cmti10.pfb): cannot open Type 1 font file for reading`): fatal, and never caused
+            // by the document's markup. The fast environment only holds the files the last
+            // normal pass used, so a font the document starts using fails here.
+            Some(
+                l.split_once("(file ")
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .map_or("<pdftex>", |(name, _)| name)
+                    .to_string(),
+            )
         } else {
             None
         };
@@ -1041,6 +1108,13 @@ mod tests {
             vec!["nosuch.sty", "chap9", "wasy10", "eufm10"]
         );
         assert!(missing_files("No file main.toc.\nOutput written on x.pdf").is_empty());
+        // A fast pass that meets a Type 1 font the farm does not hold (real pdfTeX 1.40.27 log).
+        let log = "!pdfTeX error: /Library/TeX/texbin/pdflatex (file cmti10.pfb): cannot open Type 1 font file for reading\n ==> Fatal error occurred, no output PDF file produced!\n";
+        assert_eq!(missing_files(log), vec!["cmti10.pfb"]);
+        assert_eq!(
+            missing_files("!pdfTeX error: pdflatex: something else\n"),
+            vec!["<pdftex>"]
+        );
     }
 
     #[test]

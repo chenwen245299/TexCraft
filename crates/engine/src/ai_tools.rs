@@ -418,7 +418,7 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn project(name: &str) -> (Session, PathBuf) {
+    pub(crate) fn project(name: &str) -> (Session, PathBuf) {
         let dir = std::env::temp_dir().join(format!("texcraft-ai-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sections")).unwrap();

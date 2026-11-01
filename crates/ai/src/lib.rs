@@ -8,11 +8,14 @@
 //! on the command line where other processes could read them. Answers stream back as
 //! server-sent events, parsed here into [`Event`]s on a background thread ([`Job`]).
 
+pub mod actions;
 pub mod commit;
 pub mod inline;
 pub mod models;
+pub mod usage;
 
 pub use models::{Capability, Model};
+pub use usage::Usage;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -262,6 +265,8 @@ pub struct Config {
     pub include_document: bool,
     /// Inline suggestions in the editor.
     pub inline: inline::InlineSettings,
+    /// The editor's right-click AI actions, in menu order.
+    pub actions: Vec<actions::Action>,
 }
 
 impl Default for Config {
@@ -272,6 +277,7 @@ impl Default for Config {
             model: String::new(),
             include_document: true,
             inline: inline::InlineSettings::default(),
+            actions: actions::defaults(),
         }
     }
 }
@@ -370,6 +376,7 @@ impl Config {
             self.provider = p;
             self.model = m;
         }
+        actions::normalize(&mut self.actions);
     }
 }
 
@@ -872,7 +879,13 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
             if !key.is_empty() {
                 headers.push(format!("authorization: Bearer {key}"));
             }
-            let mut body = json!({ "model": req.model, "stream": true, "messages": messages });
+            // `include_usage`: the last chunk says what the request used (tokens, cache hits).
+            let mut body = json!({ "model": req.model, "stream": true, "messages": messages,
+                "stream_options": { "include_usage": true } });
+            if base.to_ascii_lowercase().contains("openrouter") {
+                // OpenRouter adds what it billed.
+                body["usage"] = json!({ "include": true });
+            }
             if !req.tools.is_empty() {
                 body["tools"] = req
                     .tools
@@ -930,6 +943,9 @@ pub enum Event {
     Thinking,
     /// A declined request was handed to another model (`from` → `to`).
     Fallback(String),
+    /// What the request used, as the provider reported it: sent once, just before the final
+    /// event, when the provider reported anything.
+    Usage(Usage),
     /// Finished: the full Anthropic content blocks (empty for other providers).
     Done {
         /// Content blocks to send back with the next request.
@@ -965,6 +981,8 @@ pub struct SseParser {
     reasoning: String,
     /// The JSON input of the Anthropic tool-use block being streamed.
     partial: String,
+    /// What the request used, once the provider said.
+    usage: Option<Usage>,
 }
 
 impl SseParser {
@@ -1008,6 +1026,9 @@ impl SseParser {
                     .pointer("/message/model")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                if let Some(u) = v.pointer("/message/usage").filter(|u| u.is_object()) {
+                    self.usage.get_or_insert_default().merge_anthropic(u);
+                }
                 Vec::new()
             }
             "content_block_start" => {
@@ -1109,6 +1130,9 @@ impl SseParser {
                 {
                     self.refusal_category = Some(c.to_string());
                 }
+                if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                    self.usage.get_or_insert_default().merge_anthropic(u);
+                }
                 Vec::new()
             }
             "message_stop" => {
@@ -1136,6 +1160,10 @@ impl SseParser {
         }
         if self.model.is_none() {
             self.model = v.get("model").and_then(Value::as_str).map(str::to_string);
+        }
+        // The last chunk's (some servers send running totals on every chunk).
+        if let Some(u) = v.get("usage").and_then(Usage::from_openai) {
+            self.usage = Some(u);
         }
         let mut out = Vec::new();
         if let Some(choice) = v.pointer("/choices/0") {
@@ -1190,6 +1218,11 @@ impl SseParser {
             }
         }
         out
+    }
+
+    /// What the request used, when the provider reported it.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
     }
 
     /// The final event once the stream ended (curl exited with `status_ok`).
@@ -1486,6 +1519,9 @@ pub fn start(req: &ChatRequest, waker: Arc<dyn Fn() + Send + Sync>) -> Job {
                 let _ = std::fs::remove_file(p);
             }
             let ok = status.is_some_and(|s| s.success());
+            if let Some(u) = parser.usage() {
+                send(&tx, Event::Usage(u));
+            }
             let mut last = parser.finish(ok);
             if let Event::Failed(m) = &mut last
                 && parser.other.trim().is_empty()
@@ -1693,6 +1729,37 @@ mod tests {
         assert!(headers.contains(&"authorization: Bearer sk-test".to_string()));
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "Q");
+        // The last chunk says what the request used.
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body.get("usage").is_none());
+        let mut or = req.clone();
+        or.provider.base_url = "https://openrouter.ai/api/v1".into();
+        assert_eq!(
+            build(&or).2["usage"]["include"],
+            true,
+            "and OpenRouter the bill"
+        );
+    }
+
+    /// OpenAI-style usage arrives in a last chunk without choices; no usage, no figure.
+    #[test]
+    fn parses_openai_usage() {
+        let mut p = SseParser::new(Kind::OpenAi);
+        p.line(r#"data: {"choices":[{"delta":{"content":"Hi"}}],"usage":null}"#);
+        assert_eq!(p.usage(), None);
+        p.line(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        p.line(r#"data: {"choices":[],"usage":{"prompt_tokens":800,"completion_tokens":20,"prompt_cache_hit_tokens":768}}"#);
+        p.line("data: [DONE]");
+        assert_eq!(
+            p.usage(),
+            Some(Usage {
+                input: 800,
+                output: 20,
+                cache_hit: Some(768),
+                cost_usd: None
+            })
+        );
+        assert!(matches!(p.finish(true), Event::Done { .. }));
     }
 
     #[test]
@@ -1972,14 +2039,14 @@ mod tests {
         let mut thinking = false;
         for line in [
             "event: message_start",
-            r#"data: {"type":"message_start","message":{"model":"claude-opus-5-5"}}"#,
+            r#"data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":12,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
             r#"data: {"type":"content_block_stop","index":0}"#,
             r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
             r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Use "}}"#,
             r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"\\begin{table}"}}"#,
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":57}}"#,
             r#"data: {"type":"message_stop"}"#,
         ] {
             for e in p.line(line) {
@@ -1992,6 +2059,15 @@ mod tests {
         }
         assert_eq!(text, "Use \\begin{table}");
         assert!(thinking);
+        assert_eq!(
+            p.usage(),
+            Some(Usage {
+                input: 2012,
+                output: 57,
+                cache_hit: Some(2000),
+                cost_usd: None
+            })
+        );
         match p.finish(true) {
             Event::Done { blocks, model, .. } => {
                 assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
@@ -2045,6 +2121,40 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         assert_eq!(Config::load(&path), c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The right-click actions: every built-in in a new or older `ai.json`, the user's own
+    /// actions, names and prompts kept, and an emptied list stays empty.
+    #[test]
+    fn config_keeps_the_right_click_actions() {
+        let dir = std::env::temp_dir().join(format!("texcraft-ai-act-{}", std::process::id()));
+        let path = dir.join("ai.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(Config::load(&path).actions, actions::defaults());
+        let old: Config = serde_json::from_str(r#"{"include_document": false}"#).unwrap();
+        assert_eq!(old.actions, actions::defaults());
+        let mut c = Config::default();
+        c.actions[0].prompt = "Polish it my way.".into();
+        c.actions.retain(|a| a.id != "explain");
+        c.actions.push(actions::Action {
+            id: actions::new_id(&c.actions),
+            name: "Summarise".into(),
+            prompt: "Summarise this in one sentence.".into(),
+            output: actions::Output::Answer,
+        });
+        c.save(&path).unwrap();
+        let back = Config::load(&path);
+        assert_eq!(back, c);
+        assert_eq!(back.actions[0].prompt(), "Polish it my way.");
+        assert!(back.actions.iter().all(|a| a.id != "explain"));
+        assert_eq!(
+            back.actions.last().map(|a| a.label()).as_deref(),
+            Some("Summarise")
+        );
+        c.actions.clear();
+        c.save(&path).unwrap();
+        assert!(Config::load(&path).actions.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

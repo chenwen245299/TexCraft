@@ -872,3 +872,175 @@ the welcome-window and update-window bugs; what landed:
   by 6° with its folded corner and Σ, and the key in front of its corner holding a sparkle
   where the icon has the backslash; one ink like the other toolbar glyphs (the earlier red
   sparkle on a tile read as a dot). Checked by eye in light and dark, open and closed.
+
+## Return over a selection replaces it (2026-11-01)
+
+- Return with text selected (dragged with the mouse, or ⇧-arrows) did nothing: `smart_return`
+  consumes the key before the text widget sees it and gave up on a non-empty selection. It now
+  removes the selection first and then does its usual work from the selection's start (line
+  indent, `\item`, auto `\end{env}`), so the selection becomes the line break, as typing over it
+  does. ⌘Z restores it in one step (egui's undoer, as for plain Return).
+- Test `return_replaces_the_selection` (backwards selection on one line, across lines, then a
+  plain Return), failing before the fix. Dev app: a real pointer drag over a word and a
+  right-to-left drag across two lines, then Return and ⌘Z, read back over the control channel.
+- Not checked by screenshot: `ui.screenshot` timed out (the window was off screen); the text and
+  selection were read back instead.
+
+## Assistant header lines up with the PDF header (2026-11-01)
+
+- The Assistant panel's header row was 32 pt; the PDF, editor and sidebar header bars beside it
+  are `HEADER_HEIGHT` (26.5 pt), so its divider sat 5.5 pt lower and its icons off the PDF
+  header's centre line. It now uses `HEADER_HEIGHT`: one divider across the window.
+- Test `assistant_header_lines_up_with_the_pdf_header` (the two dividers' y from the drawn
+  shapes; 84 vs 78.5 before). Dev app screenshots in English and Chinese.
+- Open: on a narrow window (880 pt, Assistant open) the editor and PDF panes are ~140 pt wide and
+  their header glyphs overlap; the headers don't drop items when short of room.
+
+## Assistant model menu hugs the model name (2026-11-01)
+
+- The header's model menu stretched from the logo to the history button, leaving the up/down
+  chevron far from the name. It is now as wide as the name + 24 pt (the chevron 7 pt after
+  it), at most `MODEL_MENU_MAX` (240 pt) or the room before the history button; longer names are
+  elided.
+- Test `model_menu_hugs_the_model_name` (short name under 80 pt, long name at the cap). Dev app
+  screenshots in English and Chinese with a configured model.
+
+## LIVE mode: the PDF catches up with the source, every time (2026-11-01)
+
+- Report: in LIVE mode the PDF sometimes stayed on an older version of the text. Two causes,
+  both reproduced in the dev app:
+  - **A font new to the fast environment froze the preview for good.** Fast pdfTeX passes only
+    see the font files the last normal pass used. The first `\textit`/`\textbf`/`\texttt` (or a
+    heading's bold in the contents) after that made pdfTeX stop with `(file cmti10.pfb): cannot
+    open Type 1 font file for reading`, no PDF. That message was not taken for "the fast
+    environment lacks something", so no normal pass rebuilt it: every later pass failed the same
+    way, the last good PDF stayed up, and the farm lives in `.texcraft/live`, so restarting did
+    not help. `live::missing_files` now reads pdfTeX backend errors: the pass falls back to a
+    normal one, which rebuilds the farm (next pass fast again, 47 ms).
+  - **Live passes read the previous pass's `.aux`/`.toc`/`.out`, and nothing ran after typing
+    stopped.** `\section{file_name}` (half-typed: errors, last good PDF kept) corrected to
+    `file\_name`: that pass read the broken `.toc`, failed with 4 errors, the pane stayed on
+    "Intro Renamed" and no further pass ran. Milder form: a renamed section kept its old title
+    in the contents until the next edit, and the contents were empty after opening.
+- The engine now keeps the promise itself (`crates/engine/src/live.rs`): each document records
+  the revision a finished pass typeset (`typeset_revision`); whenever nothing runs or waits, text
+  no pass typeset gets a catch-up pass (not when that exact text just failed or was stopped: the
+  next edit tries again), and a pass that changed the files the next one reads back
+  (`Outcome::read_back_changed`: `.aux .toc .lof .lot .loa .lol .out .nav .snm`, `\include`
+  folders too; content hashes, not mtimes) is followed by passes over the same text until they
+  settle (at most 3). This also covers Revert to Saved (asked for no pass) and a live pass that
+  gave way to ⌘T with "save before typesetting" off (the full typeset shows the saved file).
+  Body edits that move no label or heading still cost one pass. `state.inspect` typeset:
+  `behind`, `unsettled`, `settlePasses`, `catchUps`.
+- Tests: typeset `live_passes_report_when_the_files_they_read_back_changed`,
+  `a_font_new_to_the_fast_environment_falls_back_to_a_normal_pass` (real pdfLaTeX), the real
+  log line in `missing_names_from_logs`; engine `the_live_preview_settles_its_table_of_contents`,
+  `a_corrected_heading_reaches_the_pdf_after_a_half_typed_one`,
+  `an_edit_that_asked_for_no_pass_is_typeset_when_idle`,
+  `a_live_pass_that_gave_way_to_an_unsaving_typeset_is_caught_up`,
+  `a_stopped_live_pass_waits_for_the_next_edit`,
+  `a_live_pass_that_cannot_start_is_not_retried_every_frame`. All but the last two fail without
+  the fix (those two guard against retry loops).
+- Dev app (HEAD + this change): both sequences end with the pane on the current text (text read
+  back from the viewer's own selection, not the file); a project whose farm was already stuck
+  recovered on its next edit; 50 rapid edits through half-typed `\textbf{`, `$x_`, `file\_` end
+  with the PDF and its contents current, 0 errors, nothing behind.
+- Open: with a genuine error the pane still shows the last clean PDF (setting "Keep the last good
+  preview"), with nothing in the pane saying it is older than the text; AUTO mode is not covered
+  by the check; switching tabs to another project's file still leaves the PDF as it was.
+
+## Assistant usage row and context meter under the question box (2026-11-01)
+
+- What Argus (`~/My_App_UI/Argus`: `ChatRunStats.vue`, `ChatConversationCost.vue`,
+  `ContextMeter.vue`, `utils/chatRunStats.ts`, `src-tauri/src/chat_context.rs`) shows under its
+  question box, counted the same way: turns (questions) and steps (requests, tool rounds
+  included), the latest answer's speed (output tokens / model time, tools excluded), the tokens
+  the conversation used, the cache hit rate (weighted; shown only when every measured request
+  reported its cache), the cost (only when every measured answer was billed), and a ring with the
+  share of the model's context window in use. Hovering the ring opens Argus's breakdown: used /
+  window, a purple/orange/green bar, remaining, system prompt and document, tool definitions,
+  conversation and tool results; it stays 180 ms after the pointer leaves, Esc or a click
+  elsewhere closes it. Each figure has Argus's explanation as a tooltip.
+- `texcraft_ai::usage`: `Usage` from Anthropic's `message_start`/`message_delta` (cache reads and
+  writes counted in the prompt) and the OpenAI-style last chunk (`prompt_cache_hit_tokens`,
+  `prompt_tokens_details.cached_tokens` or `cached_tokens`; `cost`); OpenAI-compatible requests
+  ask for it with `stream_options.include_usage` (OpenRouter also `usage.include`). New
+  `Event::Usage`, sent once before the final event. Argus's estimate (`estimate_text`: a wide
+  character a token, four ASCII ones a token; 2,048 an image) for a whole `ChatRequest`.
+- Engine `ai_usage`: a `RunUsage` per answer (calls, tool calls, tokens, cache, billed cost, model
+  ms), saved with the conversation (`runs`, `sample` in the chat file; older files read as none);
+  `ai_stats()`; `ai_context()` (cached per what it depends on, measured from the request in
+  flight, else the next question's with the draft), calibrated by the prompt the provider last
+  counted for the same model (`used = counted + estimate now − estimate then`), window from the
+  model's context length, else 256,000 assumed (marked `~`, tooltip says where to set it).
+  `ai_send` split into `ai_prompt()` / `ai_turns()` so the meter measures the request that will
+  be sent. `state.inspect` → `ai.stats`, `ai.context`, `ai.runs`.
+- Narrow panel: the figures leave as Argus's container queries drop them (speed, cache, turns and
+  steps, tokens), then the cost; the ring stays by the send button. The document chip is capped
+  at 160 pt and elided before it would reach the ring. At the 300 pt minimum with `main.tex`,
+  tokens and cost still fit (as in Argus); with a long file name only the ring is left.
+- Tests: ai `usage::*`, `parses_anthropic_streams`, `parses_openai_usage`, `builds_openai_requests`;
+  engine `runs_add_up_their_requests`, `statistics_count_turns_steps_tokens_cache_cost_and_speed`,
+  `context_is_calibrated_by_the_measured_prompt`, `a_conversation_counts_its_steps_tokens_and_context`
+  (fake model: tool round + follow-up, then a new conversation), chat store round trip of the
+  usage; ui `the_row_gives_way_and_keeps_the_context_meter` (760 → 160 pt in 20 pt steps, en and
+  zh-Hans: drop order, no overlaps, ring always there), `the_meter_opens_its_breakdown_on_hover`,
+  `numbers_read_like_argus`.
+- Dev app (isolated instance, a local fake OpenAI-compatible model with usage, cache and cost):
+  760 / 400 / 300 pt in English and Chinese, popover in both; usage survives a restart.
+- Open: clicking the ring compacts the context in Argus; TexCraft has no compaction yet, so the
+  click does nothing. Cost shows only for providers that bill in the stream (OpenRouter), in US
+  dollars: models have no prices in Settings → AI yet. Per-answer figures under each answer
+  (Argus's `↑297.3k ↓824 … ≈¥0.605`) are not drawn, though `ai.runs` has them. In split view the
+  PDF/editor's floating scroll bar sits on the Assistant divider's grab strip (a drag from the
+  very edge moved the scroll bar, not the divider).
+
+## Right-click AI actions: a submenu, a result card, prompts in Settings (2026-11-01)
+
+- The editor's right-click menu has an **AI** row (between Comment / Uncomment and Show Position
+  in PDF) opening a submenu: Polish, Grammar Check, Shorten, Translate to English, Explain, then
+  Edit AI Actions… (and AI Settings… while no model is set up; the actions are greyed out then).
+  The submenu opens over its row, flips left when the right has no room, and stays open while
+  the pointer crosses the menu's margin or other rows on its way to it (`menu::submenu_item`).
+- An action works on the selection, or, with nothing selected, on the paragraph at the caret
+  (the lines between blank lines, without the heading or `\begin`/`\end` lines next to it;
+  `ai_actions::paragraph_at`), which it selects. As macOS Writing Tools and Notion AI do it (the
+  user asked for that over answering in the Assistant panel), the answer streams into a card
+  floating under the text (`ui::ai_card`): a rewrite shows its changes word by word (added on a
+  green tint, removed struck through in red; `actions::word_diff`, an LCS capped at 1M cells)
+  and the model's note, with Discard / Try Again / Copy / Replace; Explain shows the answer with
+  Continue in Assistant, which carries the question and answer into the conversation. Replace
+  finds the text where it moved if the user edited above it, puts the rewrite in, selects it;
+  ⌘Z undoes it, ⇧⌘Z redoes.
+- One request per action (`ai_actions::ActionRun`, its own `Job`, polled by `tick_ai_action`):
+  the Assistant's system prompt with the open document, the action's prompt and the passage in a
+  `latex` block (fence longer than any backtick run in it), no tools, no conversation. Rewrites
+  get a system addition asking for the whole passage in one block; a zh-Hans interface adds
+  "write explanations in Simplified Chinese". Prompts sent to the model stay English.
+- Settings → AI has tabs, Providers | Actions (`ui.prefs {aiTab: 1}`): the list (+ adds a new
+  action or a removed built-in, −, move up/down), name, prompt (a multi-line field), "Offer to
+  replace the text with the answer", Restore Default Prompt. Actions live in `ai.json`
+  (`Config::actions`); a built-in's name and prompt are stored empty while unchanged, so they
+  follow the interface language and later default prompts. An `ai.json` from before has them all.
+- Commands: `ai.runAction {id}`, `ai.action.replace`, `ai.action.copy`, `ai.action.retry`,
+  `ai.action.dismiss`, `ai.action.toAssistant`, `ai.actionSettings`; `state.inspect` →
+  `ai.actions` (`ready`, `list`, `run`).
+- Fixed on the way: a button outside the editor that sends the caret to it (the card's Replace,
+  but also outline entries) left the editor without keyboard focus, so ⌘Z after it did nothing:
+  egui drops a widget's focus the frame a click lands outside it, the same frame the button asked
+  for it. The editor asks again the next frame (`a_click_elsewhere_that_asks_for_the_editor_
+  leaves_it_the_keys`, fails without the fix).
+- Tests: ai `actions::*` (defaults translated, own names/prompts and restoring them, ids, the
+  message's fence, the system addition, `split_reply` incl. streaming, `word_diff`),
+  `config_keeps_the_right_click_actions` (round trip, older file, emptied list); engine
+  `ai_actions::*` (paragraph at the caret, locating moved text, no model / no text / no prompt,
+  a fake model: rewrite on the paragraph replaced after edits above it, Try Again / Discard /
+  failure, Explain in Chinese carried into the Assistant); ui `right_click_ai_submenu_runs_an_
+  action` (menu → AI row → submenu beside it, margin keeps it, another row closes it, Polish runs,
+  the card shows, its Replace replaces), the focus test above.
+- Dev app (isolated instance, a local fake OpenAI-compatible model): menu and submenu, card with
+  marked changes, Replace then ⌘Z / ⇧⌘Z, Settings → AI → Actions with an edited prompt surviving a
+  restart and Restore Default Prompt; English (light) and Chinese (dark).
+- Open: the card is plain text (no Markdown rendering for Explain's answer); one result at a time
+  (a new action replaces it); actions have no shortcuts; the card's Try Again gives one answer at
+  a time (no ‹ › through earlier ones as Writing Tools has).

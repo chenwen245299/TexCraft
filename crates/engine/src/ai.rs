@@ -3,13 +3,15 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use texcraft_ai::{
-    ChatRequest, Config, Event, Image, Job, KeyStore, Model, Role, ToolResult, Turn,
+    ChatRequest, Config, Event, Image, Job, KeyStore, Model, Role, Tool, ToolResult, Turn, Usage,
 };
 use texcraft_i18n::{tr, trf};
 
 use crate::ai_tools::{self, ToolUse};
+use crate::ai_usage::{ChatUsage, ContextUsage, PromptSample, RunUsage};
 use crate::chats::{self, ChatStore, ChatSummary};
 use crate::{CommandError, Effect, Session, edit};
 
@@ -84,10 +86,16 @@ pub struct AiState {
     pub chat_id: Option<String>,
     /// The current project's saved conversations, the latest first.
     pub history: Vec<ChatSummary>,
+    /// The right-click AI action running or showing its result (the editor's result card).
+    pub action: Option<crate::ai_actions::ActionRun>,
     /// The project folder the conversation belongs to (canonical; `None`: none).
     chat_project: Option<PathBuf>,
     /// The folder last seen (`None`: not looked yet), to notice another project opening.
     chat_seen: Option<Option<PathBuf>>,
+    /// What the conversation used (its answers' requests), saved with it.
+    pub usage: ChatUsage,
+    /// The last context measured, and what it depended on (see `Session::ai_context`).
+    pub(crate) context_cache: Option<(u64, Option<ContextUsage>)>,
 }
 
 /// An answer in rounds: the model calls tools, gets their answers and goes on.
@@ -99,6 +107,33 @@ struct Round {
     text: String,
     /// The system prompt without the tools (for asking again without them).
     plain_system: String,
+    /// The answer's entry in `usage.runs`.
+    run: usize,
+    /// When the request in flight was sent.
+    started: Instant,
+    /// Its estimated size (to calibrate the context meter with what the provider counts).
+    estimate: u64,
+}
+
+impl Round {
+    fn new(req: ChatRequest, plain_system: String, run: usize) -> Self {
+        let estimate = texcraft_ai::usage::estimate(&req).total();
+        Self {
+            req,
+            n: 0,
+            text: String::new(),
+            plain_system,
+            run,
+            started: Instant::now(),
+            estimate,
+        }
+    }
+
+    /// The request was sent again (grown, or changed): its time and size start afresh.
+    fn restart(&mut self) {
+        self.started = Instant::now();
+        self.estimate = texcraft_ai::usage::estimate(&self.req).total();
+    }
 }
 
 /// The most rounds of tool calls one answer may take.
@@ -112,6 +147,47 @@ impl AiState {
     /// A request is running.
     pub fn is_busy(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// The request being answered.
+    pub(crate) fn round_request(&self) -> Option<&ChatRequest> {
+        self.job.as_ref().and(self.round.as_ref()).map(|r| &r.req)
+    }
+
+    /// The request in flight ended (`tool_calls`: the tools it called that will run): one more
+    /// step, and its time with the model when it ran to the end (`timed`).
+    fn end_request(&mut self, tool_calls: usize, timed: bool) {
+        let Some(round) = self.round.as_ref() else {
+            return;
+        };
+        let ms = u64::try_from(round.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(run) = self.usage.runs.get_mut(round.run) {
+            run.calls = run.calls.saturating_add(1);
+            run.tool_calls = run
+                .tool_calls
+                .saturating_add(u32::try_from(tool_calls).unwrap_or(u32::MAX));
+            if timed {
+                run.model_ms = run.model_ms.saturating_add(ms);
+            }
+        }
+    }
+
+    /// The provider reported what the request in flight used.
+    fn record_usage(&mut self, u: &Usage) {
+        let Some(round) = self.round.as_ref() else {
+            return;
+        };
+        if let Some(run) = self.usage.runs.get_mut(round.run) {
+            run.add(u);
+        }
+        if u.input > 0 {
+            self.usage.sample = Some(PromptSample {
+                provider: round.req.provider.id.clone(),
+                model: round.req.model.clone(),
+                estimated: round.estimate,
+                input: u.input,
+            });
+        }
     }
 }
 
@@ -322,62 +398,9 @@ impl Session {
         self.ai
             .messages
             .push(ChatMessage::user(text.to_string(), images));
-        // The conversation: answered questions only (failed or declined ones are left out).
-        let mut turns = Vec::new();
-        let msgs = &self.ai.messages;
-        let mut i = 0;
-        while i < msgs.len() {
-            let Some(m) = msgs.get(i) else { break };
-            if m.role == Role::User {
-                let answer = msgs.get(i + 1).filter(|a| a.role == Role::Assistant);
-                let last = i + 1 == msgs.len();
-                match answer {
-                    Some(a) if a.error.is_none() && !a.pending => {
-                        turns.push(Turn {
-                            role: Role::User,
-                            text: m.text.clone(),
-                            blocks: Vec::new(),
-                            images: m.images.clone(),
-                            ..Default::default()
-                        });
-                        turns.push(Turn {
-                            role: Role::Assistant,
-                            text: a.text.clone(),
-                            // Blocks only go back to the model that wrote them.
-                            blocks: if a.model.as_deref() == Some(model.as_str()) {
-                                a.blocks.clone()
-                            } else {
-                                Vec::new()
-                            },
-                            images: Vec::new(),
-                            ..Default::default()
-                        });
-                        i += 2;
-                        continue;
-                    }
-                    _ if last => turns.push(Turn {
-                        role: Role::User,
-                        text: m.text.clone(),
-                        blocks: Vec::new(),
-                        images: m.images.clone(),
-                        ..Default::default()
-                    }),
-                    _ => {}
-                }
-            }
-            i += 1;
-        }
+        let turns = self.ai_turns(&model);
         let provider_id = provider.id.clone();
-        // With a project folder the model may read its files (never change them).
-        let plain_system = self.ai_system();
-        let tools = self
-            .ai_project_root()
-            .map_or_else(Vec::new, |_| ai_tools::specs());
-        let system = if tools.is_empty() {
-            plain_system.clone()
-        } else {
-            format!("{plain_system}{}", ai_tools::PROMPT)
-        };
+        let (system, tools, plain_system) = self.ai_prompt();
         let req = ChatRequest {
             provider,
             model: model.clone(),
@@ -401,15 +424,80 @@ impl Session {
             note: None,
             tools: Vec::new(),
         });
-        self.ai.job = Some(texcraft_ai::start(&req, Arc::clone(&self.waker)));
-        self.ai.round = Some(Round {
-            req,
-            n: 0,
-            text: String::new(),
-            plain_system,
+        self.ai.usage.runs.push(RunUsage {
+            message: self.ai.messages.len().saturating_sub(1),
+            ..RunUsage::default()
         });
+        let run = self.ai.usage.runs.len().saturating_sub(1);
+        self.ai.job = Some(texcraft_ai::start(&req, Arc::clone(&self.waker)));
+        self.ai.round = Some(Round::new(req, plain_system, run));
         self.ai_save_chat();
         Ok(())
+    }
+
+    /// The system prompt, the tools and the system prompt without them: with a project folder
+    /// the model may read its files (never change them).
+    pub(crate) fn ai_prompt(&self) -> (String, Vec<Tool>, String) {
+        let plain_system = self.ai_system();
+        let tools = self
+            .ai_project_root()
+            .map_or_else(Vec::new, |_| ai_tools::specs());
+        let system = if tools.is_empty() {
+            plain_system.clone()
+        } else {
+            format!("{plain_system}{}", ai_tools::PROMPT)
+        };
+        (system, tools, plain_system)
+    }
+
+    /// The conversation to send to `model`: answered questions only (failed or declined ones are
+    /// left out), and the last question when it is not answered yet.
+    pub(crate) fn ai_turns(&self, model: &str) -> Vec<Turn> {
+        let mut turns = Vec::new();
+        let msgs = &self.ai.messages;
+        let mut i = 0;
+        while i < msgs.len() {
+            let Some(m) = msgs.get(i) else { break };
+            if m.role == Role::User {
+                let answer = msgs.get(i + 1).filter(|a| a.role == Role::Assistant);
+                let last = i + 1 == msgs.len();
+                match answer {
+                    Some(a) if a.error.is_none() && !a.pending => {
+                        turns.push(Turn {
+                            role: Role::User,
+                            text: m.text.clone(),
+                            blocks: Vec::new(),
+                            images: m.images.clone(),
+                            ..Default::default()
+                        });
+                        turns.push(Turn {
+                            role: Role::Assistant,
+                            text: a.text.clone(),
+                            // Blocks only go back to the model that wrote them.
+                            blocks: if a.model.as_deref() == Some(model) {
+                                a.blocks.clone()
+                            } else {
+                                Vec::new()
+                            },
+                            images: Vec::new(),
+                            ..Default::default()
+                        });
+                        i += 2;
+                        continue;
+                    }
+                    _ if last => turns.push(Turn {
+                        role: Role::User,
+                        text: m.text.clone(),
+                        blocks: Vec::new(),
+                        images: m.images.clone(),
+                        ..Default::default()
+                    }),
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        turns
     }
 
     /// The model called tools: run them (they only read), and ask again with their answers.
@@ -423,6 +511,13 @@ impl Session {
         else {
             return;
         };
+        let runs_tools = self
+            .ai
+            .round
+            .as_ref()
+            .is_some_and(|r| r.n < MAX_TOOL_ROUNDS);
+        self.ai
+            .end_request(if runs_tools { tool_calls.len() } else { 0 }, true);
         let Some(mut round) = self.ai.round.take() else {
             return;
         };
@@ -478,6 +573,7 @@ impl Session {
             ..Default::default()
         });
         round.n += 1;
+        round.restart();
         self.ai.job = Some(texcraft_ai::start(&round.req, Arc::clone(&self.waker)));
         self.ai.round = Some(round);
         if let Some(m) = self.ai.messages.last_mut() {
@@ -547,6 +643,7 @@ impl Session {
         if !first {
             self.ai_save_chat();
             self.ai.messages.clear();
+            self.ai.usage = ChatUsage::default();
             self.ai.chat_id = None;
         }
         self.ai.chat_project = project;
@@ -563,7 +660,7 @@ impl Session {
     }
 
     /// Saves the conversation shown (once it has a question).
-    fn ai_save_chat(&mut self) {
+    pub(crate) fn ai_save_chat(&mut self) {
         let Some(store) = &self.ai.chats else {
             return;
         };
@@ -571,7 +668,12 @@ impl Session {
             return;
         }
         let id = self.ai.chat_id.get_or_insert_with(chats::new_id).clone();
-        let saved = store.save(self.ai.chat_project.as_deref(), &id, &self.ai.messages);
+        let saved = store.save(
+            self.ai.chat_project.as_deref(),
+            &id,
+            &self.ai.messages,
+            &self.ai.usage,
+        );
         if let Err(e) = saved {
             self.set_status(e);
         }
@@ -582,19 +684,21 @@ impl Session {
     pub fn ai_new_chat(&mut self) {
         self.ai_stop();
         self.ai.messages.clear();
+        self.ai.usage = ChatUsage::default();
         self.ai.chat_id = None;
     }
 
     /// Shows saved conversation `id` of the current project.
     pub fn ai_open_chat(&mut self, id: &str) -> Result<(), CommandError> {
         self.ai_stop();
-        let messages = self
+        let (messages, usage) = self
             .ai
             .chats
             .as_ref()
             .and_then(|s| s.load(self.ai.chat_project.as_deref(), id))
             .ok_or_else(|| CommandError::Failed(tr("No such conversation.").into()))?;
         self.ai.messages = messages;
+        self.ai.usage = usage;
         self.ai.chat_id = Some(id.to_string());
         Ok(())
     }
@@ -612,6 +716,7 @@ impl Session {
                 job.cancel();
             }
             self.ai.messages.clear();
+            self.ai.usage = ChatUsage::default();
             self.ai.chat_id = None;
         }
         self.ai_refresh_history();
@@ -620,6 +725,10 @@ impl Session {
 
     /// Stops the answer that is arriving (what arrived so far stays).
     pub fn ai_stop(&mut self) {
+        // A step without a measured end: no time (its output is not known).
+        if self.ai.job.is_some() {
+            self.ai.end_request(0, false);
+        }
         self.ai.round = None;
         if let Some(job) = self.ai.job.take() {
             job.cancel();
@@ -677,6 +786,10 @@ impl Session {
             .unwrap_or_default();
         let mut finished = false;
         for e in events {
+            if let Event::Usage(u) = &e {
+                self.ai.record_usage(u);
+                continue;
+            }
             if matches!(&e, Event::Done { tool_calls, .. } if !tool_calls.is_empty()) {
                 self.ai_tool_round(e);
                 continue;
@@ -685,6 +798,9 @@ impl Session {
                 && self.ai_retry_without_tools(msg)
             {
                 continue;
+            }
+            if matches!(e, Event::Done { .. } | Event::Refused(_) | Event::Failed(_)) {
+                self.ai.end_request(0, true);
             }
             let Some(m) = self.ai.messages.last_mut() else {
                 break;
@@ -698,6 +814,7 @@ impl Session {
                     }
                 }
                 Event::Thinking => m.thinking = m.text.is_empty(),
+                Event::Usage(_) => {}
                 Event::Fallback(what) => {
                     m.note = Some(trf!("Declined, answered by {model}", model = what));
                 }
@@ -766,8 +883,13 @@ impl Session {
         {
             return false;
         }
+        self.ai.end_request(0, true);
+        let Some(round) = self.ai.round.as_mut() else {
+            return false;
+        };
         round.req.tools.clear();
         round.req.system = round.plain_system.clone();
+        round.restart();
         self.ai.job = Some(texcraft_ai::start(&round.req, Arc::clone(&self.waker)));
         true
     }

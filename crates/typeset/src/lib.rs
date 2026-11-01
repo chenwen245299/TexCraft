@@ -301,6 +301,10 @@ pub struct Outcome {
     pub preamble_cached: bool,
     /// The live pass ran in the fast environment (minimal texmf.cnf and file farm).
     pub fast_env: bool,
+    /// The live pass rewrote files the next pass reads back (`.aux`, `.toc`, `.out`, …, see
+    /// [`live::read_back_state`]): another pass over the same text can come out different (the
+    /// contents, references and outline catch up; errors left there by half-typed text go).
+    pub read_back_changed: bool,
 }
 
 /// Where a live pass mirrored the project.
@@ -815,6 +819,9 @@ fn run_live(
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default()
     };
+    // Tectonic reruns the engine until these files settle by itself.
+    let read_back_before =
+        (req.engine != Engine::Tectonic).then(|| live::read_back_state(req, &cwd));
     // Up to three attempts: fast pass, then normal passes when the fast environment or the
     // reduced font map turned out to miss something.
     for _attempt in 0..3 {
@@ -915,6 +922,8 @@ fn run_live(
         break;
     }
     outcome.duration = started.elapsed();
+    outcome.read_back_changed = !outcome.cancelled
+        && read_back_before.is_some_and(|before| live::read_back_state(req, &cwd) != before);
     let out_dir = cwd;
     let fresh = |p: &Path| {
         std::fs::metadata(p)
@@ -1091,6 +1100,114 @@ mod tests {
         assert!(o.pdf.is_some(), "console:\n{}", o.console);
         assert!(o.synctex.is_some());
         assert!(o.log_path.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A live pass is one engine run: the contents it shows come from the previous pass's
+    /// `.toc`. `read_back_changed` says when another pass over the same text would differ
+    /// (oracle test with pdfLaTeX).
+    #[test]
+    fn live_passes_report_when_the_files_they_read_back_changed() {
+        let tc = Toolchain::detect();
+        if !tc.supports(Engine::PdfLatex) {
+            eprintln!("skipping: no TeX installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("texcraft-readback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("chapters")).unwrap();
+        std::fs::write(dir.join("chapters/one.tex"), "Chapter text.\n").unwrap();
+        let req = |title: &str| LiveRequest {
+            project_dir: dir.clone(),
+            root_rel: "main.tex".into(),
+            buffers: vec![(
+                "main.tex".into(),
+                format!(
+                    "\\documentclass{{article}}\n\\usepackage{{hyperref}}\n\\begin{{document}}\n\\tableofcontents\n\\section{{{title}}}\n\\include{{chapters/one}}\n\\end{{document}}\n"
+                ),
+            )],
+            dirs: vec!["chapters".into()],
+            engine: Engine::PdfLatex,
+            shell_escape: false,
+            cache_preamble: true,
+            pretex: None,
+        };
+        let pass = |r: LiveRequest| start_live(r, &tc, Arc::new(|| {})).wait(|_| {});
+        // The first pass writes the contents (its PDF shows none); the second shows them and
+        // changes nothing.
+        let o = pass(req("Intro"));
+        assert!(o.pdf.is_some() && o.read_back_changed, "{}", o.console);
+        assert!(dir.join(".texcraft/live/chapters/one.aux").is_file());
+        let o = pass(req("Intro"));
+        assert_eq!(o.report.errors(), 0, "{:?}", o.report.issues);
+        assert!(!o.read_back_changed);
+        // A renamed section: the contents still show the old title until the next pass.
+        assert!(pass(req("Renamed")).read_back_changed);
+        assert!(!pass(req("Renamed")).read_back_changed);
+        // A half-typed title breaks the contents file: the corrected text's first pass reads it
+        // and fails, the next one over the same text is clean.
+        let o = pass(req("file_name"));
+        assert!(o.read_back_changed && o.report.errors() > 0);
+        let o = pass(req("file\\_name"));
+        assert!(o.read_back_changed && o.report.errors() > 0, "inherited");
+        let o = pass(req("file\\_name"));
+        assert!(!o.read_back_changed, "settled");
+        assert_eq!(o.report.errors(), 0, "{:?}", o.report.issues);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fast environment holds only the font files the last normal pass used. A font the
+    /// document starts using (here the first italics) is not there: pdfTeX stops ("cannot open
+    /// Type 1 font file"), and the pass must fall back to a normal one, which rebuilds the
+    /// environment. Before, every later pass failed the same way and the preview froze.
+    #[test]
+    fn a_font_new_to_the_fast_environment_falls_back_to_a_normal_pass() {
+        let tc = Toolchain::detect();
+        if !tc.supports(Engine::PdfLatex) || tc.kpsewhich().is_none() {
+            eprintln!("skipping: no TeX installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("texcraft-newfont-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = |body: &str| LiveRequest {
+            project_dir: dir.clone(),
+            root_rel: "main.tex".into(),
+            buffers: vec![(
+                "main.tex".into(),
+                format!(
+                    "\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+                ),
+            )],
+            dirs: vec![],
+            engine: Engine::PdfLatex,
+            shell_escape: false,
+            cache_preamble: true,
+            pretex: None,
+        };
+        let pass = |r: LiveRequest| start_live(r, &tc, Arc::new(|| {})).wait(|_| {});
+        // Normal passes build the reduced map and the fast environment; then passes are fast.
+        for body in [
+            "Plain text.",
+            "Plain text, edited.",
+            "Plain text, edited again.",
+        ] {
+            let o = pass(req(body));
+            assert!(o.pdf.is_some(), "{}", o.console);
+        }
+        assert!(pass(req("Plain text, once more.")).fast_env);
+        for body in [
+            "Now \\textit{italic} words.",
+            "Now \\textit{italic} words, more.",
+        ] {
+            let o = pass(req(body));
+            assert_eq!(o.report.errors(), 0, "{:?}", o.report.issues);
+            assert!(o.pdf.is_some() && o.pdf_fresh, "{}", o.console);
+        }
+        assert!(
+            pass(req("Now \\textit{italic} words, and more.")).fast_env,
+            "the rebuilt environment holds the italic font"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

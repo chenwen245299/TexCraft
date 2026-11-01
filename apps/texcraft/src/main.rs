@@ -529,8 +529,9 @@ impl App {
                     Ok(json!({ "open": w.open, "launch": w.launch }))
                 }
                 "ui.prefs" => {
-                    // {open?: bool, pane?: "general"|"sidebar"|"editor"|"viewer"|"typesetting",
-                    //  editorTab?: n, sheet?: bool, sheetTab?: n, inline?: bool, models?: bool,
+                    // {open?: bool, pane?: "general"|"sidebar"|"editor"|"viewer"|"typesetting"|"ai",
+                    //  editorTab?: n, aiTab?: n (0 providers, 1 actions), sheet?: bool,
+                    //  sheetTab?: n, inline?: bool, models?: bool,
                     //  modelGroup?: "text"|"vision"|"other"|null}
                     let prefs = &mut self.bench.prefs;
                     if let Some(inline) = p.params.get("inline").and_then(Value::as_bool) {
@@ -550,6 +551,9 @@ impl App {
                     }
                     if let Some(n) = p.params.get("editorTab").and_then(Value::as_u64) {
                         prefs.editor_tab = n.min(1) as usize;
+                    }
+                    if let Some(n) = p.params.get("aiTab").and_then(Value::as_u64) {
+                        prefs.ai_tab = n.min(1) as usize;
                     }
                     if let Some(n) = p.params.get("sheetTab").and_then(Value::as_u64) {
                         prefs.sheet_tab = n.min(3) as usize;

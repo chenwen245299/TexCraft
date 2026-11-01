@@ -76,16 +76,26 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
    only the live folder, the project and the farm and copies the engine's memory settings
    (`kpsewhich -expand-var`). Fast passes set `TEXMFCNF` to it and skip the ~110 ms of TeX Live
    configuration parsing; the format is stored uncompressed (another ~50 ms). A fast pass that
-   reports a missing file or font a normal pass did not is rerun normally and the farm rebuilt.
+   reports a missing file or font a normal pass did not is rerun normally and the farm rebuilt —
+   including pdfTeX's `(file cmti10.pfb): cannot open Type 1 font file` when the document starts
+   using a font the farm lacks (before, every later pass failed on it and the preview froze).
 7. One engine pass. The log is parsed against the project folder; mirror paths in issues and
    SyncTeX results are mapped back to the real files (`Mirror::to_project` / `to_mirror`).
 8. If the pass has errors and a previous PDF exists, the PDF is kept (setting `live_keep_good`);
    otherwise the viewer reopens it, keeping the old page textures until the new ones arrive, so the
    view neither flickers nor jumps.
+9. The engine keeps LIVE mode's promise itself (`crates/engine/src/live.rs`): each document
+   records the revision a finished pass typeset (`typeset_revision`), and whenever nothing runs or
+   waits, text no pass typeset gets a catch-up pass (unless that exact text just failed or was
+   stopped). A pass is one engine run, so what it shows of the contents, references and outline
+   comes from the previous pass's `.aux`/`.toc`/`.out`/…; a pass that changed those files
+   (`Outcome::read_back_changed`) is followed by passes over the same text until they settle (at
+   most 3). Without that, a heading corrected after a half-typed one failed on the half-typed
+   one's `.toc` and the last good PDF stayed up for good.
 
-9. A pass still running after 20 s (or 4× the last pass's time) while newer edits wait is stopped
-   and the next pass typesets them; a job whose thread dies finishes with an error. Either way no
-   pass can hold up all later ones.
+10. A pass still running after 20 s (or 4× the last pass's time) while newer edits wait is
+    stopped and the next pass typesets them; a job whose thread dies finishes with an error.
+    Either way no pass can hold up all later ones.
 
 Full typesets (⌘T, and on opening a project) save edited files and run latexmk on the real files
 into `.texcraft/build/`, then copy the PDF beside the root. Live passes never touch that PDF, so in

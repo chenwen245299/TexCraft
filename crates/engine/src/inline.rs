@@ -284,7 +284,7 @@ impl Session {
             match e {
                 Event::Text(t) => p.answer.push_str(&t),
                 Event::Thinking => p.thought = true,
-                Event::Fallback(_) => {}
+                Event::Fallback(_) | Event::Usage(_) => {}
                 Event::Done { .. } => {
                     if let Some(p) = self.inline.pending.take() {
                         self.inline.last_latency = Some(p.started.elapsed());

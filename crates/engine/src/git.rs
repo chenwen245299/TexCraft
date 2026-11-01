@@ -266,7 +266,9 @@ impl Session {
             };
             match e {
                 texcraft_ai::Event::Text(t) => answer.push_str(&t),
-                texcraft_ai::Event::Thinking | texcraft_ai::Event::Fallback(_) => {}
+                texcraft_ai::Event::Thinking
+                | texcraft_ai::Event::Fallback(_)
+                | texcraft_ai::Event::Usage(_) => {}
                 texcraft_ai::Event::Done { .. } => {
                     let message = ai_commit::clean(answer);
                     self.git.drafting = None;

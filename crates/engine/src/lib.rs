@@ -17,7 +17,9 @@ use texcraft_synctex::{PdfRect, SyncTex};
 use texcraft_typeset::{Job, JobEvent, LiveRequest, Mirror, Outcome, Request, Toolchain};
 
 pub mod ai;
+pub mod ai_actions;
 pub mod ai_tools;
+pub mod ai_usage;
 pub mod chats;
 pub mod commands;
 pub mod edit;
@@ -26,6 +28,7 @@ pub mod full;
 pub mod git;
 pub mod index;
 pub mod inline;
+pub mod live;
 pub mod sync;
 pub mod update;
 
@@ -48,6 +51,10 @@ pub struct Document {
     pub revision: u64,
     /// `revision` when last saved or loaded.
     pub saved_revision: u64,
+    /// The revision the PDF preview has typeset: a finished live pass over this buffer, or a
+    /// full typeset of the saved file. In LIVE mode the engine typesets again whenever it falls
+    /// behind `revision` (see [`live`]).
+    pub typeset_revision: u64,
     /// Selection in char indices, mirrored from the editor every frame.
     pub selection: Selection,
 }
@@ -61,6 +68,7 @@ impl Document {
             text,
             revision: 1,
             saved_revision: 0,
+            typeset_revision: 0,
             selection: Selection::default(),
         }
     }
@@ -560,6 +568,8 @@ pub enum Effect {
     GitDiff,
     /// Open Settings at the AI pane.
     AiSettings,
+    /// Open Settings at the AI pane's right-click actions.
+    AiActionSettings,
     /// Open the inline AI suggestion settings (the editor header's popover).
     InlineSettings,
     /// Start renaming a file in the Files list (a file or folder just created).
@@ -612,6 +622,19 @@ pub struct TypesetState {
     /// The running live pass was stopped on purpose (it took too long, or TexCraft is quitting):
     /// it leaves no trace.
     pub live_dropped: bool,
+    /// The documents (normalized typeset paths) and the revisions the running job typesets:
+    /// each one's `typeset_revision` when it finishes.
+    pub job_revisions: Vec<(PathBuf, u64)>,
+    /// The root whose last live pass rewrote files the next pass reads back (`.aux`, `.toc`,
+    /// …): a pass over the same text would come out different.
+    pub unsettled: Option<PathBuf>,
+    /// Live passes run over unchanged text so far to settle those files.
+    pub settle_passes: u8,
+    /// Live passes the engine started because the preview was behind the text (see [`live`]).
+    pub catch_ups: u64,
+    /// What the last live pass started from (see [`live`]): one that failed or was stopped is
+    /// not started again until something changes.
+    pub(crate) last_attempt: Option<u64>,
     /// Typesetting before quitting.
     pub quit: QuitTypeset,
 }
@@ -913,6 +936,8 @@ impl Session {
             text,
             revision: 0,
             saved_revision: 0,
+            // Opening is not an edit: the PDF typeset before (if any) stands for the file.
+            typeset_revision: 0,
             selection: Selection::default(),
         };
         // Replace a pristine untitled document instead of piling up tabs.
@@ -1267,6 +1292,27 @@ impl Session {
                 self.save(i)?;
             }
         }
+        // A full typeset reads the files on disk: the saved revisions (an untitled root's scratch
+        // file was just written from its buffer).
+        let folder = texcraft_project::normalize(&root)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        self.typeset.job_revisions = self
+            .docs
+            .iter()
+            .filter_map(|d| {
+                let p = texcraft_project::normalize(d.typeset_path()?);
+                let rev = if d.path.is_some() {
+                    d.saved_revision
+                } else if p == texcraft_project::normalize(&root) {
+                    d.revision
+                } else {
+                    return None;
+                };
+                p.starts_with(&folder).then_some((p, rev))
+            })
+            .collect();
         let plan = self.compute_plan(Some(root.clone()));
         let req = Request {
             root: root.clone(),
@@ -1292,6 +1338,12 @@ impl Session {
 
     /// Starts a live-preview pass over the unsaved buffers (never saves anything).
     pub fn live_typeset(&mut self) -> Result<(), CommandError> {
+        self.start_live(false)
+    }
+
+    /// Starts a live pass (queues one if a run is in progress). `settle`: a pass over text the
+    /// last pass already typeset, because that pass rewrote files the next one reads back.
+    pub(crate) fn start_live(&mut self, settle: bool) -> Result<(), CommandError> {
         if self.typeset.is_running() {
             self.typeset.queued_live = true;
             return Ok(());
@@ -1301,18 +1353,15 @@ impl Session {
             .ok_or_else(|| CommandError::Failed(tr("nothing to typeset").into()))?;
         let root = texcraft_project::normalize(&root);
         let project_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
+        let inputs = self.live_buffers(&project_dir);
+        self.typeset.last_attempt = Some(self.live_stamp(&root, &inputs));
         let root_rel = root
             .file_name()
             .map(PathBuf::from)
             .ok_or_else(|| CommandError::Failed(tr("the root file has no name").into()))?;
-        let buffers: Vec<(PathBuf, String)> = self
-            .docs
+        let buffers: Vec<(PathBuf, String)> = inputs
             .iter()
-            .filter_map(|d| {
-                let p = texcraft_project::normalize(d.typeset_path()?);
-                let rel = p.strip_prefix(&project_dir).ok()?.to_path_buf();
-                Some((rel, d.text.clone()))
-            })
+            .filter_map(|(i, rel)| Some((rel.clone(), self.docs.get(*i)?.text.clone())))
             .collect();
         if !buffers.iter().any(|(p, _)| *p == root_rel) && !root.is_file() {
             return Err(CommandError::Failed(
@@ -1344,6 +1393,18 @@ impl Session {
         };
         self.typeset.console.clear();
         self.typeset.root = Some(root);
+        self.typeset.job_revisions = inputs
+            .iter()
+            .filter_map(|(i, _)| {
+                let d = self.docs.get(*i)?;
+                Some((texcraft_project::normalize(d.typeset_path()?), d.revision))
+            })
+            .collect();
+        self.typeset.settle_passes = if settle {
+            self.typeset.settle_passes.saturating_add(1)
+        } else {
+            0
+        };
         self.typeset.job_edit_at = self.typeset.pending_edit_at.take();
         self.typeset.live_job = true;
         self.typeset.background = false;
@@ -1373,6 +1434,7 @@ impl Session {
             self.tick_git(now),
             self.tick_git_message(),
             self.tick_ai(),
+            self.tick_ai_action(),
             self.tick_inline(now),
         ]
         .into_iter()
@@ -1401,7 +1463,11 @@ impl Session {
                 && outcome.cancelled
                 && (self.typeset.queued || self.typeset.live_dropped);
             self.typeset.live_dropped = false;
-            if !superseded {
+            if superseded {
+                // Stopped through no fault of the text: a later pass may typeset it again.
+                self.typeset.last_attempt = None;
+                self.typeset.job_revisions.clear();
+            } else {
                 self.finish_typeset(*outcome);
             }
             if self.typeset.queued {
@@ -1446,6 +1512,8 @@ impl Session {
                 live_wait = Some(due.saturating_duration_since(now));
             }
         }
+        // LIVE mode: the preview catches up with edits no finished pass typeset, and settles.
+        self.keep_live_current();
         // Full typesets TexCraft starts by itself (LIVE mode, quitting).
         let full_wait = self.tick_full(now);
         if self.typeset.is_running() {
@@ -1481,6 +1549,7 @@ impl Session {
         self.typeset.runs += 1;
         self.typeset.finished_at = Some(std::time::SystemTime::now());
         self.typeset.issues = outcome.report.issues.clone();
+        self.note_typeset(&outcome);
         let background = !outcome.live && self.typeset.background;
         if !outcome.live
             && (outcome.cancelled || outcome.error.is_some())
@@ -1873,6 +1942,10 @@ impl Session {
                 "background": self.typeset.is_full_running() && self.typeset.background,
                 "staleProjects": self.typeset.stale.iter().map(|(r, _)| r).collect::<Vec<_>>(),
                 "quitting": self.typeset.is_quitting(),
+                "behind": self.live_behind(),
+                "unsettled": self.typeset.unsettled.is_some(),
+                "settlePasses": self.typeset.settle_passes,
+                "catchUps": self.typeset.catch_ups,
             },
             "pdf": {
                 "path": self.pdf.path,
@@ -1895,6 +1968,7 @@ impl Session {
                 })).collect::<Vec<_>>(),
                 "includeDocument": self.ai.config.include_document,
                 "inline": self.inline_inspect(),
+                "actions": self.ai_actions_inspect(),
                 "busy": self.ai.is_busy(),
                 "readsImages": self.ai_reads_images(),
                 "draftImages": self.ai.draft_images.iter().map(|i| serde_json::json!({
@@ -1905,6 +1979,10 @@ impl Session {
                     "text": m.text, "error": m.error, "pending": m.pending, "model": m.model,
                     "images": m.images.len(),
                 })).collect::<Vec<_>>(),
+                // The row under the question box, and its context meter.
+                "stats": self.ai_stats(),
+                "context": self.ai_context_now(),
+                "runs": self.ai.usage.runs,
             },
             "git": {
                 "root": self.git.repo.as_ref().map(|r| r.root.clone()),

@@ -105,6 +105,11 @@ fn editor_tabs() -> [&'static str; 2] {
     [tr("Editing Aids"), tr("Editor Look & Feel")]
 }
 
+/// AI pane tabs: the providers and their models, the editor's right-click actions.
+fn ai_tabs() -> [&'static str; 2] {
+    [tr("Providers"), tr("Actions")]
+}
+
 /// State of the Settings window and the Typeset Configuration sheet.
 #[derive(Default)]
 pub struct Prefs {
@@ -116,6 +121,8 @@ pub struct Prefs {
     pub pane: Pane,
     /// Editor pane tab (index into Editing Aids, Editor Look & Feel).
     pub editor_tab: usize,
+    /// AI pane tab (index into Providers, Actions).
+    pub ai_tab: usize,
     /// Typeset Configuration tab (Summary, General, Bibliographies, Indices).
     pub sheet_tab: usize,
     /// Draw the Settings window's contents inside the main window instead (control channel:
@@ -809,7 +816,7 @@ fn settings_body(
             ctrl: rect.left() + 420.0,
             right: rect.right() - 13.0,
             y: content_top,
-            id: Id::new(("prefs", prefs.pane, prefs.editor_tab)),
+            id: Id::new(("prefs", prefs.pane, prefs.editor_tab, prefs.ai_tab)),
         };
         match prefs.pane {
             Pane::General => general_pane(&mut form, session),
@@ -823,6 +830,7 @@ fn settings_body(
             }
             Pane::Viewer => viewer_pane(&mut form, session),
             Pane::Typesetting => open_sheet = typesetting_pane(&mut form, session),
+            Pane::Ai if prefs.ai_tab == 1 => ai_actions_pane(&mut form, session, &mut prefs.ai),
             Pane::Ai => ai_pane(&mut form, session, &mut prefs.ai),
         }
         let wanted = (form.y - rect.top() + 36.0).max(300.0).round();
@@ -882,20 +890,25 @@ fn pane_bar(ui: &mut Ui, pal: &Pal, prefs: &mut Prefs, rect: Rect) -> f32 {
             prefs.pane = *pane;
         }
     }
-    if prefs.pane == Pane::Editor {
+    if matches!(prefs.pane, Pane::Editor | Pane::Ai) {
+        let (names, tab) = if prefs.pane == Pane::Editor {
+            (editor_tabs(), &mut prefs.editor_tab)
+        } else {
+            (ai_tabs(), &mut prefs.ai_tab)
+        };
         if let Some(i) = text_tabs(
             ui,
             pal,
-            Id::new("prefs-editor-tabs"),
+            Id::new(("prefs-tabs", prefs.pane)),
             rect.center().x,
             top + PANE_BAR_H - 0.5,
             20.0,
             112.0,
-            &editor_tabs(),
-            prefs.editor_tab,
+            &names,
+            *tab,
             11.8,
         ) {
-            prefs.editor_tab = i;
+            *tab = i;
         }
         hairline(
             ui,
@@ -1593,6 +1606,12 @@ pub(crate) struct AiPaneState {
     message: Option<(String, bool)>,
     /// The model picker window (Add Models…).
     pub(crate) picker: crate::model_picker::ModelPicker,
+    /// The right-click action shown on the Actions tab (index into the config's actions).
+    action: usize,
+    /// The id of the action whose name and prompt are in the fields below (`None`: load them).
+    action_fields: Option<String>,
+    action_name: String,
+    action_prompt: String,
 }
 
 /// Added models shown before their list scrolls, and their row height.
@@ -2370,6 +2389,371 @@ fn ai_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
     }
     y += 24.0;
     f.y = y + 12.0;
+
+    if changed && let Err(e) = session.save_ai_config() {
+        st.message = Some((e.to_string(), false));
+    }
+}
+
+/// A multi-line text field in the preference style, scrolling when the text is taller.
+fn text_area(ui: &mut Ui, pal: &Pal, id: Id, r: Rect, text: &mut String) -> egui::Response {
+    let focused = ui.memory(|m| m.has_focus(id));
+    ui.painter().rect(
+        r,
+        5.5,
+        pal.control,
+        Stroke::new(
+            if focused { 1.5 } else { 0.0 },
+            if focused {
+                pal.accent
+            } else {
+                Color32::TRANSPARENT
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    let inner = r.shrink2(vec2(6.0, 5.0));
+    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+    c.set_clip_rect(inner.intersect(ui.clip_rect()));
+    egui::ScrollArea::vertical()
+        .id_salt(id.with("scroll"))
+        .auto_shrink([false, false])
+        .show(&mut c, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .id(id)
+                    .font(FontId::proportional(12.0))
+                    .text_color(pal.control_text)
+                    .frame(egui::Frame::NONE)
+                    .margin(vec2(3.0, 1.0))
+                    .desired_width(ui.available_width())
+                    // The whole box takes clicks, not only the lines written.
+                    .min_size(vec2(0.0, inner.height() - 2.0))
+                    .desired_rows(1),
+            )
+        })
+        .inner
+}
+
+/// A segmented pair of small buttons (+ / −, up / down) at `r`: returns their responses.
+fn button_pair(
+    ui: &mut Ui,
+    pal: &Pal,
+    id: Id,
+    r: Rect,
+    tips: [&str; 2],
+) -> (egui::Response, egui::Response) {
+    let a = Rect::from_min_size(r.min, vec2(r.width() / 2.0, r.height()));
+    let b = Rect::from_min_max(pos2(a.right(), r.top()), r.max);
+    ui.painter()
+        .rect(r, 5.0, pal.control, Stroke::NONE, StrokeKind::Inside);
+    ui.painter().line_segment(
+        [
+            pos2(a.right(), a.top() + 4.0),
+            pos2(a.right(), a.bottom() - 4.0),
+        ],
+        Stroke::new(1.0, pal.hairline_strong),
+    );
+    let ra = ui
+        .interact(a, id.with(0), Sense::click())
+        .on_hover_text(tips[0]);
+    let rb = ui
+        .interact(b, id.with(1), Sense::click())
+        .on_hover_text(tips[1]);
+    (ra, rb)
+}
+
+/// Settings → AI → Actions: the editor's right-click AI actions, their names and prompts.
+fn ai_actions_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
+    use texcraft_ai::actions::{self, Action, Output};
+    let ui = &mut *f.ui;
+    let pal = f.pal;
+    let t = &pal.tokens;
+    let top = f.y + 6.0;
+    let left = f.left + 7.0;
+    let right = f.right - 7.0;
+    let mut changed = false;
+    let list_h = 262.0;
+    let row_h = 36.0;
+
+    // ---- The actions, in menu order.
+    let list = Rect::from_min_size(pos2(left, top), vec2(196.0, list_h));
+    ui.painter().rect(
+        list,
+        7.0,
+        pal.bg,
+        Stroke::new(0.5, pal.hairline_strong),
+        StrokeKind::Inside,
+    );
+    let n = session.ai.config.actions.len();
+    st.action = st.action.min(n.saturating_sub(1));
+    if n == 0 {
+        ui.painter().text(
+            list.center(),
+            Align2::CENTER_CENTER,
+            tr("No Actions"),
+            FontId::proportional(12.0),
+            pal.note,
+        );
+    }
+    let inner = list.shrink2(vec2(5.0, 5.0));
+    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+    c.set_clip_rect(inner.intersect(ui.clip_rect()));
+    c.spacing_mut().item_spacing.y = 1.0;
+    let mut clicked = None;
+    egui::ScrollArea::vertical()
+        .id_salt("ai-actions")
+        .auto_shrink([false, false])
+        .show(&mut c, |ui| {
+            for (i, a) in session.ai.config.actions.iter().enumerate() {
+                let (row, resp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                let selected = i == st.action;
+                if selected {
+                    ui.painter().rect_filled(row, 6.0, pal.accent);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(row, 6.0, pal.control);
+                }
+                let (fg, weak) = if selected {
+                    (Color32::WHITE, Color32::from_white_alpha(200))
+                } else {
+                    (pal.label, pal.note)
+                };
+                let f1 = semibold(12.0);
+                let name = crate::widgets::elide(ui.painter(), &a.label(), &f1, row.width() - 20.0);
+                ui.painter().text(
+                    pos2(row.left() + 10.0, row.top() + 12.0),
+                    Align2::LEFT_CENTER,
+                    name,
+                    f1,
+                    fg,
+                );
+                ui.painter().text(
+                    pos2(row.left() + 10.0, row.top() + 26.0),
+                    Align2::LEFT_CENTER,
+                    match a.output {
+                        Output::Rewrite => tr("Replaces the text"),
+                        Output::Answer => tr("Shows the answer"),
+                    },
+                    FontId::proportional(10.5),
+                    weak,
+                );
+                if resp.clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    if let Some(i) = clicked {
+        st.action = i;
+    }
+    // + / − and up / down under the list.
+    let pm = Rect::from_min_size(pos2(list.left(), list.bottom() + 6.0), vec2(52.0, 22.0));
+    let (plus_resp, minus_resp) = button_pair(
+        ui,
+        pal,
+        Id::new("ai-action-add"),
+        pm,
+        [tr("Add an Action"), tr("Remove the Action")],
+    );
+    let half = |r: &egui::Response| r.rect.shrink(5.0);
+    icons::plus(ui.painter(), half(&plus_resp), pal.control_text);
+    icons::minus(
+        ui.painter(),
+        half(&minus_resp),
+        if n > 0 { pal.control_text } else { pal.note },
+    );
+    let ud = Rect::from_min_size(pos2(pm.right() + 8.0, pm.top()), vec2(52.0, 22.0));
+    let (up_resp, down_resp) = button_pair(
+        ui,
+        pal,
+        Id::new("ai-action-move"),
+        ud,
+        [tr("Move Up"), tr("Move Down")],
+    );
+    let can_up = n > 0 && st.action > 0;
+    let can_down = st.action + 1 < n;
+    icons::arrow_line(
+        ui.painter(),
+        half(&up_resp),
+        if can_up { pal.control_text } else { pal.note },
+        true,
+    );
+    icons::arrow_line(
+        ui.painter(),
+        half(&down_resp),
+        if can_down { pal.control_text } else { pal.note },
+        false,
+    );
+    egui::Popup::menu(&plus_resp).show(|ui| {
+        crate::menu::begin(ui, 200.0);
+        let list = &mut session.ai.config.actions;
+        if crate::menu::button(ui, t, tr("New Action")) {
+            list.push(Action {
+                id: actions::new_id(list),
+                ..Default::default()
+            });
+            st.action = list.len() - 1;
+            st.action_fields = None;
+            changed = true;
+        }
+        let missing = actions::missing(list);
+        if !missing.is_empty() {
+            crate::menu::separator(ui, t);
+            crate::menu::heading(ui, t, tr("Built-in Actions"));
+            for b in missing {
+                if crate::menu::button(ui, t, tr(b.name)) {
+                    list.push(Action::from_builtin(b));
+                    st.action = list.len() - 1;
+                    st.action_fields = None;
+                    changed = true;
+                }
+            }
+        }
+    });
+    if minus_resp.clicked() && st.action < n {
+        session.ai.config.actions.remove(st.action);
+        st.action = st.action.saturating_sub(1);
+        st.action_fields = None;
+        changed = true;
+    }
+    if (up_resp.clicked() && can_up) || (down_resp.clicked() && can_down) {
+        let to = if up_resp.clicked() {
+            st.action - 1
+        } else {
+            st.action + 1
+        };
+        session.ai.config.actions.swap(st.action, to);
+        st.action = to;
+        changed = true;
+    }
+
+    // ---- The selected action.
+    let x = list.right() + 22.0;
+    let w = right - x;
+    let mut y = top + 4.0;
+    let selected = st.action;
+    let id = move |k: &str| Id::new(("ai-action-field", k, selected));
+    if let Some(a) = session.ai.config.actions.get_mut(st.action) {
+        if st.action_fields.as_deref() != Some(a.id.as_str()) {
+            st.action_fields = Some(a.id.clone());
+            st.action_name = a.label();
+            st.action_prompt = a.prompt().to_string();
+        }
+        field_title(ui, pal, x, y + 8.0, tr("Name"));
+        let r = Rect::from_min_size(pos2(x, y + 18.0), vec2(w, 24.0));
+        let hint = a.builtin().map_or(tr("Untitled Action"), |b| tr(b.name));
+        if text_field(ui, pal, id("name"), r, &mut st.action_name, false, hint).changed() {
+            a.name = st.action_name.trim().to_string();
+            changed = true;
+        }
+        y += 54.0;
+
+        field_title(ui, pal, x, y + 8.0, tr("Prompt"));
+        let r = Rect::from_min_size(pos2(x, y + 18.0), vec2(w, 118.0));
+        if text_area(ui, pal, id("prompt"), r, &mut st.action_prompt).changed() {
+            a.prompt = st.action_prompt.trim().to_string();
+            changed = true;
+        }
+        y += 18.0 + 118.0 + 6.0;
+        let g = ui.painter().layout(
+            tr("Sent to the model as written, followed by the selected text (or the paragraph at the caret) in a code block.").to_string(),
+            FontId::proportional(11.0),
+            pal.note,
+            w,
+        );
+        let gh = g.size().y;
+        ui.painter().galley(pos2(x, y), g, pal.note);
+        y += gh + 10.0;
+
+        let mut rewrite = a.output == Output::Rewrite;
+        if check_control(
+            ui,
+            pal,
+            id("rewrite"),
+            pos2(x, y + 8.0),
+            15.0,
+            tr("Offer to replace the text with the answer"),
+            12.0,
+            &mut rewrite,
+            true,
+        ) {
+            a.output = if rewrite {
+                Output::Rewrite
+            } else {
+                Output::Answer
+            };
+            changed = true;
+        }
+        y += 26.0;
+        let note = if rewrite {
+            tr(
+                "The answer is the rewritten text, shown with its changes marked; Replace puts it in place of the text.",
+            )
+        } else {
+            tr(
+                "The answer shows as it is, and Continue in Assistant carries it into the conversation.",
+            )
+        };
+        let g = ui.painter().layout(
+            note.to_string(),
+            FontId::proportional(11.0),
+            pal.note,
+            w - 23.0,
+        );
+        let gh = g.size().y;
+        ui.painter().galley(pos2(x + 23.0, y - 4.0), g, pal.note);
+        y += gh + 8.0;
+
+        if a.builtin().is_some() {
+            let label = tr("Restore Default Prompt");
+            let bw = ui
+                .painter()
+                .layout_no_wrap(label.to_string(), FontId::proportional(11.5), pal.label)
+                .size()
+                .x
+                + 26.0;
+            let r = Rect::from_min_size(pos2(x, y), vec2(bw, 24.0));
+            if a.prompt_changed() {
+                if push_button(ui, pal, id("restore"), r, label, 11.5) {
+                    a.restore_prompt();
+                    st.action_fields = None;
+                    changed = true;
+                }
+            } else {
+                ui.painter().text(
+                    pos2(x, r.center().y),
+                    Align2::LEFT_CENTER,
+                    tr("The default prompt."),
+                    FontId::proportional(11.0),
+                    pal.note,
+                );
+            }
+            y += 32.0;
+        }
+    } else {
+        let g = ui.painter().layout(
+            tr("Add an action with +: a new one, or a built-in one you removed.").to_string(),
+            FontId::proportional(12.0),
+            pal.desc,
+            w,
+        );
+        y += g.size().y;
+        ui.painter().galley(pos2(x, top + 8.0), g, pal.desc);
+    }
+
+    // ---- Below both columns: how the actions are used.
+    let mut y = y.max(pm.bottom() + 12.0) + 6.0;
+    hairline(ui, f.left, f.right, y, pal.hairline);
+    y += 12.0;
+    let g = ui.painter().layout(
+        tr("Right-click in the editor and choose AI to run an action on the selected text, or on the paragraph at the caret when nothing is selected. The answer appears in a card under the text: Replace puts a rewrite in place of it (⌘Z undoes that), and Continue in Assistant carries an answer into the conversation.").to_string(),
+        FontId::proportional(11.5),
+        pal.desc,
+        right - left,
+    );
+    let gh = g.size().y;
+    ui.painter().galley(pos2(left, y), g, pal.desc);
+    f.y = y + gh + 12.0;
 
     if changed && let Err(e) = session.save_ai_config() {
         st.message = Some((e.to_string(), false));

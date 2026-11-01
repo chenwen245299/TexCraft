@@ -6,16 +6,17 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align2, Color32, FontId, Galley, Id, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2,
-    vec2,
+    Align2, Color32, CornerRadius, FontId, Galley, Id, Key, Modifiers, Rect, RichText, Sense,
+    Stroke, Ui, pos2, vec2,
 };
 use texcraft_ai::Role;
 use texcraft_engine::Session;
 use texcraft_engine::ai_tools::{ToolKind, ToolUse};
+use texcraft_engine::ai_usage::ContextUsage;
 use texcraft_i18n::{tr, trf};
 
 use crate::menu::{self, ButtonKind};
-use crate::theme::{Tokens, editor_font, semibold};
+use crate::theme::{HEADER_HEIGHT, Tokens, editor_font, semibold};
 use crate::{icons, widgets};
 
 /// UI state of the Assistant tab.
@@ -27,6 +28,16 @@ pub struct AiPanelState {
     focus: bool,
     /// Messages seen last frame (scroll to the bottom when it grows).
     seen: usize,
+    /// The context meter's popover is open.
+    context_open: bool,
+    /// When it closes, the pointer having left the meter and the popover (Argus waits 180 ms, so
+    /// the pointer can move from one to the other).
+    context_close_at: Option<f64>,
+    /// Esc or a click closed it while the pointer was on the meter: it opens again only once the
+    /// pointer has left.
+    context_dismissed: bool,
+    /// Where the popover was drawn last frame.
+    context_pop: Option<Rect>,
 }
 
 /// The app icon (assets/icon/texcraft.svg) over the Assistant's empty states.
@@ -44,6 +55,24 @@ fn paint_app_icon(ui: &Ui, r: Rect) {
 
 /// Height of the attached images' strip in the question box.
 const THUMBS_H: f32 = 50.0;
+
+/// Widest the question box's document chip grows (pt): a long file name is elided, leaving the
+/// rest of the row to what the conversation used.
+const CHIP_MAX: f32 = 160.0;
+
+/// The usage row's font size (that of the document chip beside it).
+const STAT_SIZE: f32 = 10.5;
+/// The context meter's ring: its diameter and line width (pt).
+const RING: f32 = 13.0;
+const RING_LINE: f32 = 2.0;
+/// The context popover's width and padding (Argus's 290 and 14 pt).
+const POP_W: f32 = 290.0;
+const POP_PAD: f32 = 14.0;
+/// How long the popover stays once the pointer has left (s).
+const POP_GRACE: f64 = 0.18;
+
+/// Widest the header's model menu grows (pt); longer model names are elided.
+pub(crate) const MODEL_MENU_MAX: f32 = 240.0;
 
 /// The question box's id (the app pastes images into it).
 fn composer_id() -> Id {
@@ -159,8 +188,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
     let body = ui.max_rect();
     let configured = session.ai.config.selection().is_some();
 
-    // ---- Header: model menu, new conversation, settings.
-    let header = Rect::from_min_size(body.min, vec2(body.width(), 32.0));
+    // ---- Header: model menu, new conversation, settings. As tall as the PDF's header bar
+    // beside it, so the two rows and their dividers line up.
+    let header = Rect::from_min_size(body.min, vec2(body.width(), HEADER_HEIGHT));
     header_bar(ui, t, session, st, header);
 
     if !configured {
@@ -418,13 +448,21 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
     icons::plus(&p, new_r.shrink(4.5), t.sidebar_icon);
     icons::gear_solid(&p, set_r.shrink(4.0), t.gear, t.assistant_bg);
 
-    // The model menu.
+    // The model menu: as wide as its label, the chevron right after it (a long name is elided
+    // at `MODEL_MENU_MAX`, or short of the history button).
     let label = session
         .ai_model()
         .map_or_else(|| tr("No model").to_string(), |m| m.label().to_string());
-    let menu_r = Rect::from_min_max(
+    let f = semibold(12.0);
+    let label_w = p
+        .layout_no_wrap(label.clone(), f.clone(), t.sidebar_text)
+        .size()
+        .x;
+    let room = (hist_r.left() - 6.0 - (r.left() + 28.0)).max(0.0);
+    let menu_w = (label_w + 24.0).min(MODEL_MENU_MAX).min(room);
+    let menu_r = Rect::from_min_size(
         pos2(r.left() + 28.0, r.center().y - 11.0),
-        pos2(hist_r.left() - 6.0, r.center().y + 11.0),
+        vec2(menu_w, 22.0),
     );
     let resp = ui
         .interact(menu_r, Id::new("ai-model"), Sense::click())
@@ -432,8 +470,7 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
     if resp.hovered() {
         p.rect_filled(menu_r, 5.0, t.row_hover);
     }
-    let f = semibold(12.0);
-    let text = widgets::elide(&p, &label, &f, menu_r.width() - 26.0);
+    let text = widgets::elide(&p, &label, &f, menu_r.width() - 24.0);
     p.text(
         pos2(menu_r.left() + 5.0, menu_r.center().y),
         Align2::LEFT_CENTER,
@@ -1267,8 +1304,19 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
                 resp.request_focus();
             }
         });
-    // Bottom row: include the document, send / stop.
+    // Bottom row: include the document; what the conversation used and the context meter
+    // (Argus's row), the meter by the send button to the last; send / stop.
     let row_y = field.bottom() - 16.0;
+    let busy = session.ai.is_busy();
+    let b = Rect::from_center_size(pos2(field.right() - 18.0, row_y), vec2(24.0, 24.0));
+    let context = session.ai_context();
+    let ring_r = {
+        let w = context.as_ref().map_or(0.0, |c| meter_width(&p, c));
+        Rect::from_min_max(
+            pos2(b.left() - 4.0 - w, row_y - 11.0),
+            pos2(b.left() - 4.0, row_y + 11.0),
+        )
+    };
     let include = session.ai.config.include_document;
     let doc_name = session
         .doc()
@@ -1286,7 +1334,13 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
         .x;
     let chip_r = Rect::from_min_size(
         pos2(field.left() + 9.0, row_y - 9.0),
-        vec2((tw + 26.0).min(field.width() - 50.0), 18.0),
+        vec2(
+            (tw + 26.0)
+                .min(CHIP_MAX)
+                .min(ring_r.left() - 8.0 - (field.left() + 9.0))
+                .max(26.0),
+            18.0,
+        ),
     );
     let resp = ui
         .interact(chip_r, Id::new("ai-doc-chip"), Sense::click())
@@ -1326,8 +1380,19 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
     if resp.clicked() {
         let _ = session.run("ai.toggleDocument", &serde_json::Value::Null);
     }
-    let busy = session.ai.is_busy();
-    let b = Rect::from_center_size(pos2(field.right() - 18.0, row_y), vec2(24.0, 24.0));
+    let stats = session.ai_stats();
+    usage_row(
+        ui,
+        t,
+        &stats,
+        Rect::from_min_max(
+            pos2(chip_r.right() + 10.0, row_y - 9.0),
+            pos2(ring_r.left() - 4.0, row_y + 9.0),
+        ),
+    );
+    if let Some(c) = &context {
+        context_meter(ui, t, st, c, ring_r);
+    }
     let can_send = !session.ai.draft.trim().is_empty() || !session.ai.draft_images.is_empty();
     let bresp = ui
         .interact(b, Id::new("ai-send"), Sense::click())
@@ -1380,6 +1445,471 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
             if reads { t.accent } else { t.error },
         );
     }
+}
+
+/// `14200000` → "14.2M", `297300` → "297.3k", `824` → "824" (Argus's compact token count).
+fn compact_tokens(n: u64) -> String {
+    let one = |v: f64| {
+        let t = format!("{v:.1}");
+        t.strip_suffix(".0").map_or(t.clone(), str::to_string)
+    };
+    if n >= 1_000_000 {
+        format!("{}M", one(n as f64 / 1_000_000.0))
+    } else if n >= 1_000 {
+        format!("{}k", one(n as f64 / 1_000.0))
+    } else {
+        n.to_string()
+    }
+}
+
+/// `326509` → "326,509".
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A cost as Argus writes it: two decimals from 1 up, four below, trailing zeros dropped.
+fn cost_text(usd: f64) -> String {
+    if usd <= 0.0 {
+        return "0.00".into();
+    }
+    if usd < 0.0001 {
+        return "<0.0001".into();
+    }
+    let t = if usd < 1.0 {
+        format!("{usd:.4}")
+    } else {
+        format!("{usd:.2}")
+    };
+    let t = t.trim_end_matches('0');
+    t.strip_suffix('.').unwrap_or(t).to_string()
+}
+
+/// One figure of the usage row.
+struct Stat {
+    /// Its order of leaving when the row is short of room (Argus's: speed, cache, turns and
+    /// steps, tokens; then the cost, so a narrow panel keeps only the context meter).
+    rank: u8,
+    /// Room before it when a figure precedes it (pt).
+    gap: f32,
+    icon: Option<fn(&egui::Painter, Rect, Color32)>,
+    text: String,
+    hint: String,
+}
+
+/// The figures of `s` that are known, in their order.
+fn stats_items(s: &texcraft_engine::ai_usage::ChatStats) -> Vec<Stat> {
+    let mut items = Vec::new();
+    if s.turns > 0 || s.steps > 0 {
+        let turns = if s.turns == 1 {
+            trf!("{n} turn", n = s.turns)
+        } else {
+            trf!("{n} turns", n = s.turns)
+        };
+        let text = match s.steps {
+            0 => turns,
+            1 => format!("{turns} {}", trf!("{n} step", n = s.steps)),
+            n => format!("{turns} {}", trf!("{n} steps", n = n)),
+        };
+        items.push(Stat {
+            rank: 2,
+            gap: 0.0,
+            icon: Some(icons::gauge),
+            text,
+            hint: trf!(
+                "Turns: questions asked. Steps: requests to the model, including the rounds after it read project files. Tools called: {tools}.",
+                tools = s.tool_calls
+            ),
+        });
+    }
+    if let Some(v) = s.speed {
+        items.push(Stat {
+            rank: 0,
+            gap: 8.0,
+            icon: None,
+            text: format!("~{v} tok/s"),
+            hint: tr(
+                "Average output speed of the latest answer, including waiting and reasoning, excluding the time tools took.",
+            )
+            .into(),
+        });
+    }
+    if let Some(n) = s.tokens {
+        items.push(Stat {
+            rank: 3,
+            gap: 10.0,
+            icon: Some(icons::database),
+            text: format!("{} tok", compact_tokens(n)),
+            hint: trf!(
+                "What this conversation's requests used: {input} input and {output} output tokens.",
+                input = grouped(s.input),
+                output = grouped(s.output)
+            ),
+        });
+    }
+    if let Some(p) = s.cache_percent {
+        items.push(Stat {
+            rank: 1,
+            gap: 8.0,
+            icon: None,
+            text: trf!("Cache hit {n}%", n = p),
+            hint: tr(
+                "Cached input tokens out of all input tokens, weighted by usage. Shown only when every request reported its cache hits.",
+            )
+            .into(),
+        });
+    }
+    if let Some(c) = s.cost_usd {
+        items.push(Stat {
+            rank: 4,
+            gap: 8.0,
+            icon: None,
+            text: format!("${}", cost_text(c)),
+            hint: trf!(
+                "What the provider billed for this conversation: ${amount}.",
+                amount = format!("{c:.6}")
+            ),
+        });
+    }
+    items
+}
+
+/// Which of `items` fit in `room` (pt), dropping them by rank; and the width they take.
+fn fit_stats(p: &egui::Painter, items: &[Stat], room: f32) -> (Vec<bool>, f32) {
+    let font = FontId::proportional(STAT_SIZE);
+    let widths: Vec<f32> = items
+        .iter()
+        .map(|i| {
+            let text = p
+                .layout_no_wrap(i.text.clone(), font.clone(), Color32::WHITE)
+                .size()
+                .x;
+            text + if i.icon.is_some() {
+                STAT_SIZE + 5.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let total = |shown: &[bool]| {
+        let mut w = 0.0;
+        let mut first = true;
+        for ((item, width), on) in items.iter().zip(&widths).zip(shown) {
+            if *on {
+                w += width + if first { 0.0 } else { item.gap };
+                first = false;
+            }
+        }
+        w
+    };
+    let mut shown = vec![true; items.len()];
+    for rank in 0..=4 {
+        if total(&shown) <= room {
+            break;
+        }
+        for (item, on) in items.iter().zip(shown.iter_mut()) {
+            if item.rank == rank {
+                *on = false;
+            }
+        }
+    }
+    let w = total(&shown);
+    if w > room {
+        return (vec![false; items.len()], 0.0);
+    }
+    (shown, w)
+}
+
+/// What the conversation used (Argus's run statistics), right-aligned in `area`: the figures
+/// that do not fit leave, never overlapping the chip or the meter.
+fn usage_row(ui: &Ui, t: &Tokens, s: &texcraft_engine::ai_usage::ChatStats, area: Rect) {
+    let items = stats_items(s);
+    if items.is_empty() || area.width() <= 0.0 {
+        return;
+    }
+    let p = ui.painter();
+    let (shown, width) = fit_stats(p, &items, area.width());
+    let font = FontId::proportional(STAT_SIZE);
+    let mut x = area.right() - width;
+    let mut first = true;
+    for (k, (item, on)) in items.iter().zip(&shown).enumerate() {
+        if !*on {
+            continue;
+        }
+        if !first {
+            x += item.gap;
+        }
+        first = false;
+        let start = x;
+        if let Some(icon) = item.icon {
+            let r = Rect::from_min_size(
+                pos2(x, area.center().y - STAT_SIZE / 2.0 - 0.5),
+                vec2(STAT_SIZE + 1.0, STAT_SIZE + 1.0),
+            );
+            icon(p, r, t.text_weak);
+            x += STAT_SIZE + 5.0;
+        }
+        let g = p.layout_no_wrap(item.text.clone(), font.clone(), t.text_weak);
+        let w = g.size().x;
+        p.galley(pos2(x, area.center().y - g.size().y / 2.0), g, t.text_weak);
+        x += w;
+        let r = Rect::from_min_max(pos2(start, area.top()), pos2(x, area.bottom()));
+        ui.interact(r, Id::new(("ai-usage", k)), Sense::hover())
+            .on_hover_text(&item.hint);
+    }
+}
+
+/// The context meter's text ("28%").
+fn meter_text(c: &ContextUsage) -> String {
+    format!("{}%", c.percent)
+}
+
+/// How wide the context meter is: ring, gap, percentage and its padding.
+fn meter_width(p: &egui::Painter, c: &ContextUsage) -> f32 {
+    let w = p
+        .layout_no_wrap(
+            meter_text(c),
+            FontId::proportional(STAT_SIZE),
+            Color32::WHITE,
+        )
+        .size()
+        .x;
+    6.0 + RING + 5.0 + w + 6.0
+}
+
+/// A ring filled clockwise from the top to `fraction`.
+fn paint_ring(p: &egui::Painter, center: egui::Pos2, track: Color32, fill: Color32, fraction: f32) {
+    let r = (RING - RING_LINE) / 2.0;
+    p.circle_stroke(center, r, Stroke::new(RING_LINE, track));
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction <= 0.0 {
+        return;
+    }
+    let n = ((48.0 * fraction).ceil() as usize).max(2);
+    let start = -std::f32::consts::FRAC_PI_2;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = start + std::f32::consts::TAU * fraction * i as f32 / n as f32;
+            center + vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, Stroke::new(RING_LINE, fill)));
+}
+
+/// The context meter (a ring and the share of the window in use) in `r`; hovering it opens the
+/// breakdown above it, as in Argus.
+fn context_meter(ui: &Ui, t: &Tokens, st: &mut AiPanelState, c: &ContextUsage, r: Rect) {
+    let resp = ui.interact(r, Id::new("ai-context"), Sense::hover());
+    let now = ui.input(|i| i.time);
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let on_pop = pointer.is_some_and(|q| st.context_pop.is_some_and(|pop| pop.contains(q)));
+    let over = resp.hovered() || on_pop;
+    if !over {
+        st.context_dismissed = false;
+    }
+    if over && !st.context_dismissed {
+        st.context_open = true;
+        st.context_close_at = None;
+    } else if st.context_open {
+        let at = *st.context_close_at.get_or_insert(now + POP_GRACE);
+        if now >= at {
+            st.context_open = false;
+            st.context_close_at = None;
+        } else {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(at - now));
+        }
+    }
+    // Esc, or a press anywhere else, closes it.
+    let pressed_outside = ui.input(|i| i.pointer.any_pressed()) && !over;
+    if st.context_open && (ui.input(|i| i.key_pressed(Key::Escape)) || pressed_outside) {
+        st.context_open = false;
+        st.context_close_at = None;
+        st.context_dismissed = over;
+    }
+
+    let warning = c.percent >= 80;
+    let p = ui.painter();
+    let color = if warning {
+        t.warning
+    } else if st.context_open {
+        t.text
+    } else {
+        t.text_weak
+    };
+    if st.context_open {
+        p.rect_filled(r, 6.0, t.row_hover);
+    }
+    let center = pos2(r.left() + 6.0 + RING / 2.0, r.center().y);
+    paint_ring(
+        p,
+        center,
+        t.composer_border,
+        color,
+        c.percent as f32 / 100.0,
+    );
+    p.text(
+        pos2(r.left() + 6.0 + RING + 5.0, r.center().y),
+        Align2::LEFT_CENTER,
+        meter_text(c),
+        FontId::proportional(STAT_SIZE),
+        color,
+    );
+    st.context_pop = if st.context_open {
+        Some(context_popover(ui, t, c, r))
+    } else {
+        None
+    };
+}
+
+/// The context breakdown over the meter `anchor` (right edges aligned, kept on screen); returns
+/// where it went.
+fn context_popover(ui: &Ui, t: &Tokens, c: &ContextUsage, anchor: Rect) -> Rect {
+    let screen = ui.ctx().content_rect();
+    let w = POP_W.min(screen.width() - 24.0).max(120.0);
+    let line = 18.0;
+    let row = 24.0;
+    let h = POP_PAD * 2.0 + line + 5.0 + line + 10.0 + 4.0 + 10.0 + 4.0 * row;
+    let left = (anchor.right() - w)
+        .min(screen.right() - w - 12.0)
+        .max(12.0);
+    let top = (anchor.top() - h - 8.0).max(12.0);
+    let rect = Rect::from_min_size(pos2(left, top), vec2(w, h));
+    egui::Area::new(Id::new("ai-context-popover"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .fade_in(false)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            let (r, _) = ui.allocate_exact_size(rect.size(), Sense::hover());
+            let p = ui.painter();
+            let frame = menu::frame(t);
+            p.add(frame.shadow.as_shape(r, CornerRadius::same(12)));
+            p.rect(
+                r,
+                12.0,
+                t.popup_bg,
+                Stroke::new(0.5, t.menu_border),
+                egui::StrokeKind::Inside,
+            );
+            let inner = r.shrink(POP_PAD);
+            let font = FontId::proportional(12.0);
+            let mut y = inner.top();
+            // Title and the share used.
+            p.text(
+                pos2(inner.left(), y + line / 2.0),
+                Align2::LEFT_CENTER,
+                tr("Context window"),
+                semibold(12.0),
+                t.text,
+            );
+            p.text(
+                pos2(inner.right(), y + line / 2.0),
+                Align2::RIGHT_CENTER,
+                trf!("{percent}% used", percent = c.percent),
+                font.clone(),
+                t.text_weak,
+            );
+            y += line + 5.0;
+            // Tokens in use of the window.
+            let total = format!(
+                "{}{} / {}{} tokens",
+                if c.estimated { "~" } else { "" },
+                grouped(c.used),
+                if c.window_assumed { "~" } else { "" },
+                grouped(c.window)
+            );
+            let total_r = p.text(
+                pos2(inner.left(), y + line / 2.0),
+                Align2::LEFT_CENTER,
+                total,
+                font.clone(),
+                t.text,
+            );
+            let mut notes = Vec::new();
+            if c.window_assumed {
+                notes.push(trf!(
+                    "The model's context length is not known; {n} tokens are assumed. Set it in Settings → AI.",
+                    n = grouped(c.window)
+                ));
+            }
+            if c.images {
+                notes.push(
+                    tr("Images are estimated: what they take depends on how the model reads them.")
+                        .to_string(),
+                );
+            }
+            if !notes.is_empty() {
+                ui.interact(total_r, Id::new("ai-context-total"), Sense::hover())
+                    .on_hover_text(notes.join("\n"));
+            }
+            y += line + 10.0;
+            // The bar: each part's share of the window in use.
+            let bar = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 4.0));
+            p.rect_filled(bar, 2.0, t.row_hover);
+            let parts = [
+                (tr("System prompt and document"), c.system, t.context_system),
+                (tr("Tool definitions"), c.tools, t.context_tools),
+                (tr("Conversation and tool results"), c.messages, t.context_messages),
+            ];
+            let sum: u64 = parts.iter().map(|(_, n, _)| *n).sum();
+            let used_w = bar.width() * c.percent as f32 / 100.0;
+            let mut x = bar.left();
+            if sum > 0 {
+                let painter = p.with_clip_rect(bar);
+                for (_, n, color) in &parts {
+                    let w = used_w * *n as f32 / sum as f32;
+                    painter.rect_filled(
+                        Rect::from_min_size(pos2(x, bar.top()), vec2(w, bar.height())),
+                        0.0,
+                        *color,
+                    );
+                    x += w;
+                }
+            }
+            y += 4.0 + 10.0;
+            // Tokens left, then the parts.
+            let value = |n: u64| format!("~{}", grouped(n));
+            let mut row_at = |label: &str, n: u64, dot: Option<Color32>| {
+                let cy = y + row / 2.0;
+                let mut lx = inner.left();
+                if let Some(color) = dot {
+                    p.rect_filled(
+                        Rect::from_center_size(pos2(lx + 3.5, cy), vec2(7.0, 7.0)),
+                        2.0,
+                        color,
+                    );
+                    lx += 13.0;
+                }
+                p.text(
+                    pos2(lx, cy),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font.clone(),
+                    t.text_weak,
+                );
+                p.text(
+                    pos2(inner.right(), cy),
+                    Align2::RIGHT_CENTER,
+                    value(n),
+                    font.clone(),
+                    t.text,
+                );
+                y += row;
+            };
+            row_at(tr("Remaining tokens"), c.remaining, None);
+            for (label, n, color) in parts {
+                row_at(label, n, Some(color));
+            }
+        });
+    rect
 }
 
 #[cfg(test)]
@@ -1436,5 +1966,262 @@ mod link_tests {
             split_target("<my%20paper.tex>"),
             ("my paper.tex".into(), None)
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_row_tests {
+    use super::*;
+    use texcraft_engine::ai::ChatMessage;
+    use texcraft_engine::ai_usage::RunUsage;
+    use texcraft_i18n::Lang;
+
+    /// A session with a model of a known window, one question answered after two requests, and
+    /// every figure of the row known.
+    fn session() -> Session {
+        let mut s = Session::new(Arc::new(|| {}));
+        s.settings.live_typeset = false;
+        s.update.url = "/nonexistent/texcraft-latest.json".into();
+        let ollama = texcraft_ai::PRESETS
+            .iter()
+            .find(|p| p.id == "ollama")
+            .unwrap();
+        let i = s.ai.config.add(ollama);
+        s.ai.config.providers[i].models = vec![texcraft_ai::Model {
+            id: "m".into(),
+            context_length: Some(128_000),
+            ..Default::default()
+        }];
+        s.ai.config.normalize();
+        let message = |role, text: &str| ChatMessage {
+            role,
+            text: text.into(),
+            blocks: Vec::new(),
+            model: Some("m".into()),
+            provider: None,
+            pending: false,
+            thinking: false,
+            error: None,
+            note: None,
+            images: Vec::new(),
+            tools: Vec::new(),
+        };
+        s.ai.messages = vec![
+            message(Role::User, "Why ??"),
+            message(Role::Assistant, "Typeset twice."),
+        ];
+        s.ai.usage.runs = vec![RunUsage {
+            message: 1,
+            calls: 97,
+            tool_calls: 60,
+            measured: 97,
+            input: 14_100_000,
+            output: 120_000,
+            cache_hit: 10_434_000,
+            cache_reported: true,
+            cost_usd: Some(2.065),
+            model_ms: 1_000_000,
+        }];
+        s
+    }
+
+    /// Draws the Assistant `width` pt wide (two frames, so nothing is left from a wider one) with
+    /// the pointer at `pointer`, at `time` s; returns the document chip, the row's figures (by
+    /// their order, `None` when left out), the context meter and the send button.
+    #[allow(clippy::type_complexity)]
+    fn draw(
+        ctx: &egui::Context,
+        s: &mut Session,
+        st: &mut AiPanelState,
+        width: f32,
+        pointer: Option<egui::Pos2>,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> (Rect, Vec<Option<Rect>>, Option<Rect>, Rect) {
+        let t = Tokens::light();
+        for k in 0..2 {
+            let mut ev: Vec<egui::Event> =
+                pointer.map(egui::Event::PointerMoved).into_iter().collect();
+            if k == 1 {
+                ev.extend(events.clone());
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 640.0))),
+                time: Some(time + f64::from(k) * 0.001),
+                events: ev,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| show(ui, &t, s, st));
+            out.textures_delta.clear();
+        }
+        let rect = |id: Id| ctx.read_response(id).map(|r| r.rect);
+        (
+            rect(Id::new("ai-doc-chip")).unwrap(),
+            (0..5).map(|k| rect(Id::new(("ai-usage", k)))).collect(),
+            rect(Id::new("ai-context")),
+            rect(Id::new("ai-send")).unwrap(),
+        )
+    }
+
+    /// Wide, every figure shows; narrower, they leave in Argus's order (speed, cache, turns and
+    /// steps, tokens, then the cost) and never overlap the chip, each other, the meter or the
+    /// send button; the context meter stays by the send button to the last. In both languages.
+    #[test]
+    fn the_row_gives_way_and_keeps_the_context_meter() {
+        for lang in [Lang::En, Lang::ZhHans] {
+            let _lang = texcraft_i18n::scoped(lang);
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut s = session();
+            let mut st = AiPanelState::default();
+            // Figures by their order: turns/steps, speed, tokens, cache, cost.
+            let leaving = [1usize, 3, 0, 2, 4];
+            let mut last_shown = 5;
+            let mut width = 760.0;
+            while width >= 160.0 {
+                let (chip, items, meter, send) =
+                    draw(&ctx, &mut s, &mut st, width, None, 0.0, Vec::new());
+                let Some(meter) = meter else {
+                    panic!("{lang:?} {width}: no context meter");
+                };
+                assert!(
+                    meter.right() <= send.left() && meter.left() >= chip.right(),
+                    "{lang:?} {width}: {chip:?} {meter:?} {send:?}"
+                );
+                let shown: Vec<Rect> = items.iter().flatten().copied().collect();
+                for r in &shown {
+                    assert!(
+                        r.left() >= chip.right() && r.right() <= meter.left(),
+                        "{lang:?} {width}: {r:?} between {chip:?} and {meter:?}"
+                    );
+                }
+                for pair in shown.windows(2) {
+                    assert!(
+                        pair[0].right() <= pair[1].left(),
+                        "{lang:?} {width}: {pair:?}"
+                    );
+                }
+                // The figures left out are the first to leave.
+                let gone = items.iter().filter(|r| r.is_none()).count();
+                for (k, r) in items.iter().enumerate() {
+                    let rank = leaving.iter().position(|x| *x == k).unwrap();
+                    assert_eq!(r.is_none(), rank < gone, "{lang:?} {width}: {items:?}");
+                }
+                assert!(
+                    shown.len() <= last_shown,
+                    "{lang:?} {width}: fewer as it narrows"
+                );
+                last_shown = shown.len();
+                if width >= 700.0 {
+                    assert_eq!(shown.len(), 5, "{lang:?} {width}: all of them");
+                }
+                width -= 20.0;
+            }
+            assert_eq!(last_shown, 0, "{lang:?}: at the narrowest only the meter");
+        }
+    }
+
+    /// Hovering the meter opens the breakdown above it, right edges aligned; it stays while the
+    /// pointer crosses to it, closes 180 ms after the pointer left, and Esc closes it.
+    #[test]
+    fn the_meter_opens_its_breakdown_on_hover() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut s = session();
+        let mut st = AiPanelState::default();
+        let (_, _, meter, _) = draw(&ctx, &mut s, &mut st, 420.0, None, 0.0, Vec::new());
+        let meter = meter.unwrap();
+        assert!(!st.context_open);
+        draw(
+            &ctx,
+            &mut s,
+            &mut st,
+            420.0,
+            Some(meter.center()),
+            1.0,
+            Vec::new(),
+        );
+        assert!(st.context_open);
+        let pop = st.context_pop.unwrap();
+        assert!(
+            pop.bottom() <= meter.top() && (pop.right() - meter.right()).abs() < 0.5,
+            "{pop:?} {meter:?}"
+        );
+        assert_eq!(pop.width(), POP_W);
+        // Across the gap and onto it: still open.
+        let gap = pos2(meter.center().x, meter.top() - 4.0);
+        draw(&ctx, &mut s, &mut st, 420.0, Some(gap), 1.1, Vec::new());
+        assert!(st.context_open);
+        draw(
+            &ctx,
+            &mut s,
+            &mut st,
+            420.0,
+            Some(pop.center()),
+            1.2,
+            Vec::new(),
+        );
+        assert!(st.context_open);
+        // Away: open for 180 ms more, then closed.
+        let away = pos2(20.0, 100.0);
+        draw(&ctx, &mut s, &mut st, 420.0, Some(away), 2.0, Vec::new());
+        assert!(st.context_open);
+        draw(&ctx, &mut s, &mut st, 420.0, Some(away), 2.3, Vec::new());
+        assert!(!st.context_open && st.context_pop.is_none());
+        // Esc closes it, and it stays closed while the pointer stays on the meter.
+        draw(
+            &ctx,
+            &mut s,
+            &mut st,
+            420.0,
+            Some(meter.center()),
+            3.0,
+            Vec::new(),
+        );
+        assert!(st.context_open);
+        let esc = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        draw(
+            &ctx,
+            &mut s,
+            &mut st,
+            420.0,
+            Some(meter.center()),
+            3.1,
+            vec![esc],
+        );
+        assert!(!st.context_open);
+        draw(
+            &ctx,
+            &mut s,
+            &mut st,
+            420.0,
+            Some(meter.center()),
+            3.2,
+            Vec::new(),
+        );
+        assert!(!st.context_open);
+    }
+
+    #[test]
+    fn numbers_read_like_argus() {
+        assert_eq!(compact_tokens(14_200_000), "14.2M");
+        assert_eq!(compact_tokens(1_000_000), "1M");
+        assert_eq!(compact_tokens(297_300), "297.3k");
+        assert_eq!(compact_tokens(824), "824");
+        assert_eq!(grouped(326_509), "326,509");
+        assert_eq!(grouped(1_048_576), "1,048,576");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(cost_text(14.87), "14.87");
+        assert_eq!(cost_text(0.605), "0.605");
+        assert_eq!(cost_text(1.5), "1.5");
+        assert_eq!(cost_text(2.0), "2");
+        assert_eq!(cost_text(0.00001), "<0.0001");
+        assert_eq!(cost_text(0.0), "0.00");
     }
 }

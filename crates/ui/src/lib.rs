@@ -10,6 +10,7 @@ use std::time::Instant;
 use egui::{Context, Rect, Sense, Stroke, pos2, vec2};
 use texcraft_engine::{Effect, Layout, NativeEdit, Session, ThemeChoice, registry};
 
+pub mod ai_card;
 pub mod ai_inline;
 pub mod ai_logos;
 pub mod ai_panel;
@@ -336,10 +337,11 @@ impl Workbench {
                     self.prefs.open = true;
                     self.prefs.focus = true;
                 }
-                Effect::AiSettings => {
+                Effect::AiSettings | Effect::AiActionSettings => {
                     self.prefs.open = true;
                     self.prefs.focus = true;
                     self.prefs.pane = prefs::Pane::Ai;
+                    self.prefs.ai_tab = usize::from(e == Effect::AiActionSettings);
                 }
                 Effect::TypesetConfiguration => self.dialog = Dialog::TypesetConfiguration,
                 Effect::GotoPage(p) => self.pdf.goto_page(p),
@@ -1035,6 +1037,102 @@ mod tests {
         }
         assert_eq!(line(&session), Some(3), "the row's first line");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Assistant panel's header row is as tall as the PDF's header bar beside it: the two
+    /// dividers under them meet at the same height.
+    #[test]
+    fn assistant_header_lines_up_with_the_pdf_header() {
+        let ctx = Context::default();
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.update.url = "/nonexistent/texcraft-latest.json".into();
+        session.view.assistant = true;
+        let mut out = None;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1388.0, 824.0))),
+                ..Default::default()
+            };
+            let mut o = ctx.run_ui(input, |ui| bench.ui(ui, &mut session));
+            o.textures_delta.clear();
+            out = Some(o);
+        }
+        let Some(out) = out else {
+            panic!("no frame");
+        };
+        // Every horizontal line drawn: (y, left, right).
+        fn walk(shape: &egui::Shape, into: &mut Vec<(f32, f32, f32)>) {
+            match shape {
+                egui::Shape::LineSegment { points: [a, b], .. } if a.y == b.y => {
+                    into.push((a.y, a.x.min(b.x), a.x.max(b.x)));
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut lines = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut lines);
+        }
+        let Some(menu) = ctx.read_response(egui::Id::new("ai-model")).map(|r| r.rect) else {
+            panic!("no Assistant header");
+        };
+        // The divider under the Assistant's header: the first line below its model menu.
+        let Some(&(y, left, _)) = lines
+            .iter()
+            .filter(|(y, l, r)| *y > menu.bottom() && *l <= menu.left() && *r >= menu.right())
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+        else {
+            panic!("no divider under the Assistant header: {lines:?}");
+        };
+        // The PDF header's divider ends where the Assistant panel begins.
+        let Some(&(pdf_y, _, _)) = lines
+            .iter()
+            .filter(|(y, _, r)| (*r - left).abs() <= 2.0 && *y < menu.bottom() + 20.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+        else {
+            panic!("no PDF header divider ending at {left}: {lines:?}");
+        };
+        assert_eq!(y, pdf_y, "{lines:?}");
+        assert_eq!(menu.center().y, y - theme::HEADER_HEIGHT / 2.0);
+    }
+
+    /// The Assistant header's model menu is as wide as the model's name, its chevron right
+    /// after it; a long name stops at the menu's widest and is elided.
+    #[test]
+    fn model_menu_hugs_the_model_name() {
+        let ctx = Context::default();
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.update.url = "/nonexistent/texcraft-latest.json".into();
+        session.view.assistant = true;
+        let Some(local) = texcraft_ai::PRESETS.iter().find(|p| p.id == "ollama") else {
+            panic!("no local preset");
+        };
+        let i = session.ai.config.add(local);
+        let mut menu_width = |session: &mut Session, model: &str| {
+            session.ai.config.providers[i].models = vec![model.into()];
+            session.ai.config.normalize();
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1388.0, 824.0))),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| bench.ui(ui, session));
+                out.textures_delta.clear();
+            }
+            let Some(menu) = ctx.read_response(egui::Id::new("ai-model")) else {
+                panic!("no model menu");
+            };
+            menu.rect.width()
+        };
+        let short = menu_width(&mut session, "gpt-5");
+        let long = menu_width(&mut session, &"a-very-long-model-name-".repeat(6));
+        assert!(short > 24.0 && short < 80.0, "{short}");
+        assert_eq!(long, ai_panel::MODEL_MENU_MAX);
     }
 
     /// The main window comes forward for a dialog or a new document raised while another of the

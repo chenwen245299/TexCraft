@@ -8,6 +8,7 @@
 //! words or numbers ("退出 TexCraft", "{n} 个文件"); "…" stays "…".
 
 mod ai;
+mod ai_actions;
 mod app;
 mod commands;
 mod editor;
@@ -29,6 +30,7 @@ const TABLES: &[Entries] = &[
     git::ENTRIES,
     prefs::ENTRIES,
     ai::ENTRIES,
+    ai_actions::ENTRIES,
 ];
 
 pub(crate) fn entries() -> impl Iterator<Item = (&'static str, &'static str)> {

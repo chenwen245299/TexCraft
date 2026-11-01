@@ -249,6 +249,32 @@ pub fn button(ui: &mut Ui, t: &Tokens, label: &str) -> bool {
     item(ui, t, label, Item::default()).clicked()
 }
 
+/// A menu item that opens a submenu: its label and a `>` at the right, highlighted while the
+/// submenu is `open` (as a macOS menu keeps its parent row lit). The caller shows the submenu
+/// beside the row while the row is hovered or the submenu is in use; a click does not close
+/// the menu.
+pub fn submenu_item(ui: &mut Ui, t: &Tokens, label: &str, open: bool) -> Response {
+    let font = FontId::proportional(FONT);
+    let natural = INDENT + text_width(ui, label, &font) + SHORTCUT_GAP + 18.0;
+    let (r, resp) = ui.allocate_exact_size(vec2(row_width(ui, natural), ROW), Sense::click());
+    let p = ui.painter();
+    let hot = open || resp.hovered();
+    if hot {
+        p.rect_filled(r, 5.0, t.accent);
+    }
+    let fg = if hot { Color32::WHITE } else { t.text };
+    p.text(
+        pos2(r.left() + INDENT, r.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        fg,
+    );
+    let arrow = Rect::from_center_size(pos2(r.right() - 15.0, r.center().y), vec2(11.0, 11.0));
+    icons::chevron_right(p, arrow, if hot { fg } else { t.text_weak });
+    resp
+}
+
 /// A hairline between groups of items.
 pub fn separator(ui: &mut Ui, t: &Tokens) {
     let (r, _) = ui.allocate_exact_size(vec2(row_width(ui, 0.0), 11.0), Sense::hover());

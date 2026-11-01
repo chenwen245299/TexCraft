@@ -11,6 +11,7 @@ use texcraft_ai::{Image, Role};
 
 use crate::ai::ChatMessage;
 use crate::ai_tools::ToolUse;
+use crate::ai_usage::{ChatUsage, PromptSample, RunUsage};
 
 /// The folder of conversations without a project.
 const NO_PROJECT: &str = "_none";
@@ -62,6 +63,12 @@ struct StoredMessage {
 #[derive(Serialize, Deserialize)]
 struct StoredChat {
     messages: Vec<StoredMessage>,
+    /// What its answers used (older files have none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    runs: Vec<RunUsage>,
+    /// The last prompt the provider counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sample: Option<PromptSample>,
 }
 
 /// Where conversations are kept (TexCraft's data folder's `chats`).
@@ -165,35 +172,39 @@ impl ChatStore {
         list
     }
 
-    /// Conversation `id` of `project`.
-    pub fn load(&self, project: Option<&Path>, id: &str) -> Option<Vec<ChatMessage>> {
+    /// Conversation `id` of `project`, and what it used.
+    pub fn load(&self, project: Option<&Path>, id: &str) -> Option<(Vec<ChatMessage>, ChatUsage)> {
         if !valid_id(id) {
             return None;
         }
         let text = std::fs::read_to_string(self.dir(project).join(format!("{id}.json"))).ok()?;
         let chat: StoredChat = serde_json::from_str(&text).ok()?;
-        Some(
-            chat.messages
-                .into_iter()
-                .map(|m| ChatMessage {
-                    role: m.role,
-                    text: m.text,
-                    blocks: Vec::new(),
-                    model: m.model,
-                    provider: m.provider,
-                    pending: false,
-                    thinking: false,
-                    error: m.error,
-                    note: m.note,
-                    images: m
-                        .images
-                        .iter()
-                        .filter_map(|i| Image::from_base64(&i.name, &i.media_type, &i.data))
-                        .collect(),
-                    tools: m.tools,
-                })
-                .collect(),
-        )
+        let usage = ChatUsage {
+            runs: chat.runs,
+            sample: chat.sample,
+        };
+        let messages = chat
+            .messages
+            .into_iter()
+            .map(|m| ChatMessage {
+                role: m.role,
+                text: m.text,
+                blocks: Vec::new(),
+                model: m.model,
+                provider: m.provider,
+                pending: false,
+                thinking: false,
+                error: m.error,
+                note: m.note,
+                images: m
+                    .images
+                    .iter()
+                    .filter_map(|i| Image::from_base64(&i.name, &i.media_type, &i.data))
+                    .collect(),
+                tools: m.tools,
+            })
+            .collect();
+        Some((messages, usage))
     }
 
     /// Saves conversation `id` of `project` (an answer still arriving is left out).
@@ -202,6 +213,7 @@ impl ChatStore {
         project: Option<&Path>,
         id: &str,
         messages: &[ChatMessage],
+        usage: &ChatUsage,
     ) -> Result<(), String> {
         if !valid_id(id) {
             return Err(format!("not a conversation id: {id}"));
@@ -238,6 +250,8 @@ impl ChatStore {
                     tools: m.tools.clone(),
                 })
                 .collect(),
+            runs: usage.runs.clone(),
+            sample: usage.sample.clone(),
         };
         let json = serde_json::to_vec(&chat).map_err(|e| e.to_string())?;
         write_atomic(&dir.join(format!("{id}.json")), &json)?;
@@ -341,13 +355,39 @@ mod tests {
         let a = new_id();
         let b = new_id();
         assert_ne!(a, b);
-        store.save(Some(&project), &a, &first).unwrap();
+        let usage = ChatUsage {
+            runs: vec![RunUsage {
+                message: 1,
+                calls: 2,
+                tool_calls: 1,
+                measured: 2,
+                input: 3000,
+                output: 40,
+                cache_hit: 2048,
+                cache_reported: true,
+                cost_usd: None,
+                model_ms: 1500,
+            }],
+            sample: Some(PromptSample {
+                provider: "p".into(),
+                model: "m".into(),
+                estimated: 1400,
+                input: 1500,
+            }),
+        };
+        store.save(Some(&project), &a, &first, &usage).unwrap();
         let long = "x".repeat(100);
+        let none = ChatUsage::default();
         store
-            .save(Some(&project), &b, &[message(Role::User, &long)])
+            .save(Some(&project), &b, &[message(Role::User, &long)], &none)
             .unwrap();
         store
-            .save(Some(&other), &a, &[message(Role::User, "Other project")])
+            .save(
+                Some(&other),
+                &a,
+                &[message(Role::User, "Other project")],
+                &none,
+            )
             .unwrap();
 
         // Nothing in the project folder.
@@ -362,7 +402,8 @@ mod tests {
             list.iter()
                 .any(|c| c.title.chars().count() == TITLE_CHARS && c.title.ends_with('…'))
         );
-        let back = store.load(Some(&project), &a).unwrap();
+        let (back, back_usage) = store.load(Some(&project), &a).unwrap();
+        assert_eq!(back_usage, usage, "what it used comes back with it");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].text, first[0].text);
         assert_eq!(back[0].images, first[0].images);
@@ -370,7 +411,7 @@ mod tests {
         assert_eq!(store.list(Some(&other))[0].title, "Other project");
         // Ids name files: nothing else is read or written.
         assert!(store.load(Some(&project), "../index").is_none());
-        assert!(store.save(Some(&project), "../x", &first).is_err());
+        assert!(store.save(Some(&project), "../x", &first, &none).is_err());
 
         store.delete(Some(&project), &b).unwrap();
         assert_eq!(store.list(Some(&project)).len(), 1);

@@ -173,12 +173,14 @@ pub struct SpellState {
 }
 
 /// The editor's right-click menu: spelling suggestions when it opened on a misspelled word,
-/// then the edit commands.
+/// then the edit commands and the AI actions' submenu.
 struct SpellMenu {
     spell: Option<SpellTarget>,
     at: Pos2,
     /// Just opened: the menu measures itself again (its items differ from the last one's).
     fresh: bool,
+    /// The AI submenu is open.
+    ai_open: bool,
 }
 
 /// The misspelled word a right-click menu is about.
@@ -1380,16 +1382,25 @@ fn accept_completion(session: &mut Session, st: &mut EditorState) {
     st.push_selection = Some(session.active);
 }
 
-/// Handles Return: auto-indent, auto-itemise, auto `\end{env}`. Returns true if handled.
+/// Handles Return: auto-indent, auto-itemise, auto `\end{env}`. Over a selection it replaces
+/// the selection, as typing does. Returns true if handled.
 fn smart_return(session: &mut Session, auto_indent: bool, auto_end: bool) -> bool {
     let Some(doc) = session.doc_mut() else {
         return false;
     };
-    if !doc.selection.is_empty() {
-        return false;
-    }
-    let text = doc.text.clone();
-    let caret_b = edit::byte_of(&text, doc.selection.cursor);
+    let sel = doc.selection;
+    let text = if sel.is_empty() {
+        doc.text.clone()
+    } else {
+        let a = edit::byte_of(&doc.text, sel.start());
+        let b = edit::byte_of(&doc.text, sel.end());
+        format!(
+            "{}{}",
+            doc.text.get(..a).unwrap_or(""),
+            doc.text.get(b..).unwrap_or("")
+        )
+    };
+    let caret_b = edit::byte_of(&text, sel.start());
     let line_start = text
         .get(..caret_b)
         .and_then(|x| x.rfind('\n'))
@@ -1581,7 +1592,10 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     }
     if st.focus || reveal.is_some() {
         ui.memory_mut(|m| m.request_focus(id));
-        st.focus = false;
+        // Asked for by a click elsewhere (a button in the Assistant, an outline entry): egui
+        // takes the focus back from a widget the frame a click lands outside it, so ask again
+        // next frame.
+        st.focus = ui.input(|i| i.pointer.any_click());
     }
 
     // ---- Highlights: find matches, bracket pair.
@@ -1668,6 +1682,7 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     let mut changed = false;
     let mut cmd_clicked = false;
     let mut output_galley: Option<(Arc<Galley>, Pos2)> = None;
+    let mut view = None;
     let mut cursor_range = None;
 
     let scroll = if wrap {
@@ -2006,8 +2021,10 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                         spell,
                         at: pointer,
                         fresh: true,
+                        ai_open: false,
                     });
                 }
+                view = Some(clip);
                 output_galley = Some((galley, gpos));
                 // Scroll to a revealed line.
                 if let Some((_, line)) = reveal {
@@ -2060,7 +2077,15 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     if st.completion.is_some() || !has_focus {
         session.inline_dismiss();
     }
+    // A right-click AI action's result hangs under the text it ran on.
+    let ai_anchor = match (&output_galley, view) {
+        (Some((galley, gpos)), Some(view)) => crate::ai_card::anchor(session, galley, *gpos, view),
+        _ => None,
+    };
+    // Esc closes the completion list or the menu first.
+    let card_escape = st.completion.is_none() && st.spell.menu.is_none();
     spell_menu(ui, t, session, st, active);
+    crate::ai_card::show(ui, t, session, ai_anchor, card_escape);
 
     // ---- Completion popup.
     if let (Some(c), Some(caret)) = (st.completion.as_ref(), st.caret_rect) {
@@ -2075,6 +2100,8 @@ fn spell_menu(ui: &Ui, t: &Tokens, session: &mut Session, st: &mut EditorState, 
     let mut ignore = false;
     let mut close = false;
     let mut command: Option<&'static str> = None;
+    let mut ai_row: Option<Rect> = None;
+    let mut ai_hovered = false;
     let area = egui::Area::new(Id::new("spell-menu"))
         .order(egui::Order::Foreground)
         .fixed_pos(menu.at + vec2(2.0, 2.0))
@@ -2116,17 +2143,64 @@ fn spell_menu(ui: &Ui, t: &Tokens, session: &mut Session, st: &mut EditorState, 
                     command = command.or(command_item(ui, t, session, id));
                 }
                 crate::menu::separator(ui, t);
+                // The AI actions (Settings → AI → Actions), in a submenu.
+                let ai = crate::menu::submenu_item(ui, t, "AI", menu.ai_open);
+                ai_hovered = ai.hovered() || ai.clicked();
+                ai_row = Some(ai.rect);
+                crate::menu::separator(ui, t);
                 command = command.or(command_item(ui, t, session, "typeset.syncPdf"));
             });
         });
+    // The submenu opens over its row. Another row of the menu closes it once the pointer rests
+    // there; it stays while the pointer is in it, in the menu's margin, outside the menus, or
+    // crossing other rows on its way to it.
+    let mut ai_open = menu.ai_open || ai_hovered;
+    let last = ui.ctx().memory(|m| m.area_rect(ai_submenu_id()));
+    if let (Some(p), Some(row)) = (ui.input(|i| i.pointer.hover_pos()), ai_row)
+        && area.response.rect.contains(p)
+        && (row.left()..=row.right()).contains(&p.x)
+        && !row.contains(p)
+        && !last.is_some_and(|r| r.contains(p))
+    {
+        let dx = ui.input(|i| i.pointer.delta().x);
+        let toward = last.is_some_and(|r| {
+            if r.center().x > row.center().x {
+                dx > 0.0
+            } else {
+                dx < 0.0
+            }
+        });
+        if !toward {
+            ai_open = false;
+        }
+    }
+    let mut run_action: Option<String> = None;
+    let sub = match ai_row {
+        Some(row) if ai_open => Some(ai_submenu(
+            ui,
+            t,
+            session,
+            (area.response.rect, row),
+            !menu.ai_open,
+            &mut command,
+            &mut run_action,
+        )),
+        _ => None,
+    };
+    let inside = |p: Pos2| area.response.rect.contains(p) || sub.is_some_and(|r| r.contains(p));
     if ui.input(|i| i.key_pressed(Key::Escape))
         || (ui.input(|i| i.pointer.any_click())
-            && !area
-                .response
-                .rect
-                .contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default()))
+            && !inside(ui.input(|i| i.pointer.interact_pos().unwrap_or_default()))
             && !ui.input(|i| i.pointer.secondary_clicked()))
     {
+        close = true;
+    }
+    if let Some(id) = run_action {
+        // The action selects what it works on: the editor keeps the keys to show it.
+        st.focus = true;
+        if let Err(e) = session.run("ai.runAction", &serde_json::json!({ "id": id })) {
+            session.set_status(e.to_string());
+        }
         close = true;
     }
     if let Some(id) = command {
@@ -2170,7 +2244,83 @@ fn spell_menu(ui: &Ui, t: &Tokens, session: &mut Session, st: &mut EditorState, 
         st.spell.menu = None;
     } else if let Some(m) = st.spell.menu.as_mut() {
         m.fresh = false;
+        m.ai_open = ai_open;
     }
+}
+
+/// The area of the right-click menu's AI submenu.
+fn ai_submenu_id() -> Id {
+    Id::new("spell-menu-ai")
+}
+
+/// The right-click menu's AI submenu, beside row `row` of `menu` (their rects; on the left
+/// when the right has no room): the actions of Settings → AI → Actions, then their settings.
+/// `fresh`: it just opened and measures itself. Sets `command` or `action` to the item chosen;
+/// returns its rect.
+fn ai_submenu(
+    ui: &Ui,
+    t: &Tokens,
+    session: &Session,
+    (menu, row): (Rect, Rect),
+    fresh: bool,
+    command: &mut Option<&'static str>,
+    action: &mut Option<String>,
+) -> Rect {
+    let id = ai_submenu_id();
+    let size = ui
+        .ctx()
+        .memory(|m| m.area_rect(id))
+        .map_or(vec2(200.0, 200.0), |r| r.size());
+    let screen = ui.ctx().content_rect();
+    let x = if menu.right() - 4.0 + size.x > screen.right() {
+        (menu.left() + 4.0 - size.x).max(screen.left())
+    } else {
+        menu.right() - 4.0
+    };
+    let y = (row.top() - f32::from(crate::menu::MARGIN))
+        .min(screen.bottom() - size.y)
+        .max(screen.top());
+    // Without a model (or a document) the actions are greyed out, and AI Settings… sets one up.
+    let ready = session.is_enabled("ai.runAction");
+    let actions: Vec<(String, String)> = session
+        .ai
+        .config
+        .actions
+        .iter()
+        .map(|a| (a.id.clone(), a.label()))
+        .collect();
+    egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos(x, y))
+        .sizing_pass(fresh)
+        .show(ui.ctx(), |ui| {
+            crate::menu::frame(t).show(ui, |ui| {
+                crate::menu::begin(ui, 160.0);
+                let opts = crate::menu::Item {
+                    disabled: !ready,
+                    ..Default::default()
+                };
+                for (id, label) in &actions {
+                    if crate::menu::item(ui, t, label, opts).clicked() {
+                        *action = Some(id.clone());
+                    }
+                }
+                if actions.is_empty() {
+                    let none = crate::menu::Item {
+                        disabled: true,
+                        ..Default::default()
+                    };
+                    crate::menu::item(ui, t, tr("No Actions"), none);
+                }
+                crate::menu::separator(ui, t);
+                if !ready && session.doc().is_some() {
+                    *command = command.or(command_item(ui, t, session, "ai.settings"));
+                }
+                *command = command.or(command_item(ui, t, session, "ai.actionSettings"));
+            });
+        })
+        .response
+        .rect
 }
 
 /// A menu item for command `id` (label and shortcut from the registry); returns the id when
@@ -2461,6 +2611,323 @@ mod tests {
         frame(&mut session, &mut st, right(at, true));
         frame(&mut session, &mut st, right(at, false));
         assert_eq!(selection(&session), Some((0, 0)));
+    }
+
+    /// The right-click menu's AI row opens a submenu beside it with the actions of Settings →
+    /// AI → Actions; another row closes it; a click on an action runs it on the selection (the
+    /// question goes to the Assistant) and closes the menus.
+    #[test]
+    fn right_click_ai_submenu_runs_an_action() {
+        let _en = texcraft_i18n::scoped(texcraft_i18n::Lang::En);
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        let text = "\\section{A}\nSome text here.\n";
+        assert!(
+            session
+                .run("edit.setText", &serde_json::json!({ "text": text }))
+                .is_ok()
+        );
+        let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let t = Tokens::light();
+        let mut st = EditorState::default();
+        let frame = |session: &mut Session, st: &mut EditorState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| show(ui, &t, session, st));
+            out.textures_delta.clear();
+        };
+        let button = |pos: Pos2, button, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        let hover = |session: &mut Session, st: &mut EditorState, pos: Pos2| {
+            frame(session, st, vec![egui::Event::PointerMoved(pos)]);
+            frame(session, st, Vec::new());
+            st.spell.menu.as_ref().map(|m| m.ai_open)
+        };
+        let area = |name: &str| ctx.memory(|m| m.area_rect(Id::new(name)));
+
+        st.focus = true;
+        frame(&mut session, &mut st, Vec::new());
+        let Some(rect) = ctx.read_response(id).map(|r| r.rect) else {
+            panic!("no editor");
+        };
+        let at = rect.min + vec2(2.0, 10.0);
+        // With no model the actions are there but greyed out.
+        assert!(!session.is_enabled("ai.runAction"));
+        // A local model (no key), on a port nothing answers.
+        let Some(ollama) = texcraft_ai::PRESETS.iter().find(|p| p.id == "ollama") else {
+            panic!("no Ollama preset");
+        };
+        let i = session.ai.config.add(ollama);
+        session.ai.config.providers[i].base_url = "http://127.0.0.1:9/v1".into();
+        session.ai.config.providers[i].models = vec!["local-model".into()];
+        session.ai.config.normalize();
+        assert!(session.is_enabled("ai.runAction"));
+
+        // Everything selected, then the menu.
+        let n = text.chars().count();
+        if let Some(doc) = session.docs.get_mut(session.active) {
+            doc.selection = Selection {
+                anchor: 0,
+                cursor: n,
+            };
+        }
+        st.push_selection = Some(session.active);
+        frame(&mut session, &mut st, Vec::new());
+        frame(
+            &mut session,
+            &mut st,
+            button(at, egui::PointerButton::Secondary, true),
+        );
+        frame(
+            &mut session,
+            &mut st,
+            button(at, egui::PointerButton::Secondary, false),
+        );
+        frame(&mut session, &mut st, Vec::new());
+        let Some(menu) = area("spell-menu") else {
+            panic!("the menu is up");
+        };
+        assert_eq!(
+            hover(&mut session, &mut st, menu.min + vec2(40.0, 3.0)),
+            Some(false)
+        );
+        // Down the menu to the AI row.
+        let mut y = menu.top() + 4.0;
+        let mut ai_y = None;
+        while y < menu.bottom() {
+            if hover(&mut session, &mut st, egui::pos2(menu.left() + 40.0, y)) == Some(true) {
+                ai_y = Some(y);
+                break;
+            }
+            y += 6.0;
+        }
+        let Some(ai_y) = ai_y else {
+            panic!("no AI row in {menu:?}");
+        };
+        // Its submenu is beside the menu, level with the row.
+        frame(&mut session, &mut st, Vec::new());
+        let Some(sub) = area("spell-menu-ai") else {
+            panic!("no submenu");
+        };
+        assert!(
+            sub.left() >= menu.right() - 6.0,
+            "{sub:?} right of {menu:?}"
+        );
+        assert!(
+            (sub.top() - (ai_y - 12.5)).abs() < 14.0,
+            "{sub:?} at {ai_y}"
+        );
+        // The menu's margin between the row and the submenu keeps it open (on the way across).
+        assert_eq!(
+            hover(&mut session, &mut st, egui::pos2(menu.right() - 1.5, ai_y)),
+            Some(true)
+        );
+        // Another row closes it; the AI row opens it again.
+        assert_eq!(
+            hover(&mut session, &mut st, menu.min + vec2(40.0, 15.0)),
+            Some(false)
+        );
+        assert_eq!(
+            hover(&mut session, &mut st, egui::pos2(menu.left() + 40.0, ai_y)),
+            Some(true)
+        );
+        // Across to the first action (Polish), which stays open on the way, and a click.
+        let polish = sub.min + vec2(40.0, 5.0 + 12.5);
+        assert_eq!(hover(&mut session, &mut st, polish), Some(true));
+        frame(
+            &mut session,
+            &mut st,
+            button(polish, egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut session,
+            &mut st,
+            button(polish, egui::PointerButton::Primary, false),
+        );
+        assert!(st.spell.menu.is_none(), "the menus close");
+        let question = session
+            .ai
+            .action
+            .as_ref()
+            .map(|r| r.question.clone())
+            .unwrap_or_default();
+        assert!(question.starts_with("Polish the wording"), "{question}");
+        assert!(
+            question.contains("```latex\n\\section{A}\nSome text here.\n```"),
+            "{question}"
+        );
+        assert!(
+            !session.view.assistant,
+            "the result is not in the Assistant"
+        );
+        assert!(session.ai.messages.is_empty());
+
+        // Its card hangs under the text; once the rewrite is in, Replace puts it in place.
+        frame(&mut session, &mut st, Vec::new());
+        frame(&mut session, &mut st, Vec::new());
+        let Some(card) = area("ai-action-card") else {
+            panic!("no result card");
+        };
+        assert!(card.top() > rect.top() + 20.0, "under the text: {card:?}");
+        if let Some(run) = session.ai.action.as_mut() {
+            run.answer = "```latex\nSome better text.\n```\nOne word changed.".into();
+            run.pending = false;
+        }
+        frame(&mut session, &mut st, Vec::new());
+        frame(&mut session, &mut st, Vec::new());
+        let Some(card) = area("ai-action-card") else {
+            panic!("no result card");
+        };
+        // The rightmost button (the default one, as on macOS).
+        let replace = egui::pos2(card.right() - 12.0 - 40.0, card.bottom() - 12.0 - 14.0);
+        frame(
+            &mut session,
+            &mut st,
+            button(replace, egui::PointerButton::Primary, true),
+        );
+        frame(
+            &mut session,
+            &mut st,
+            button(replace, egui::PointerButton::Primary, false),
+        );
+        assert!(session.ai.action.is_none(), "the card closes");
+        assert_eq!(
+            session.doc().map(|d| d.text.clone()).as_deref(),
+            Some("Some better text.")
+        );
+    }
+
+    /// A button outside the editor that sends the caret to it (Replace under an answer in the
+    /// Assistant, an outline entry) leaves the keys with the editor, so ⌘Z undoes right away,
+    /// although egui takes the focus from a widget the frame a click lands outside it.
+    #[test]
+    fn a_click_elsewhere_that_asks_for_the_editor_leaves_it_the_keys() {
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        assert!(
+            session
+                .run("edit.setText", &serde_json::json!({ "text": "Hello" }))
+                .is_ok()
+        );
+        let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let t = Tokens::light();
+        let mut st = EditorState::default();
+        // The editor on the left; the rest of the window belongs to something else.
+        let frame = |session: &mut Session, st: &mut EditorState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let r = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 700.0));
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(r));
+                show(&mut c, &t, session, st);
+            });
+            out.textures_delta.clear();
+        };
+        let elsewhere = egui::pos2(800.0, 300.0);
+        let button = |pressed| {
+            vec![
+                egui::Event::PointerMoved(elsewhere),
+                egui::Event::PointerButton {
+                    pos: elsewhere,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&mut session, &mut st, Vec::new());
+        frame(&mut session, &mut st, button(true));
+        // The click's release: the button asks for the editor (as a revealed line does) before
+        // the editor is drawn.
+        st.focus = true;
+        frame(&mut session, &mut st, button(false));
+        frame(&mut session, &mut st, Vec::new());
+        assert!(ctx.memory(|m| m.has_focus(id)), "the editor has the keys");
+    }
+
+    /// Return over a selection replaces it with the line break (and the line's indent), like
+    /// typing over it; without a selection it still auto-indents.
+    #[test]
+    fn return_replaces_the_selection() {
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        assert!(
+            session
+                .run(
+                    "edit.setText",
+                    &serde_json::json!({ "text": "  Hello world\nnext" })
+                )
+                .is_ok()
+        );
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let t = Tokens::light();
+        let mut st = EditorState::default();
+        let frame = |session: &mut Session, st: &mut EditorState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| show(ui, &t, session, st));
+            out.textures_delta.clear();
+        };
+        let select = |session: &mut Session, st: &mut EditorState, anchor, cursor| {
+            if let Some(doc) = session.docs.get_mut(session.active) {
+                doc.selection = Selection { anchor, cursor };
+            }
+            st.push_selection = Some(session.active);
+        };
+        let key = |key| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        let text = |s: &Session| s.doc().map(|d| d.text.clone()).unwrap_or_default();
+        let selection = |s: &Session| s.doc().map(|d| (d.selection.anchor, d.selection.cursor));
+
+        st.focus = true;
+        frame(&mut session, &mut st, Vec::new());
+        // " world" selected backwards (as when dragging right to left).
+        select(&mut session, &mut st, 13, 7);
+        frame(&mut session, &mut st, Vec::new());
+        frame(&mut session, &mut st, key(Key::Enter));
+        assert_eq!(text(&session), "  Hello\n  \nnext");
+        assert_eq!(selection(&session), Some((10, 10)));
+
+        // Across lines: the indent is the first line's.
+        select(&mut session, &mut st, 4, 11);
+        frame(&mut session, &mut st, Vec::new());
+        frame(&mut session, &mut st, key(Key::Enter));
+        assert_eq!(text(&session), "  He\n  next");
+        assert_eq!(selection(&session), Some((7, 7)));
+
+        // No selection: auto-indent as before.
+        frame(&mut session, &mut st, key(Key::Enter));
+        assert_eq!(text(&session), "  He\n  \n  next");
     }
 
     /// Typing plain text waits for an AI suggestion; typing a command opens the completion list
