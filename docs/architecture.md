@@ -83,8 +83,16 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
    otherwise the viewer reopens it, keeping the old page textures until the new ones arrive, so the
    view neither flickers nor jumps.
 
+9. A pass still running after 20 s (or 4× the last pass's time) while newer edits wait is stopped
+   and the next pass typesets them; a job whose thread dies finishes with an error. Either way no
+   pass can hold up all later ones.
+
 Full typesets (⌘T, and on opening a project) save edited files and run latexmk on the real files
-into `.texcraft/build/`.
+into `.texcraft/build/`, then copy the PDF beside the root. Live passes never touch that PDF, so in
+LIVE mode the engine (`full.rs`) remembers each project edited since its last full typeset and
+typesets it in full 5 minutes after the first such edit, at a 5 s pause in typing (at once after
+10 minutes), and before quitting (after the unsaved-changes prompt; a sheet offers Don't Quit /
+Quit Now). Projects nobody edits are never typeset in the background.
 
 ## Testing
 

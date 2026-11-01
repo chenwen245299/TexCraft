@@ -40,7 +40,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("PDF Only (⌘4)", "仅 PDF（⌘4）"),
     ("Back", "后退"),
     ("Forward", "前进"),
-    ("New Document (⌘N)", "新建文稿（⌘N）"),
+    ("AI Assistant (⌥⌘7)", "AI 助手（⌥⌘7）"),
     // Dialogs (dialogs.rs)
     ("Go to Line", "前往行"),
     ("Line number", "行号"),
@@ -223,4 +223,10 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Grade Entire Viewer Output", "为整个查看器输出调色"),
     ("No Grading", "不调色"),
     ("Page {page} of {pages}", "第 {page} 页，共 {pages} 页"),
+    // Typesetting before quitting (LIVE mode)
+    ("Typesetting before quitting…", "退出前正在排版…"),
+    (
+        "TexCraft typesets “{name}” so that the PDF beside it has your latest changes.",
+        "TexCraft 正在排版“{name}”，让它旁边的 PDF 包含你的最新修改。",
+    ),
 ];

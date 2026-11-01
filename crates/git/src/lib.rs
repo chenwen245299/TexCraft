@@ -405,6 +405,8 @@ pub struct Snapshot {
     pub status: Status,
     /// Recent commits, newest first.
     pub log: Vec<Commit>,
+    /// The repository has a remote (a branch without an upstream can be published).
+    pub has_remote: bool,
 }
 
 /// Reads status and history of `root`.
@@ -413,6 +415,7 @@ pub fn snapshot(root: &Path) -> Result<Snapshot, GitError> {
         root: root.to_path_buf(),
         status: status(root)?,
         log: log(root, 40),
+        has_remote: run(root, &["remote"]).is_ok_and(|r| r.lines().any(|l| !l.trim().is_empty())),
     })
 }
 
@@ -446,6 +449,15 @@ pub enum Op {
     Push,
     /// `git fetch`.
     Fetch,
+    /// Pull, then push (Sync Changes).
+    Sync,
+    /// What a commit would record, as text for writing its message: the staged diff, else
+    /// (`staged` false: nothing is staged, the commit takes everything) the diff against HEAD
+    /// and the untracked files' names. Long diffs are cut.
+    Changes {
+        /// Something is staged.
+        staged: bool,
+    },
     /// The diff of one file: `staged` for the index, else the working tree.
     Diff {
         /// Path relative to the root.
@@ -470,7 +482,8 @@ impl Op {
             Self::Pull => tr("Pulling"),
             Self::Push => tr("Pushing"),
             Self::Fetch => tr("Fetching"),
-            Self::Diff { .. } => tr("Reading changes"),
+            Self::Sync => tr("Syncing"),
+            Self::Diff { .. } | Self::Changes { .. } => tr("Reading changes"),
         }
     }
 }
@@ -513,7 +526,19 @@ pub fn perform(root: &Path, op: &Op) -> Result<Option<String>, GitError> {
             }
             run(root, &["commit", "-q", "-m", message]).map(|_| None)
         }
-        Op::Pull => run_in(root, &["pull", "--no-edit"], NETWORK, &[]).map(|_| None),
+        Op::Pull => {
+            // Since Git 2.27 a pull into a branch that has commits of its own stops and asks
+            // how to reconcile them, unless pull.rebase or pull.ff is set: merge then, Git's
+            // old default (as VS Code's Sync does); the user's own setting otherwise.
+            let configured = ["pull.rebase", "pull.ff"]
+                .iter()
+                .any(|k| run(root, &["config", "--get", k]).is_ok());
+            let mut args = vec!["pull", "--no-edit"];
+            if !configured {
+                args.push("--no-rebase");
+            }
+            run_in(root, &args, NETWORK, &[]).map(|_| None)
+        }
         Op::Push => {
             let st = status(root)?;
             if st.upstream.is_some() {
@@ -529,6 +554,11 @@ pub fn perform(root: &Path, op: &Op) -> Result<Option<String>, GitError> {
             }
         }
         Op::Fetch => run_in(root, &["fetch", "--prune"], NETWORK, &[]).map(|_| None),
+        Op::Sync => {
+            perform(root, &Op::Pull)?;
+            perform(root, &Op::Push)
+        }
+        Op::Changes { staged } => changes(root, *staged).map(Some),
         Op::Diff {
             path,
             staged,
@@ -555,6 +585,56 @@ pub fn perform(root: &Path, op: &Op) -> Result<Option<String>, GitError> {
             Ok(Some(String::from_utf8_lossy(&out).into_owned()))
         }
     }
+}
+
+/// The most of a diff [`Op::Changes`] keeps (in characters): enough for a commit message.
+pub const CHANGES_MAX: usize = 12_000;
+
+/// [`Op::Changes`]: a summary of the files, then the diff (cut to [`CHANGES_MAX`]).
+fn changes(root: &Path, staged: bool) -> Result<String, GitError> {
+    let diff = |extra: &[&str]| -> Result<String, GitError> {
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff"];
+        args.extend_from_slice(extra);
+        run(root, &args)
+    };
+    let (stat, patch, untracked) = if staged {
+        (
+            diff(&["--cached", "--stat"])?,
+            diff(&["--cached"])?,
+            String::new(),
+        )
+    } else {
+        // Before the first commit there is no HEAD: everything is untracked.
+        let head = run(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
+        let (stat, patch) = if head {
+            (diff(&["HEAD", "--stat"])?, diff(&["HEAD"])?)
+        } else {
+            (String::new(), String::new())
+        };
+        let untracked = run(root, &["ls-files", "--others", "--exclude-standard"])?;
+        (stat, patch, untracked)
+    };
+    let mut out = String::new();
+    if !stat.trim().is_empty() {
+        out.push_str(stat.trim_end());
+        out.push_str("\n\n");
+    }
+    for name in untracked.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        out.push_str("New file: ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    if !untracked.trim().is_empty() {
+        out.push('\n');
+    }
+    match patch.char_indices().nth(CHANGES_MAX) {
+        Some((cut, _)) => {
+            out.push_str(patch.get(..cut).unwrap_or(""));
+            out.push_str("\n[diff cut here]\n");
+        }
+        None => out.push_str(&patch),
+    }
+    Ok(out)
 }
 
 /// The answer of a [`Job`].
@@ -758,9 +838,112 @@ u UU N... 100644 100644 100644 100644 a b c conflict.tex\0\
         .unwrap()
         .unwrap();
         assert!(diff.contains("+New"), "{diff}");
+        // What a commit would take: nothing staged, so the diff against HEAD and the new file.
+        std::fs::write(dir.join("main.tex"), "Hello, world\n").unwrap();
+        let all = perform(&root, &Op::Changes { staged: false })
+            .unwrap()
+            .unwrap();
+        assert!(all.contains("main.tex | 2"), "{all}");
+        assert!(all.contains("+Hello, world"), "{all}");
+        assert!(all.contains("New file: new.tex"), "{all}");
+        // Staged: only the index.
+        perform(&root, &Op::Stage(vec!["new.tex".into()])).unwrap();
+        let staged = perform(&root, &Op::Changes { staged: true })
+            .unwrap()
+            .unwrap();
+        assert!(
+            staged.contains("+New") && !staged.contains("Hello, world"),
+            "{staged}"
+        );
+        perform(&root, &Op::Unstage(vec!["new.tex".into()])).unwrap();
+        // A long diff is cut.
+        std::fs::write(dir.join("main.tex"), "x\n".repeat(CHANGES_MAX)).unwrap();
+        let long = perform(&root, &Op::Changes { staged: false })
+            .unwrap()
+            .unwrap();
+        assert!(long.ends_with("[diff cut here]\n"), "cut");
+        assert!(long.chars().count() < CHANGES_MAX + 2_000, "{}", long.len());
         // No remote: push explains instead of failing obscurely.
         let e = perform(&root, &Op::Push).unwrap_err();
         assert!(e.0.contains("no remote"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sync pulls the upstream's new commits, then pushes the local ones; a repository with a
+    /// remote says so.
+    #[test]
+    fn sync_pulls_then_pushes() {
+        if !available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("texcraft-git-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (bare, work, other) = (
+            base.join("remote.git"),
+            base.join("work"),
+            base.join("other"),
+        );
+        for d in [&bare, &work] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        run(&bare, &["init", "-q", "--bare"]).unwrap();
+        let identity = |dir: &Path| {
+            run(dir, &["config", "user.name", "TexCraft Test"]).unwrap();
+            run(dir, &["config", "user.email", "test@example.invalid"]).unwrap();
+            run(dir, &["config", "commit.gpgsign", "false"]).unwrap();
+        };
+        perform(&work, &Op::Init).unwrap();
+        identity(&work);
+        assert!(!snapshot(&work).unwrap().has_remote);
+        std::fs::write(work.join("main.tex"), "One\n").unwrap();
+        let commit = |dir: &Path, message: &str| {
+            perform(
+                dir,
+                &Op::Commit {
+                    message: message.into(),
+                    all: true,
+                },
+            )
+            .unwrap();
+        };
+        commit(&work, "First");
+        run(&work, &["remote", "add", "origin", &bare.to_string_lossy()]).unwrap();
+        let snap = snapshot(&work).unwrap();
+        assert!(snap.has_remote);
+        assert!(snap.status.upstream.is_none(), "not published yet");
+        perform(&work, &Op::Push).unwrap();
+        let branch = status(&work).unwrap().branch.unwrap();
+
+        // Someone else pushes a commit; here a local one waits.
+        run(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                &branch,
+                &bare.to_string_lossy(),
+                "other",
+            ],
+        )
+        .unwrap();
+        identity(&other);
+        std::fs::write(other.join("refs.bib"), "@misc{a}\n").unwrap();
+        commit(&other, "Add references");
+        perform(&other, &Op::Push).unwrap();
+        std::fs::write(work.join("main.tex"), "Two\n").unwrap();
+        commit(&work, "Second");
+        assert_eq!(status(&work).unwrap().ahead, 1);
+
+        perform(&work, &Op::Sync).unwrap();
+        let st = status(&work).unwrap();
+        assert_eq!((st.ahead, st.behind), (0, 0), "{st:?}");
+        assert!(work.join("refs.bib").exists(), "pulled");
+        let pushed = run(&bare, &["log", "--format=%s", &branch]).unwrap();
+        assert!(
+            pushed.contains("Second") && pushed.contains("Add references"),
+            "{pushed}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

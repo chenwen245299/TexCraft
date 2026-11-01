@@ -25,6 +25,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Push {n} commit", "推送 {n} 个提交"),
     ("Push {n} commits", "推送 {n} 个提交"),
     ("Publish Branch", "发布分支"),
+    ("Writing commit message", "正在生成提交信息"),
     ("More Actions", "更多操作"),
     ("Show Repository in Explorer", "在资源管理器中显示仓库"),
     ("Reveal Repository in Finder", "在访达中显示仓库"),

@@ -41,9 +41,12 @@ pub struct Tokens {
     pub filter_bg: Color32,
     /// Sidebar filter field border.
     pub filter_border: Color32,
-    /// The Assistant's question box: a shade lighter than the sidebar it sits in.
+    /// The AI Assistant panel's background (on the right): the page's white, not the
+    /// sidebar's grey.
+    pub assistant_bg: Color32,
+    /// The Assistant's question box and code cards: a soft shade on its background.
     pub composer_bg: Color32,
-    /// Its hairline border.
+    /// Their hairline border.
     pub composer_border: Color32,
     /// Count badge outline.
     pub badge_border: Color32,
@@ -223,8 +226,9 @@ impl Tokens {
             sidebar_icon: hex(0x7D7D7D),
             filter_bg: hex(0xCBCBCB),
             filter_border: hex(0xB4B4B4),
-            composer_bg: hex(0xEFEFEF),
-            composer_border: hex(0xCDCDCD),
+            assistant_bg: hex(0xFFFFFF),
+            composer_bg: hex(0xF5F5F7),
+            composer_border: hex(0xDEDEE1),
             badge_border: hex(0xB7B7B7),
             toolbar_separator: hex(0x8C8C8C),
             badge_fill: Color32::from_black_alpha(8),
@@ -313,8 +317,9 @@ impl Tokens {
             sidebar_icon: hex(0xA0A0A2),
             filter_bg: hex(0x3A3A3C),
             filter_border: hex(0x505052),
-            composer_bg: hex(0x313133),
-            composer_border: hex(0x444446),
+            assistant_bg: hex(0x232325),
+            composer_bg: hex(0x2D2D30),
+            composer_border: hex(0x3E3E41),
             badge_border: hex(0x5A5A5C),
             toolbar_separator: hex(0x6A6A6E),
             badge_fill: Color32::from_white_alpha(10),
@@ -491,6 +496,11 @@ pub fn semibold(size: f32) -> FontId {
 /// Installs fonts: the system UI and monospace fonts when they exist (loaded at run time, not
 /// shipped), with CJK and symbol fallbacks; egui's built-in fonts otherwise.
 pub fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions());
+}
+
+/// The fonts [`install_fonts`] installs.
+fn font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let mut load = |name: &str, paths: &[&str], index: u32| -> bool {
         for p in paths {
@@ -591,10 +601,15 @@ pub fn install_fonts(ctx: &egui::Context) {
     if mono {
         monofam.insert(0, "mono".into());
     }
-    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+    // Chinese right after the system font: egui's own fallbacks (its emoji and icon fonts)
+    // carry blocky full-width punctuation (？（）！) that would otherwise win over PingFang's.
+    for (fam, primary) in [
+        (FontFamily::Proportional, ui),
+        (FontFamily::Monospace, mono),
+    ] {
         let list = fonts.families.entry(fam).or_default();
         if cjk {
-            list.push("cjk".into());
+            list.insert(usize::from(primary).min(list.len()), "cjk".into());
         }
         if math {
             list.push("math".into());
@@ -615,7 +630,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         .families
         .insert(FontFamily::Name(SEMIBOLD_FAMILY.into()), bold);
     if cjk {
-        editor.push("cjk".into());
+        editor.insert(usize::from(mono).min(editor.len()), "cjk".into());
     }
     if math {
         editor.push("math".into());
@@ -626,7 +641,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(FontFamily::Name(EDITOR_FAMILY.into()), editor);
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 /// Applies spacing and text styles shared by both appearances.
@@ -722,5 +737,44 @@ mod flash_colour_tests {
         let cream = rgb(hex(0xFCF8E4));
         let lit = over(hex(0xFCF8E4), Tokens::light().source_flash);
         assert!(cream[2] - lit[2] > 100.0, "{lit:?}");
+    }
+}
+
+#[cfg(test)]
+mod font_order_tests {
+    use super::*;
+
+    /// Chinese comes right after the system font in every family, ahead of egui's emoji and
+    /// icon fonts (their full-width ？（）！ are blocky and would win otherwise).
+    #[test]
+    fn cjk_comes_before_egui_fallbacks() {
+        let fonts = font_definitions();
+        if !fonts.font_data.contains_key("cjk") {
+            eprintln!("skipping: no CJK font on this system");
+            return;
+        }
+        for fam in [
+            FontFamily::Proportional,
+            FontFamily::Monospace,
+            FontFamily::Name(EDITOR_FAMILY.into()),
+            FontFamily::Name(SEMIBOLD_FAMILY.into()),
+        ] {
+            let list = fonts.families.get(&fam).cloned().unwrap_or_default();
+            let at = |name: &str| list.iter().position(|f| f == name);
+            let Some(cjk) = at("cjk") else {
+                panic!("{fam:?}: no cjk in {list:?}");
+            };
+            for fallback in [
+                "NotoEmoji-Regular",
+                "emoji-icon-font",
+                "Ubuntu-Light",
+                "Hack",
+            ] {
+                if let Some(i) = at(fallback) {
+                    assert!(cjk < i, "{fam:?}: cjk after {fallback}: {list:?}");
+                }
+            }
+            assert!(cjk <= 2, "{fam:?}: right after the system font: {list:?}");
+        }
     }
 }

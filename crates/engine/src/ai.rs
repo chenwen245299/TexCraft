@@ -4,9 +4,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use texcraft_ai::{ChatRequest, Config, Event, Image, Job, KeyStore, Model, Role, Turn};
+use texcraft_ai::{
+    ChatRequest, Config, Event, Image, Job, KeyStore, Model, Role, ToolResult, Turn,
+};
 use texcraft_i18n::{tr, trf};
 
+use crate::ai_tools::{self, ToolUse};
+use crate::chats::{self, ChatStore, ChatSummary};
 use crate::{CommandError, Effect, Session, edit};
 
 /// One message of the conversation.
@@ -32,6 +36,8 @@ pub struct ChatMessage {
     pub note: Option<String>,
     /// Images attached to a question (sent again with every later question).
     pub images: Vec<Image>,
+    /// The project files the model looked at while answering (read-only tools).
+    pub tools: Vec<ToolUse>,
 }
 
 impl ChatMessage {
@@ -47,6 +53,7 @@ impl ChatMessage {
             thinking: false,
             error: None,
             note: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -69,7 +76,33 @@ pub struct AiState {
     /// Why an image could not be attached (shown over the question box until the next try).
     pub notice: Option<String>,
     job: Option<Job>,
+    /// The question being answered with tools: its request, grown by each round of calls.
+    round: Option<Round>,
+    /// Where conversations are saved (`None`: not saved, as in tests).
+    pub chats: Option<ChatStore>,
+    /// The conversation shown (`None`: new, not saved yet).
+    pub chat_id: Option<String>,
+    /// The current project's saved conversations, the latest first.
+    pub history: Vec<ChatSummary>,
+    /// The project folder the conversation belongs to (canonical; `None`: none).
+    chat_project: Option<PathBuf>,
+    /// The folder last seen (`None`: not looked yet), to notice another project opening.
+    chat_seen: Option<Option<PathBuf>>,
 }
+
+/// An answer in rounds: the model calls tools, gets their answers and goes on.
+struct Round {
+    req: ChatRequest,
+    /// Rounds of tool calls so far.
+    n: u32,
+    /// The text of this round (it goes back with the round's calls).
+    text: String,
+    /// The system prompt without the tools (for asking again without them).
+    plain_system: String,
+}
+
+/// The most rounds of tool calls one answer may take.
+pub const MAX_TOOL_ROUNDS: u32 = 12;
 
 /// The most images one question takes, and the largest image (the chat APIs refuse more).
 pub const MAX_IMAGES: usize = 10;
@@ -274,23 +307,7 @@ impl Session {
                 tr("Wait for the answer, or stop it first.").into(),
             ));
         }
-        let (provider, model) = self
-            .ai
-            .config
-            .selection()
-            .map(|(p, m)| (p.clone(), m.to_string()))
-            .ok_or_else(|| {
-                CommandError::Failed(
-                    tr("Add a provider and a model in Settings → AI first.").into(),
-                )
-            })?;
-        let api_key = self.ai_key_for(&provider);
-        if api_key.is_empty() && !texcraft_ai::is_local(&provider) {
-            return Err(CommandError::Failed(trf!(
-                "Enter the API key of {provider} in Settings → AI.",
-                provider = provider.name
-            )));
-        }
+        let (provider, model, api_key) = self.ai_target()?;
         let images = std::mem::take(&mut self.ai.draft_images);
         if !images.is_empty() && !self.ai_reads_images() {
             let label = self
@@ -321,6 +338,7 @@ impl Session {
                             text: m.text.clone(),
                             blocks: Vec::new(),
                             images: m.images.clone(),
+                            ..Default::default()
                         });
                         turns.push(Turn {
                             role: Role::Assistant,
@@ -332,6 +350,7 @@ impl Session {
                                 Vec::new()
                             },
                             images: Vec::new(),
+                            ..Default::default()
                         });
                         i += 2;
                         continue;
@@ -341,6 +360,7 @@ impl Session {
                         text: m.text.clone(),
                         blocks: Vec::new(),
                         images: m.images.clone(),
+                        ..Default::default()
                     }),
                     _ => {}
                 }
@@ -348,14 +368,25 @@ impl Session {
             i += 1;
         }
         let provider_id = provider.id.clone();
+        // With a project folder the model may read its files (never change them).
+        let plain_system = self.ai_system();
+        let tools = self
+            .ai_project_root()
+            .map_or_else(Vec::new, |_| ai_tools::specs());
+        let system = if tools.is_empty() {
+            plain_system.clone()
+        } else {
+            format!("{plain_system}{}", ai_tools::PROMPT)
+        };
         let req = ChatRequest {
             provider,
             model: model.clone(),
-            system: self.ai_system(),
+            system,
             api_key,
             turns,
             max_tokens: None,
             no_reasoning: false,
+            tools,
         };
         self.ai.messages.push(ChatMessage {
             images: Vec::new(),
@@ -368,13 +399,228 @@ impl Session {
             thinking: false,
             error: None,
             note: None,
+            tools: Vec::new(),
         });
         self.ai.job = Some(texcraft_ai::start(&req, Arc::clone(&self.waker)));
+        self.ai.round = Some(Round {
+            req,
+            n: 0,
+            text: String::new(),
+            plain_system,
+        });
+        self.ai_save_chat();
+        Ok(())
+    }
+
+    /// The model called tools: run them (they only read), and ask again with their answers.
+    fn ai_tool_round(&mut self, done: Event) {
+        let Event::Done {
+            blocks,
+            model,
+            tool_calls,
+            reasoning,
+        } = done
+        else {
+            return;
+        };
+        let Some(mut round) = self.ai.round.take() else {
+            return;
+        };
+        if round.n >= MAX_TOOL_ROUNDS {
+            self.ai.job = None;
+            if let Some(m) = self.ai.messages.last_mut() {
+                m.pending = false;
+                m.thinking = false;
+                m.note = Some(trf!(
+                    "Stopped after {n} rounds of reading files",
+                    n = round.n
+                ));
+                if m.text.trim().is_empty() {
+                    m.error = Some(tr("The model kept reading files without answering.").into());
+                }
+            }
+            return;
+        }
+        let root = self.ai_project_root();
+        let mut results = Vec::new();
+        let mut uses = Vec::new();
+        for call in &tool_calls {
+            let (content, used) = match &root {
+                Some(r) => self.run_ai_tool(r, call),
+                None => (
+                    "Error: no project folder is open.".to_string(),
+                    ToolUse {
+                        kind: ai_tools::ToolKind::Read,
+                        target: call.name.clone(),
+                        lines: None,
+                        failed: true,
+                    },
+                ),
+            };
+            results.push(ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                content,
+            });
+            uses.push(used);
+        }
+        round.req.turns.push(Turn {
+            role: Role::Assistant,
+            text: std::mem::take(&mut round.text),
+            blocks,
+            tool_calls,
+            reasoning,
+            ..Default::default()
+        });
+        round.req.turns.push(Turn {
+            role: Role::User,
+            tool_results: results,
+            ..Default::default()
+        });
+        round.n += 1;
+        self.ai.job = Some(texcraft_ai::start(&round.req, Arc::clone(&self.waker)));
+        self.ai.round = Some(round);
+        if let Some(m) = self.ai.messages.last_mut() {
+            m.tools.extend(uses);
+            m.thinking = false;
+            if let Some(model) = model {
+                m.model = Some(model);
+            }
+            // The next round's text starts a paragraph of its own.
+            if !m.text.trim().is_empty() && !m.text.ends_with("\n\n") {
+                m.text.push_str("\n\n");
+            }
+        }
+    }
+
+    /// The Assistant's provider, model and API key, or why there are none.
+    pub(crate) fn ai_target(
+        &self,
+    ) -> Result<(texcraft_ai::Provider, String, String), CommandError> {
+        let (provider, model) = self
+            .ai
+            .config
+            .selection()
+            .map(|(p, m)| (p.clone(), m.to_string()))
+            .ok_or_else(|| {
+                CommandError::Failed(
+                    tr("Add a provider and a model in Settings → AI first.").into(),
+                )
+            })?;
+        let api_key = self.ai_key_for(&provider);
+        if api_key.is_empty() && !texcraft_ai::is_local(&provider) {
+            return Err(CommandError::Failed(trf!(
+                "Enter the API key of {provider} in Settings → AI.",
+                provider = provider.name
+            )));
+        }
+        Ok((provider, model, api_key))
+    }
+
+    /// Keeps conversations in `root` (TexCraft's data folder's `chats`, never the project), and
+    /// removes those of projects that no longer exist.
+    pub fn set_chat_store(&mut self, root: PathBuf) {
+        let store = ChatStore::new(root);
+        store.sweep();
+        self.ai.chats = Some(store);
+        self.ai.chat_seen = None;
+        self.ai_follow_project();
+    }
+
+    /// Conversations belong to a project: when another one opens, the conversation is saved
+    /// and the Assistant starts afresh with that project's history (once an answer arriving
+    /// has finished).
+    pub(crate) fn ai_follow_project(&mut self) {
+        if self.ai.chats.is_none() || self.ai.job.is_some() {
+            return;
+        }
+        let seen = self.git_dir();
+        if self.ai.chat_seen.as_ref() == Some(&seen) {
+            return;
+        }
+        let first = self.ai.chat_seen.is_none();
+        let project = seen.as_ref().and_then(|p| p.canonicalize().ok());
+        self.ai.chat_seen = Some(seen);
+        if !first && project == self.ai.chat_project {
+            return;
+        }
+        if !first {
+            self.ai_save_chat();
+            self.ai.messages.clear();
+            self.ai.chat_id = None;
+        }
+        self.ai.chat_project = project;
+        self.ai_refresh_history();
+    }
+
+    fn ai_refresh_history(&mut self) {
+        self.ai.history = self
+            .ai
+            .chats
+            .as_ref()
+            .map(|s| s.list(self.ai.chat_project.as_deref()))
+            .unwrap_or_default();
+    }
+
+    /// Saves the conversation shown (once it has a question).
+    fn ai_save_chat(&mut self) {
+        let Some(store) = &self.ai.chats else {
+            return;
+        };
+        if !self.ai.messages.iter().any(|m| m.role == Role::User) {
+            return;
+        }
+        let id = self.ai.chat_id.get_or_insert_with(chats::new_id).clone();
+        let saved = store.save(self.ai.chat_project.as_deref(), &id, &self.ai.messages);
+        if let Err(e) = saved {
+            self.set_status(e);
+        }
+        self.ai_refresh_history();
+    }
+
+    /// Starts a new conversation (the one shown stays in the history).
+    pub fn ai_new_chat(&mut self) {
+        self.ai_stop();
+        self.ai.messages.clear();
+        self.ai.chat_id = None;
+    }
+
+    /// Shows saved conversation `id` of the current project.
+    pub fn ai_open_chat(&mut self, id: &str) -> Result<(), CommandError> {
+        self.ai_stop();
+        let messages = self
+            .ai
+            .chats
+            .as_ref()
+            .and_then(|s| s.load(self.ai.chat_project.as_deref(), id))
+            .ok_or_else(|| CommandError::Failed(tr("No such conversation.").into()))?;
+        self.ai.messages = messages;
+        self.ai.chat_id = Some(id.to_string());
+        Ok(())
+    }
+
+    /// Deletes saved conversation `id` (shown, the Assistant starts afresh).
+    pub fn ai_delete_chat(&mut self, id: &str) -> Result<(), CommandError> {
+        if let Some(store) = &self.ai.chats {
+            store
+                .delete(self.ai.chat_project.as_deref(), id)
+                .map_err(CommandError::Failed)?;
+        }
+        if self.ai.chat_id.as_deref() == Some(id) {
+            self.ai.round = None;
+            if let Some(job) = self.ai.job.take() {
+                job.cancel();
+            }
+            self.ai.messages.clear();
+            self.ai.chat_id = None;
+        }
+        self.ai_refresh_history();
         Ok(())
     }
 
     /// Stops the answer that is arriving (what arrived so far stays).
     pub fn ai_stop(&mut self) {
+        self.ai.round = None;
         if let Some(job) = self.ai.job.take() {
             job.cancel();
         }
@@ -390,6 +636,7 @@ impl Session {
                 m.blocks.clear();
             }
         }
+        self.ai_save_chat();
     }
 
     /// The LaTeX of answer `index`: its first `latex`/`tex` code block, else its first code
@@ -421,13 +668,24 @@ impl Session {
 
     /// Polls the running request.
     pub(crate) fn tick_ai(&mut self) -> Option<std::time::Duration> {
+        self.ai_follow_project();
         let events: Vec<Event> = self
             .ai
             .job
             .as_ref()
             .map(|j| std::iter::from_fn(|| j.try_recv()).collect())
             .unwrap_or_default();
+        let mut finished = false;
         for e in events {
+            if matches!(&e, Event::Done { tool_calls, .. } if !tool_calls.is_empty()) {
+                self.ai_tool_round(e);
+                continue;
+            }
+            if let Event::Failed(msg) = &e
+                && self.ai_retry_without_tools(msg)
+            {
+                continue;
+            }
             let Some(m) = self.ai.messages.last_mut() else {
                 break;
             };
@@ -435,12 +693,15 @@ impl Session {
                 Event::Text(t) => {
                     m.thinking = false;
                     m.text.push_str(&t);
+                    if let Some(r) = self.ai.round.as_mut() {
+                        r.text.push_str(&t);
+                    }
                 }
                 Event::Thinking => m.thinking = m.text.is_empty(),
                 Event::Fallback(what) => {
                     m.note = Some(trf!("Declined, answered by {model}", model = what));
                 }
-                Event::Done { blocks, model } => {
+                Event::Done { blocks, model, .. } => {
                     m.pending = false;
                     m.thinking = false;
                     m.blocks = blocks;
@@ -451,6 +712,8 @@ impl Session {
                         m.error = Some(tr("The model sent an empty answer.").into());
                     }
                     self.ai.job = None;
+                    self.ai.round = None;
+                    finished = true;
                 }
                 Event::Refused(category) => {
                     // A declined answer is discarded, partial text included.
@@ -463,19 +726,50 @@ impl Session {
                         None => tr("The model declined this request.").into(),
                     });
                     self.ai.job = None;
+                    self.ai.round = None;
+                    finished = true;
                 }
                 Event::Failed(msg) => {
                     m.pending = false;
                     m.thinking = false;
                     m.error = Some(msg);
                     self.ai.job = None;
+                    self.ai.round = None;
+                    finished = true;
                 }
             }
+        }
+        if finished {
+            self.ai_save_chat();
         }
         self.ai
             .job
             .is_some()
             .then_some(std::time::Duration::from_millis(100))
+    }
+
+    /// A model that takes no tools refuses the first request: ask again without them (and
+    /// without telling it about them). Returns whether it did.
+    fn ai_retry_without_tools(&mut self, msg: &str) -> bool {
+        let Some(round) = self.ai.round.as_mut() else {
+            return false;
+        };
+        let answered = self
+            .ai
+            .messages
+            .last()
+            .is_some_and(|m| !m.text.trim().is_empty());
+        if round.n > 0
+            || round.req.tools.is_empty()
+            || answered
+            || !msg.to_ascii_lowercase().contains("tool")
+        {
+            return false;
+        }
+        round.req.tools.clear();
+        round.req.system = round.plain_system.clone();
+        self.ai.job = Some(texcraft_ai::start(&round.req, Arc::clone(&self.waker)));
+        true
     }
 
     /// Inserts answer `index`'s LaTeX at the caret (replacing the selection).

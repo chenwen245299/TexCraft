@@ -95,6 +95,16 @@ impl PdfView {
         }
         self.opened_generation = session.pdf.generation;
         let Some(path) = session.pdf.path.as_ref() else {
+            // The pane was emptied (its PDF belonged to another document): no stale pages.
+            self.loaded_doc = self.opened_generation;
+            self.pages.clear();
+            self.textures.clear();
+            self.requested.clear();
+            self.selection = None;
+            self.resolved = None;
+            self.flash = None;
+            self.error = None;
+            self.current_page = 0;
             return;
         };
         match std::fs::read(path) {

@@ -1301,3 +1301,318 @@ fn pdf_selection_commands() {
     s.run("pdf.clearSelection", &Value::Null).unwrap();
     assert_eq!(s.take_effect(), Some(Effect::SelectPdfText(None)));
 }
+
+/// Opens a saved one-file project in LIVE mode and edits it (not saved).
+fn edited_live_project(name: &str) -> (Session, PathBuf) {
+    let mut s = session();
+    let main = temp_dir(name).join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\nSaved.\n\\end{document}\n",
+    )
+    .unwrap();
+    s.run("file.openPath", &json!({"path": main.to_string_lossy()}))
+        .unwrap();
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    assert!(s.typeset.stale.is_empty(), "opening a file is not an edit");
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n\\begin{document}\nTyped.\n\\end{document}\n"}),
+    )
+    .unwrap();
+    // Live passes are not what these tests are about.
+    s.typeset.live_due = None;
+    (s, main)
+}
+
+/// Ticks until no typeset runs or waits (or a minute passes).
+fn settle(s: &mut Session) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while (s.typeset.is_running() || s.typeset.queued || s.typeset.queued_live)
+        && Instant::now() < deadline
+    {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn untitled_documents_are_not_typeset_in_the_background() {
+    let mut s = session();
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n"}),
+    )
+    .unwrap();
+    assert!(
+        s.typeset.stale.is_empty(),
+        "no PDF beside an untitled document"
+    );
+    assert!(s.typeset.last_edit_at.is_some());
+    assert!(!s.quit_requested());
+}
+
+#[test]
+fn live_mode_typesets_edited_projects_in_full_now_and_then() {
+    use crate::full::{FULL_TYPESET_EVERY, FULL_TYPESET_LATEST, FULL_TYPESET_PAUSE};
+    let (mut s, main) = edited_live_project("full-periodic");
+    assert_eq!(s.typeset.stale.len(), 1);
+    assert_eq!(
+        s.inspect()["typeset"]["staleProjects"][0],
+        json!(s.typeset.stale[0].0)
+    );
+    let t0 = Instant::now();
+    // Not due yet: the wait until it is comes back, and nothing runs.
+    let wait = s.tick_full(t0).unwrap();
+    assert!(
+        wait > FULL_TYPESET_EVERY - Duration::from_secs(5),
+        "{wait:?}"
+    );
+    assert!(!s.typeset.is_running());
+    // MANUAL and a paused LIVE mode never typeset by themselves.
+    let late = t0 + FULL_TYPESET_LATEST + Duration::from_secs(1);
+    s.run("typeset.mode.manual", &Value::Null).unwrap();
+    assert!(s.tick_full(late).is_none() && !s.typeset.is_running());
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    s.live_paused = true;
+    assert!(s.tick_full(late).is_none() && !s.typeset.is_running());
+    s.live_paused = false;
+    // Due, but the user typed a moment ago: it waits for a pause in typing.
+    s.typeset.last_edit_at = Some(t0 + FULL_TYPESET_EVERY);
+    let wait = s.tick_full(t0 + FULL_TYPESET_EVERY + Duration::from_secs(1));
+    assert!(wait.is_some_and(|w| w <= FULL_TYPESET_PAUSE));
+    assert!(!s.typeset.is_running());
+    s.tick_full(t0 + FULL_TYPESET_EVERY + FULL_TYPESET_PAUSE + Duration::from_secs(1));
+    assert!(s.typeset.is_full_running() && s.typeset.background);
+    assert_eq!(s.inspect()["typeset"]["background"], true);
+    assert!(
+        s.typeset.stale.is_empty(),
+        "the PDF beside it is being updated"
+    );
+    assert!(
+        std::fs::read_to_string(&main).unwrap().contains("Typed."),
+        "saved first, like ⌘T"
+    );
+    settle(&mut s);
+    let o = s.typeset.last.as_ref().unwrap();
+    assert!(!o.live);
+    if o.error.is_some() {
+        // No TeX here: the run failed quietly (no alert) and the project is due again later.
+        assert!(!s.effects.iter().any(|e| matches!(e, Effect::Alert { .. })));
+        assert_eq!(s.typeset.stale.len(), 1);
+    } else {
+        assert!(o.success, "{}", o.console);
+        assert!(texcraft_project::published_pdf(&main).is_file());
+        assert!(s.typeset.stale.is_empty());
+    }
+    // Typing on, without a pause: after FULL_TYPESET_LATEST it runs anyway.
+    s.typeset.stale.clear();
+    s.note_edit();
+    s.typeset.live_due = None;
+    let t1 = Instant::now();
+    s.typeset.last_edit_at = Some(t1 + FULL_TYPESET_LATEST);
+    s.tick_full(t1 + FULL_TYPESET_LATEST + Duration::from_secs(1));
+    assert!(s.typeset.is_full_running());
+    s.stop_typeset();
+    settle(&mut s);
+    assert_eq!(s.typeset.stale.len(), 1, "stopped: still due");
+}
+
+#[test]
+fn quitting_in_live_mode_typesets_edited_projects_first() {
+    let (mut s, main) = edited_live_project("full-quit");
+    // MANUAL mode quits at once.
+    s.run("typeset.mode.manual", &Value::Null).unwrap();
+    assert!(!s.quit_requested());
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    assert!(!s.is_enabled("app.quitNow"));
+    // The app saved the document (unsaved-changes prompt) before it asks.
+    s.save(s.active).unwrap();
+    assert!(s.quit_requested());
+    assert!(s.typeset.is_quitting() && s.is_enabled("app.quitNow"));
+    assert_eq!(s.inspect()["typeset"]["quitting"], true);
+    assert!(s.quit_requested(), "still typesetting: the window stays");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !s.effects.iter().any(|e| *e == Effect::Quit) && Instant::now() < deadline {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        s.effects.iter().any(|e| *e == Effect::Quit),
+        "closes when done"
+    );
+    let o = s.typeset.last.as_ref().unwrap();
+    assert!(!o.live && s.typeset.background);
+    if o.error.is_none() {
+        assert!(o.success, "{}", o.console);
+        assert!(texcraft_project::published_pdf(&main).is_file());
+    }
+    assert!(!o.cancelled);
+    assert!(!s.effects.iter().any(|e| matches!(e, Effect::Alert { .. })));
+    assert!(!s.quit_requested(), "done: the window may close");
+    s.effects.clear();
+
+    // Edited after all (the window stayed open): asks again. Don't Quit keeps TexCraft open.
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n\\begin{document}\nAgain.\n\\end{document}\n"}),
+    )
+    .unwrap();
+    assert!(s.quit_requested());
+    s.run("app.cancelQuit", &Value::Null).unwrap();
+    assert!(!s.typeset.is_quitting());
+    settle(&mut s);
+    assert!(!s.effects.iter().any(|e| *e == Effect::Quit));
+    // Quit Now stops the typesetting and quits.
+    s.run("edit.setText", &json!({"text": "\\documentclass{article}\n\\begin{document}\nOnce more.\n\\end{document}\n"}))
+        .unwrap();
+    assert!(s.quit_requested());
+    s.tick(Instant::now());
+    s.run("app.quitNow", &Value::Null).unwrap();
+    assert!(s.effects.iter().any(|e| *e == Effect::Quit));
+    assert!(!s.quit_requested());
+    settle(&mut s);
+}
+
+#[test]
+fn a_live_pass_that_hangs_gives_way_to_newer_edits() {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping: no TeX");
+        return;
+    }
+    let main = temp_dir("live-stuck").join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\nSaved.\n\\end{document}\n",
+    )
+    .unwrap();
+    s.run("file.openPath", &json!({"path": main.to_string_lossy()}))
+        .unwrap();
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    // A body TeX never finishes.
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n\\begin{document}\n\\def\\x{\\x}\\x\n\\end{document}\n"}),
+    )
+    .unwrap();
+    s.live_typeset().unwrap();
+    // Typing goes on: one more pass waits behind it.
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n\\begin{document}\nFixed.\n\\end{document}\n"}),
+    )
+    .unwrap();
+    assert!(s.typeset.queued_live);
+    let started = s.typeset.job.as_ref().unwrap().started;
+    s.tick(started + Duration::from_secs(5));
+    assert!(!s.typeset.live_dropped, "a few seconds is fine");
+    s.tick(started + crate::full::LIVE_STUCK + Duration::from_secs(1));
+    assert!(s.typeset.live_dropped);
+    settle(&mut s);
+    let o = s.typeset.last.as_ref().unwrap();
+    assert!(o.live && !o.cancelled && o.success, "{}", o.console);
+    assert!(s.pdf.path.as_ref().is_some_and(|p| p.is_file()));
+    assert_eq!(
+        s.status.as_ref().map(|m| m.0.as_str()),
+        Some("A live preview pass took too long and was restarted")
+    );
+}
+
+/// What a finished typeset of `root` that produced `pdf` does to the PDF pane.
+fn finish_with_pdf(s: &mut Session, root: &Path, pdf: &Path, live: bool) {
+    s.typeset.root = Some(root.to_path_buf());
+    s.finish_typeset(Outcome {
+        success: true,
+        pdf: Some(pdf.to_path_buf()),
+        pdf_fresh: true,
+        live,
+        ..Outcome::default()
+    });
+}
+
+#[test]
+fn an_opened_file_replaces_the_untitled_pdf() {
+    let dir = temp_dir("pdf-replace");
+    let mut s = session();
+    // At launch LIVE mode typesets the start-up Untitled (behind the welcome window).
+    let untitled = s.root_path().unwrap();
+    let untitled_pdf = dir.join("Untitled.pdf");
+    std::fs::write(&untitled_pdf, b"%PDF-1.5").unwrap();
+    finish_with_pdf(&mut s, &untitled, &untitled_pdf, true);
+    assert_eq!(s.pdf.path.as_deref(), Some(untitled_pdf.as_path()));
+    assert_eq!(s.pdf.root.as_deref(), Some(untitled.as_path()));
+    // A file never typeset takes its place: the template's PDF goes, a pass is due.
+    s.settings.live_typeset = true;
+    let paper = dir.join("sigconf.tex");
+    std::fs::write(
+        &paper,
+        "\\documentclass{article}\n\\begin{document}\nPaper.\n\\end{document}\n",
+    )
+    .unwrap();
+    let generation = s.pdf.generation;
+    s.effects.clear();
+    s.open_path(&paper).unwrap();
+    assert_eq!(s.docs.len(), 1, "the pristine Untitled was replaced");
+    assert!(s.pdf.path.is_none() && s.pdf.root.is_none());
+    assert!(s.pdf.generation > generation, "the viewer drops its pages");
+    assert!(s.effects.iter().any(|e| matches!(e, Effect::PdfChanged)));
+    assert!(s.typeset.live_due.is_some(), "the opened file is typeset");
+    // The Untitled's pass finishing late (a recent document picked at once) stays out.
+    finish_with_pdf(&mut s, &untitled, &untitled_pdf, true);
+    assert!(s.pdf.path.is_none());
+    // The opened file's own PDF shows.
+    let root = s.root_path().unwrap();
+    let paper_pdf = dir.join("sigconf.pdf");
+    std::fs::write(&paper_pdf, b"%PDF-1.5").unwrap();
+    finish_with_pdf(&mut s, &root, &paper_pdf, true);
+    assert_eq!(s.pdf.path.as_deref(), Some(paper_pdf.as_path()));
+    assert_eq!(s.pdf.root.as_deref(), Some(root.as_path()));
+}
+
+#[test]
+fn an_opened_file_keeps_its_own_projects_pdf() {
+    let dir = temp_dir("pdf-keep");
+    let doc = "\\documentclass{article}\n\\begin{document}\n\\input{chapter}\n\\end{document}\n";
+    let chapter = "% !TEX root = main.tex\nA chapter.\n";
+    let mut s = session();
+    let untitled = s.root_path().unwrap();
+    let untitled_pdf = dir.join("Untitled.pdf");
+    std::fs::write(&untitled_pdf, b"%PDF-1.5").unwrap();
+    finish_with_pdf(&mut s, &untitled, &untitled_pdf, true);
+    // Typeset in an earlier session: its PDF shows right away.
+    let a = dir.join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::write(a.join("main.tex"), doc).unwrap();
+    std::fs::write(a.join("chapter.tex"), chapter).unwrap();
+    let pdf = texcraft_project::output_pdf(&a.join("main.tex").canonicalize().unwrap());
+    std::fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+    std::fs::write(&pdf, b"%PDF-1.5").unwrap();
+    s.open_path(&a.join("main.tex")).unwrap();
+    let main = s.root_path().unwrap();
+    assert_eq!(s.pdf.path.as_deref(), Some(pdf.as_path()));
+    assert_eq!(s.pdf.root.as_deref(), Some(main.as_path()));
+    // Another file of the project keeps it.
+    let generation = s.pdf.generation;
+    s.open_path(&a.join("chapter.tex")).unwrap();
+    assert_eq!(s.pdf.path.as_deref(), Some(pdf.as_path()));
+    assert_eq!(s.pdf.generation, generation);
+    // So does a live preview (no PDF in the build folder yet), and a pass for the project while
+    // the chapter is in front still shows.
+    let b = dir.join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(b.join("main.tex"), doc).unwrap();
+    std::fs::write(b.join("chapter.tex"), chapter).unwrap();
+    s.open_path(&b.join("main.tex")).unwrap();
+    let main_b = s.root_path().unwrap();
+    let live_pdf = dir.join("live-b.pdf");
+    std::fs::write(&live_pdf, b"%PDF-1.5").unwrap();
+    finish_with_pdf(&mut s, &main_b, &live_pdf, true);
+    s.open_path(&b.join("chapter.tex")).unwrap();
+    assert_eq!(s.pdf.path.as_deref(), Some(live_pdf.as_path()));
+    let next_pdf = dir.join("live-b-2.pdf");
+    std::fs::write(&next_pdf, b"%PDF-1.5").unwrap();
+    finish_with_pdf(&mut s, &main_b, &next_pdf, true);
+    assert_eq!(s.pdf.path.as_deref(), Some(next_pdf.as_path()));
+}

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
 use egui::text_selection::CCursorRange;
-use egui::{Align, Color32, Galley, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke, Ui, vec2};
+use egui::{Align, Color32, Galley, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke, Ui, Vec2, vec2};
 use texcraft_engine::{Selection, Session, edit};
 use texcraft_i18n::{tr, trf};
 use texcraft_log::Severity;
@@ -77,6 +77,18 @@ pub struct FindBar {
     pub current: usize,
 }
 
+impl FindBar {
+    /// Done (or Escape): the bar closes and forgets its search, so the next ⌘F starts empty (or
+    /// with the selection); Match Case stays as chosen.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.focus = false;
+        self.query.clear();
+        self.replacement.clear();
+        self.current = 0;
+    }
+}
+
 /// Editor UI state that is not part of the session.
 #[derive(Default)]
 pub struct EditorState {
@@ -106,6 +118,8 @@ pub struct EditorState {
     pub spell: SpellState,
     /// The source inverse search landed on, flashed for a moment.
     pub flash: Option<SourceFlash>,
+    /// The selection a right-click landed in, kept while the button is down.
+    right_click_keep: Option<CCursorRange>,
 }
 
 /// A brief highlight of characters `start..end` of document `doc` (an empty range: the caret's
@@ -865,7 +879,7 @@ fn find_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
             egui::RichText::new(tr("Replace")).size(11.0),
         );
         if ui.button(tr("Done")).clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-            st.find.open = false;
+            st.find.close();
             st.focus = true;
         }
     });
@@ -1724,7 +1738,10 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                 let shapes_from = ui
                     .ctx()
                     .graphics(|g| g.get(ui.layer_id()).map_or(0, |l| l.next_idx().0));
-                let out = egui::TextEdit::multiline(&mut doc.text)
+                let selected = egui::TextEdit::load_state(ui.ctx(), id)
+                    .and_then(|s| s.cursor.char_range())
+                    .filter(|r| !r.is_empty());
+                let mut out = egui::TextEdit::multiline(&mut doc.text)
                     .id(id)
                     .font(font.clone())
                     .frame(egui::Frame::NONE)
@@ -1746,6 +1763,74 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                     })
                     .layouter(&mut layouter)
                     .show(ui);
+                // egui's text widget moves the caret on any button's press: a right-click inside
+                // the selection keeps it for the menu's Cut and Copy, as in a macOS text view
+                // (outside it, the caret moves there).
+                let (right_press, right_down) = ui.input(|i| {
+                    (
+                        i.pointer.button_pressed(egui::PointerButton::Secondary),
+                        i.pointer.secondary_down(),
+                    )
+                });
+                if right_press {
+                    let at = ui
+                        .input(|i| i.pointer.interact_pos())
+                        .filter(|_| out.response.response.hovered())
+                        .map(|p| out.galley.cursor_from_pos(p - out.galley_pos).index.0);
+                    st.right_click_keep = selected.filter(|r| {
+                        let [a, b] = r.sorted_cursors();
+                        at.is_some_and(|c| a.index.0 <= c && c <= b.index.0)
+                    });
+                }
+                if let Some(keep) = st.right_click_keep {
+                    out.state.cursor.set_char_range(Some(keep));
+                    out.state.clone().store(ui.ctx(), id);
+                    out.cursor_range = Some(keep);
+                    if !right_down && !right_press {
+                        st.right_click_keep = None;
+                    }
+                }
+                // Drag-selecting with the pointer past the editor's edge scrolls it, faster the
+                // farther out, and the selection follows on the next frames (as in a macOS text
+                // view). The wheel scrolls during the drag too: egui's scroll area ignores it
+                // while anything is dragged.
+                if ui.ctx().is_being_dragged(id) {
+                    let view = ui.clip_rect();
+                    let (pointer, dt, wheel) = ui.input(|i| {
+                        (
+                            i.pointer.latest_pos(),
+                            i.stable_dt.clamp(0.0, 0.1),
+                            i.smooth_scroll_delta,
+                        )
+                    });
+                    // Points per second: 120 at the edge, 10 more per point beyond it.
+                    let past = |p: f32, lo: f32, hi: f32| {
+                        let d = if p < lo {
+                            p - lo
+                        } else if p > hi {
+                            p - hi
+                        } else {
+                            return 0.0;
+                        };
+                        -d.signum() * (120.0 + d.abs() * 10.0).min(2400.0) * dt
+                    };
+                    let auto = pointer.map_or(Vec2::ZERO, |p| {
+                        vec2(
+                            past(p.x, view.left(), view.right()),
+                            past(p.y, view.top(), view.bottom()),
+                        )
+                    });
+                    if auto != Vec2::ZERO || wheel != Vec2::ZERO {
+                        ui.scroll_with_delta_animation(
+                            auto + wheel,
+                            egui::style::ScrollAnimation::none(),
+                        );
+                        ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+                    }
+                    if auto != Vec2::ZERO {
+                        ui.ctx().request_repaint();
+                    }
+                }
                 changed = out.response.response.changed();
                 if let Some(range) = out.cursor_range {
                     let job = (*out.galley.job).clone();
@@ -2188,6 +2273,195 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drag-selecting with the pointer held below the editor scrolls it (and the selection
+    /// follows); above it, back up. The wheel scrolls during the drag too.
+    #[test]
+    fn drag_selection_scrolls_the_editor() {
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        let text: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        assert!(
+            session
+                .run("edit.setText", &serde_json::json!({ "text": text }))
+                .is_ok()
+        );
+        let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let t = Tokens::light();
+        let mut st = EditorState::default();
+        let mut time = 0.0;
+        let mut frame = |session: &mut Session, st: &mut EditorState, events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| show(ui, &t, session, st));
+            out.textures_delta.clear();
+        };
+        let top = |ctx: &egui::Context| ctx.read_response(id).map_or(0.0, |r| r.rect.top());
+        let cursor = |s: &Session| s.doc().map_or(0, |d| d.selection.cursor);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+
+        st.focus = true;
+        frame(&mut session, &mut st, Vec::new());
+        let start = top(&ctx);
+        let Some(rect) = ctx.read_response(id).map(|r| r.rect) else {
+            panic!("no editor");
+        };
+        let first = rect.min + vec2(20.0, 10.0);
+        frame(
+            &mut session,
+            &mut st,
+            vec![egui::Event::PointerMoved(first)],
+        );
+        frame(&mut session, &mut st, vec![button(first, true)]);
+        // Out below the editor, then held still for a second.
+        let below = egui::pos2(first.x, 760.0);
+        for k in 1..=6 {
+            let p = first + (below - first) * (k as f32 / 6.0);
+            frame(&mut session, &mut st, vec![egui::Event::PointerMoved(p)]);
+        }
+        let reached = top(&ctx);
+        let cursor_reached = cursor(&session);
+        for _ in 0..60 {
+            frame(&mut session, &mut st, Vec::new());
+        }
+        let held = top(&ctx);
+        assert!(held < reached - 100.0, "kept scrolling down while held");
+        assert!(cursor(&session) > cursor_reached, "the selection followed");
+
+        // The wheel scrolls during the drag (back up here).
+        let inside = egui::pos2(first.x, 300.0);
+        frame(
+            &mut session,
+            &mut st,
+            vec![egui::Event::PointerMoved(inside)],
+        );
+        let before_wheel = top(&ctx);
+        for _ in 0..10 {
+            frame(
+                &mut session,
+                &mut st,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, 40.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+        assert!(top(&ctx) > before_wheel + 100.0, "the wheel scrolled up");
+
+        // Held above the editor: back up to the top.
+        let above = egui::pos2(first.x, -40.0);
+        frame(
+            &mut session,
+            &mut st,
+            vec![egui::Event::PointerMoved(above)],
+        );
+        for _ in 0..240 {
+            frame(&mut session, &mut st, Vec::new());
+        }
+        assert!((top(&ctx) - start).abs() < 1.0, "scrolled back to the top");
+        frame(&mut session, &mut st, vec![button(above, false)]);
+        let sel = session
+            .doc()
+            .map(|d| (d.selection.anchor, d.selection.cursor));
+        // From the press on "line 1" up to the top.
+        assert!(
+            matches!(sel, Some((a, 0)) if (1..7).contains(&a)),
+            "{sel:?}"
+        );
+    }
+
+    /// A right-click inside the selection keeps it (the menu's Cut and Copy act on it), through
+    /// the press and the release that opens the menu; outside it, the caret moves to the click.
+    #[test]
+    fn right_click_keeps_the_selection_it_lands_in() {
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        assert!(
+            session
+                .run(
+                    "edit.setText",
+                    &serde_json::json!({ "text": "Hello world" })
+                )
+                .is_ok()
+        );
+        let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let t = Tokens::light();
+        let mut st = EditorState::default();
+        let frame = |session: &mut Session, st: &mut EditorState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| show(ui, &t, session, st));
+            out.textures_delta.clear();
+        };
+        let select = |session: &mut Session, st: &mut EditorState, anchor, cursor| {
+            if let Some(doc) = session.docs.get_mut(session.active) {
+                doc.selection = Selection { anchor, cursor };
+            }
+            st.push_selection = Some(session.active);
+        };
+        let selection = |s: &Session| s.doc().map(|d| (d.selection.anchor, d.selection.cursor));
+        let right = |pos: Pos2, pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+
+        // The editor has the keys, as after selecting with the mouse.
+        st.focus = true;
+        frame(&mut session, &mut st, Vec::new());
+        let Some(rect) = ctx.read_response(id).map(|r| r.rect) else {
+            panic!("no editor");
+        };
+        // Over the first character.
+        let at = rect.min + vec2(2.0, 10.0);
+
+        // Everything selected: the right-click lands inside.
+        select(&mut session, &mut st, 0, 11);
+        frame(&mut session, &mut st, Vec::new());
+        assert_eq!(selection(&session), Some((0, 11)));
+        frame(&mut session, &mut st, right(at, true));
+        assert_eq!(selection(&session), Some((0, 11)), "kept on the press");
+        frame(&mut session, &mut st, right(at, false));
+        assert_eq!(selection(&session), Some((0, 11)), "kept on the release");
+        assert!(st.spell.menu.is_some(), "the menu is up");
+        frame(&mut session, &mut st, Vec::new());
+        assert_eq!(selection(&session), Some((0, 11)), "kept with the menu up");
+
+        // "world" selected: the right-click on "H" lands outside, and the caret moves there.
+        st.spell.menu = None;
+        select(&mut session, &mut st, 6, 11);
+        frame(&mut session, &mut st, Vec::new());
+        assert_eq!(selection(&session), Some((6, 11)));
+        frame(&mut session, &mut st, right(at, true));
+        frame(&mut session, &mut st, right(at, false));
+        assert_eq!(selection(&session), Some((0, 0)));
+    }
 
     /// Typing plain text waits for an AI suggestion; typing a command opens the completion list
     /// and waits for none (both would take Tab). Escape closes the list and the editor keeps the

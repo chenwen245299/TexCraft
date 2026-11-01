@@ -30,8 +30,14 @@ pub enum Dialog {
         /// Text.
         message: String,
     },
-    /// Close a document with unsaved changes.
-    ConfirmClose(usize),
+    /// Close a document with unsaved changes. `quit`: TexCraft is quitting, and goes on
+    /// quitting once the document is saved or its changes dropped.
+    ConfirmClose {
+        /// The document.
+        doc: usize,
+        /// Quit afterwards.
+        quit: bool,
+    },
 }
 
 /// What the app must do after the welcome window (things that need the platform).
@@ -55,6 +61,62 @@ fn heading(ui: &mut egui::Ui, t: &Tokens, title: &str, message: Option<&str>) {
     if let Some(m) = message {
         ui.add_space(4.0);
         ui.label(RichText::new(m).size(12.0).color(t.form_desc));
+    }
+}
+
+/// While TexCraft typesets before quitting (LIVE mode): a sheet saying so, with Don't Quit and
+/// Quit Now. It goes away by itself when the typesetting is done and the window closes.
+pub fn quitting(ctx: &egui::Context, t: &Tokens, session: &mut Session) {
+    if !session.typeset.is_quitting() {
+        return;
+    }
+    let name = session
+        .typeset
+        .root
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut run = None;
+    egui::Modal::new(Id::new("quit-typeset"))
+        .frame(menu::sheet_frame(t, 20))
+        .backdrop_color(menu::backdrop())
+        .show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.horizontal_top(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, 18.0), egui::Sense::hover());
+                let angle = ui.input(|i| i.time) as f32 * 6.0;
+                crate::icons::spinner(ui.painter(), r, t.text_weak, angle);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    heading(
+                        ui,
+                        t,
+                        tr("Typesetting before quitting…"),
+                        Some(&trf!(
+                            "TexCraft typesets “{name}” so that the PDF beside it has your latest changes.",
+                            name = name
+                        )),
+                    );
+                });
+            });
+            ui.add_space(16.0);
+            match menu::dialog_buttons(
+                ui,
+                t,
+                &[
+                    (tr("Don't Quit"), ButtonKind::Normal),
+                    (tr("Quit Now"), ButtonKind::Default),
+                ],
+            ) {
+                Some(0) => run = Some("app.cancelQuit"),
+                Some(_) => run = Some("app.quitNow"),
+                None => {}
+            }
+        });
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    if let Some(id) = run {
+        let _ = session.run(id, &serde_json::Value::Null);
     }
 }
 
@@ -215,8 +277,15 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                 close = true;
             }
         }
-        Dialog::ConfirmClose(idx) => {
-            let idx = *idx;
+        Dialog::ConfirmClose { doc: idx, quit } => {
+            let (idx, quit) = (*idx, *quit);
+            // Saved or dropped: when quitting, on to the next document (or to quitting).
+            let closed = |session: &mut Session| {
+                session.close(idx);
+                if quit {
+                    let _ = session.run("app.quit", &serde_json::Value::Null);
+                }
+            };
             let name = session
                 .docs
                 .get(idx)
@@ -241,7 +310,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                     egui::Rect::from_min_size(egui::pos2(row, top), vec2(110.0, 28.0)),
                 ));
                 if menu::dialog_button(&mut left, t, tr("Don't Save"), ButtonKind::Normal, 100.0) {
-                    session.close(idx);
+                    closed(session);
                     close = true;
                 }
                 match menu::dialog_buttons(
@@ -257,7 +326,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                         if session.save(idx).is_ok()
                             && session.docs.get(idx).is_some_and(|d| !d.is_dirty())
                         {
-                            session.close(idx);
+                            closed(session);
                         }
                         close = true;
                     }

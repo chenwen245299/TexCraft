@@ -93,9 +93,11 @@ pub fn request(
             text: user,
             blocks: Vec::new(),
             images: Vec::new(),
+            ..Default::default()
         }],
         max_tokens: Some(settings.max_tokens()),
         no_reasoning: true,
+        tools: Vec::new(),
     }
 }
 

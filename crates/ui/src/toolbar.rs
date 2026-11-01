@@ -391,10 +391,10 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             .request_repaint_after(std::time::Duration::from_millis(500));
     }
 
-    // ---- Right capsules: share | view mode | back, forward, new tab.
+    // ---- Right capsules: share | view mode | AI Assistant.
     let nav_right = rect.right() - EDGE;
     let nav = Rect::from_min_max(
-        pos2(nav_right - 92.5, cy - CAPSULE_H / 2.0),
+        pos2(nav_right - 34.5, cy - CAPSULE_H / 2.0),
         pos2(nav_right, cy + CAPSULE_H / 2.0),
     );
     let view = Rect::from_min_max(
@@ -478,29 +478,33 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             run(session, ids[i]);
         }
     }
-    // Back, forward, new tab.
-    let back_en = session.is_enabled("nav.back");
-    let fwd_en = session.is_enabled("nav.forward");
-    let back = Rect::from_center_size(pos2(nav.left() + 13.5, cy), vec2(20.0, 26.0));
-    let fwd = Rect::from_center_size(pos2(nav.left() + 40.5, cy), vec2(20.0, 26.0));
-    let newt = Rect::from_center_size(pos2(nav.left() + 75.5, cy), vec2(28.0, 26.0));
-    if hit(ui, t, back, "tb-back", tr("Back"), back_en, 8.0).clicked() {
-        run(session, "nav.back");
+    // The AI Assistant panel on the right: shown, the capsule looks pressed.
+    let ai_open = session.view.assistant;
+    if ai_open {
+        p.rect_filled(nav.shrink(3.0), 15.0, t.segment_selected);
     }
-    if hit(ui, t, fwd, "tb-fwd", tr("Forward"), fwd_en, 8.0).clicked() {
-        run(session, "nav.forward");
+    if hit(
+        ui,
+        t,
+        nav.shrink(3.0),
+        "tb-assistant",
+        tr("AI Assistant (⌥⌘7)"),
+        true,
+        15.0,
+    )
+    .clicked()
+    {
+        run(session, "view.assistant");
     }
-    if hit(ui, t, newt, "tb-new", tr("New Document (⌘N)"), true, 8.0).clicked() {
-        run(session, "file.new");
-    }
-    let grey = |en: bool| if en { t.toolbar_fg } else { t.nav_disabled };
-    icons::nav_chevron(&p, back.center() + vec2(0.0, 0.25), grey(back_en), false);
-    icons::nav_chevron(&p, fwd.center() + vec2(0.0, 0.25), grey(fwd_en), true);
-    icons::new_tab_rounded(
+    icons::ai_texcraft(
         &p,
-        pos2(nav.left() + 71.0, cy + 1.15),
+        nav.center() + vec2(0.0, 0.25),
         t.toolbar_fg,
-        t.capsule_bg,
+        if ai_open {
+            t.segment_selected
+        } else {
+            t.capsule_bg
+        },
     );
     let _ = Align::Center;
 }

@@ -91,6 +91,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Committing", "正在提交"),
     ("Pulling", "正在拉取"),
     ("Pushing", "正在推送"),
+    ("Syncing", "正在同步"),
     ("Fetching", "正在获取"),
     ("Reading changes", "正在读取更改"),
     // Updates
@@ -237,4 +238,8 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Cannot write the installer: {e}", "无法写入安装程序：{e}"),
     ("Cannot start the installer: {e}", "无法启动安装程序：{e}"),
     ("Cannot start the update thread.", "无法启动更新线程。"),
+    (
+        "A live preview pass took too long and was restarted",
+        "一次实时预览排版耗时过长，已重新开始",
+    ),
 ];

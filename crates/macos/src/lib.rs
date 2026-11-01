@@ -101,6 +101,45 @@ pub fn place_traffic_lights_titled(title: &str, height: f64, left: f64, close_on
     }
 }
 
+/// The standard AppKit action for an edit shortcut (⌘A → `selectAll:`, ⌘C, ⌘V, ⌘X, ⌘Z,
+/// ⇧⌘Z), as AppKit's own Edit menu sends it; `None` for other keys. `key` is the key's
+/// character without modifiers.
+pub fn edit_action(
+    key: &str,
+    cmd: bool,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+) -> Option<&'static str> {
+    if !cmd || ctrl || alt {
+        return None;
+    }
+    Some(match (key.to_lowercase().as_str(), shift) {
+        ("a", false) => "selectAll:",
+        ("c", false) => "copy:",
+        ("v", false) => "paste:",
+        ("x", false) => "cut:",
+        ("z", false) => "undo:",
+        ("z", true) => "redo:",
+        _ => return None,
+    })
+}
+
+/// While a native modal panel has the keyboard (an Open or Save panel, an alert), ⌘A, ⌘C, ⌘V,
+/// ⌘X, ⌘Z and ⇧⌘Z do in its text fields what AppKit's own Edit menu does: TexCraft's Edit menu
+/// sends its commands to egui, so they never reached the panel. Installs a key monitor once
+/// (later calls do nothing); returns whether it is installed. Main thread only.
+pub fn route_edit_keys_to_modal_panels() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        imp::route_modal_edit_keys()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Puts the system's translucent window material (vibrancy) behind the content of the window
 /// titled `title`; the content must draw on a transparent background. Cheap to call every frame
 /// (it installs the material once). Returns whether the material is in place.
@@ -562,6 +601,68 @@ mod imp {
         true
     }
 
+    pub fn route_modal_edit_keys() -> bool {
+        use std::ptr::NonNull;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use objc2_app_kit::{NSEvent, NSEventMask};
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        if MainThreadMarker::new().is_none() {
+            return false;
+        }
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        let block = block2::RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+            if modal_edit(event) {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            }
+        });
+        // SAFETY: a key-down monitor installed on the main thread (checked above); AppKit
+        // keeps a copy of the block and calls it on the main thread.
+        let monitor = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block)
+        };
+        // The monitor works for the app's whole life.
+        std::mem::forget(monitor);
+        true
+    }
+
+    /// Sends a native modal panel the edit action for `event`; returns whether it took it.
+    fn modal_edit(event: std::ptr::NonNull<objc2_app_kit::NSEvent>) -> bool {
+        use objc2_app_kit::NSEventModifierFlags as F;
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // SAFETY: a getter on the main thread.
+        if unsafe { app.modalWindow() }.is_none() {
+            return false;
+        }
+        // SAFETY: AppKit hands monitors a live event, on the main thread.
+        let event = unsafe { event.as_ref() };
+        // SAFETY: getters of that event.
+        let (flags, key) = unsafe { (event.modifierFlags(), event.charactersIgnoringModifiers()) };
+        let Some(key) = key else {
+            return false;
+        };
+        let has = |f: F| flags.0 & f.0 != 0;
+        let Some(action) = super::edit_action(
+            &key.to_string(),
+            has(F::NSEventModifierFlagCommand),
+            has(F::NSEventModifierFlagShift),
+            has(F::NSEventModifierFlagControl),
+            has(F::NSEventModifierFlagOption),
+        ) else {
+            return false;
+        };
+        // SAFETY: a standard action to the key window's first responder (the panel's text
+        // field), on the main thread.
+        unsafe { app.sendAction_to_from(objc2::runtime::Sel::register(action), None, None) }
+    }
+
     pub fn place_titled(title: &str, height: f64, left: f64, close_only: bool) -> bool {
         let Some(mtm) = MainThreadMarker::new() else {
             return false;
@@ -639,6 +740,31 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    /// The edit shortcuts map to AppKit's standard actions; others, and other modifiers, don't.
+    #[test]
+    fn edit_shortcuts_map_to_standard_actions() {
+        use super::edit_action;
+        assert_eq!(
+            edit_action("a", true, false, false, false),
+            Some("selectAll:")
+        );
+        assert_eq!(
+            edit_action("A", true, false, false, false),
+            Some("selectAll:")
+        );
+        assert_eq!(edit_action("v", true, false, false, false), Some("paste:"));
+        assert_eq!(edit_action("Z", true, true, false, false), Some("redo:"));
+        assert_eq!(edit_action("a", false, false, false, false), None, "no ⌘");
+        assert_eq!(
+            edit_action("a", true, false, false, true),
+            None,
+            "⌥⌘A is not Select All"
+        );
+        assert_eq!(edit_action("s", true, false, false, false), None);
+        // Off the main thread nothing is installed (and nothing crashes).
+        assert!(!super::route_edit_keys_to_modal_panels());
+    }
+
     /// AppKit is asked on the main thread only: elsewhere no answer, and no crash.
     #[test]
     fn system_dark_off_the_main_thread_is_none() {

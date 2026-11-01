@@ -251,6 +251,10 @@ fn has_pdf(s: &Session) -> bool {
 fn has_pdf_selection(s: &Session) -> bool {
     !s.pdf.selected_text.is_empty()
 }
+fn is_quitting(s: &Session) -> bool {
+    s.typeset.is_quitting()
+}
+
 fn is_running(s: &Session) -> bool {
     s.typeset.is_running()
 }
@@ -487,6 +491,31 @@ static REGISTRY: &[CommandSpec] = &[
         always,
         |s, _| {
             s.effect(Effect::Quit);
+            Ok(())
+        }
+    ),
+    // The sheet shown while TexCraft typesets before quitting (LIVE mode).
+    cmd!(
+        "app.quitNow",
+        "Quit Now",
+        None,
+        0,
+        None,
+        is_quitting,
+        |s, _| {
+            s.quit_now();
+            Ok(())
+        }
+    ),
+    cmd!(
+        "app.cancelQuit",
+        "Don't Quit",
+        None,
+        0,
+        None,
+        is_quitting,
+        |s, _| {
+            s.cancel_quit();
             Ok(())
         }
     ),
@@ -894,10 +923,30 @@ static REGISTRY: &[CommandSpec] = &[
         None,
         always,
         |s, _| {
-            s.ai_stop();
-            s.ai.messages.clear();
+            s.ai_new_chat();
             Ok(())
         }
+    ),
+    cmd!(
+        "ai.openChat",
+        "Open Conversation",
+        None,
+        0,
+        None,
+        always,
+        |s, p| s.ai_open_chat(param_str(p, "id")?),
+        params =
+            "{id: string} — a saved conversation of the current project (state.inspect ai.history)"
+    ),
+    cmd!(
+        "ai.deleteChat",
+        "Delete Conversation",
+        None,
+        0,
+        None,
+        always,
+        |s, p| s.ai_delete_chat(param_str(p, "id")?),
+        params = "{id: string}"
     ),
     cmd!(
         "ai.insert",
@@ -1113,12 +1162,23 @@ static REGISTRY: &[CommandSpec] = &[
         |s, p| s.git_commit(p.get("message").and_then(Value::as_str)),
         params = "{message?: string} — default: the message box; stages everything when nothing is staged"
     ),
+    cmd!(
+        "git.generateMessage",
+        "Generate Commit Message",
+        None,
+        0,
+        None,
+        always,
+        |s, _| s.git_generate_message()
+    ),
     cmd!("git.pull", "Pull", None, 0, None, always, |s, _| s
         .git_run(texcraft_git::Op::Pull)),
     cmd!("git.push", "Push", None, 0, None, always, |s, _| s
         .git_run(texcraft_git::Op::Push)),
     cmd!("git.fetch", "Fetch", None, 0, None, always, |s, _| s
         .git_run(texcraft_git::Op::Fetch)),
+    cmd!("git.sync", "Sync Changes", None, 0, None, always, |s, _| s
+        .git_run(texcraft_git::Op::Sync)),
     cmd!(
         "git.diff",
         "Open Changes",
@@ -1963,10 +2023,10 @@ static REGISTRY: &[CommandSpec] = &[
         Some(Shortcut::cmd_alt("7")),
         always,
         |s, _| {
-            s.show_tab(SidebarTab::Assistant);
+            s.view.assistant = !s.view.assistant;
             Ok(())
         },
-        checked = |s| s.view.sidebar && s.view.sidebar_tab == SidebarTab::Assistant
+        checked = |s| s.view.assistant
     ),
     cmd!(
         "view.structure",

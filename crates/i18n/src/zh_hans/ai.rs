@@ -2,6 +2,25 @@
 //! Also the user-visible strings of crates/ai (provider kinds, capabilities, errors).
 
 pub(super) const ENTRIES: super::Entries = &[
+    // Conversation history (ai_panel.rs, engine ai.rs)
+    ("Conversation History", "对话记录"),
+    ("Conversations in This Project", "此项目的对话"),
+    ("Delete Conversation", "删除对话"),
+    ("No saved conversations yet", "还没有保存的对话"),
+    ("No such conversation.", "没有这个对话。"),
+    ("Untitled conversation", "未命名对话"),
+    // Project files the model read (ai_panel.rs, engine ai.rs)
+    ("Listed the project's files", "列出了项目文件"),
+    ("Listed {folder}", "列出了 {folder}"),
+    ("Read {file}", "读取了 {file}"),
+    ("Read {file}, lines {first}–{last}", "读取了 {file} 第 {first}–{last} 行"),
+    ("Searched for “{text}”", "搜索了“{text}”"),
+    ("Stopped after {n} rounds of reading files", "读取文件 {n} 轮后停止"),
+    (
+        "The model kept reading files without answering.",
+        "模型一直在读取文件，没有给出回答。",
+    ),
+    ("{file} is not in the project", "{file} 不在项目中"),
     // Assistant panel (ai_panel.rs)
     (
         "Find and fix the errors in this document",

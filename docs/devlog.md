@@ -723,3 +723,152 @@ the welcome-window and update-window bugs; what landed:
   window tiling, open/save panels) follow macOS's language rather than an in-app choice (would
   need the app's `AppleLanguages` default and a relaunch); the LIVE/AUTO/MANUAL badge stays
   English; new files and folders keep English names (`untitled.tex`), TeX prefers ASCII paths.
+
+## LIVE mode keeps the PDF beside the source current; live passes cannot stall (2026-10-18)
+
+- Report: on a laptop, the live preview stopped updating for good (green check, nothing typeset)
+  after a ⌘T. Not reproduced here (11 stress runs mixing typing and ⌘T, IME and AI-accept edit
+  paths checked), but two ways a pass could hold up every later one were real:
+  `Job::try_recv` treated a dead job thread as still running, and a hung TeX pass blocked the
+  queue (the toolbar shows no spinner for live passes). A dead job now finishes once with an
+  error; a live pass running ≥ 20 s (or 4× the last pass) while edits wait is stopped and the
+  next pass typesets them (status: "A live preview pass took too long and was restarted").
+- LIVE mode, new (`crates/engine/src/full.rs`): edits mark their project's root stale (untitled
+  documents never); a stale project gets a background full typeset 5 min after its first edit, at
+  a 5 s pause in typing (without the pause after 10 min); nothing runs when nothing was edited.
+  Like ⌘T it saves first (setting "save before typesetting"); failures stay quiet (no alert, no
+  issues list) and leave the project due again. Quitting in LIVE mode typesets the stale
+  projects after the unsaved-changes prompt (the PDF matches what was saved), behind a sheet
+  with Don't Quit / Quit Now (`app.cancelQuit`, `app.quitNow`); the window closes when done.
+- Quitting now goes on after the unsaved-changes prompt (Save / Don't Save) instead of stopping
+  with the document closed (`Dialog::ConfirmClose { doc, quit }`).
+- `state.inspect` typeset: `background`, `staleProjects`, `quitting`.
+- Tests: typeset (dead job finishes once), engine (untitled never stale; periodic schedule incl.
+  pause, 10-minute cap, MANUAL/paused, stop leaves it due; quit flow incl. Don't Quit, Quit Now,
+  edit after Done; a `\def\x{\x}\x` live pass is stopped and the next pass succeeds),
+  zh_hans UI test draws the quit sheet. Checked in the dev app: sheet (zh-Hans, English), quit
+  after Save → saved, typeset, closed in ~2 s with the edit in the PDF; Don't Save → PDF matches
+  the saved file; Don't Quit and Quit Now.
+- Open: the laptop's actual cause is unknown (if it recurs: `ps` for a long-running
+  xelatex/xdvipdfmx, and the mtimes in `.texcraft/live/`); quitting from the Dock or at logout
+  may bypass the window's close request; no setting for the 5-minute interval.
+
+
+## Right-click keeps the editor selection (2026-11-01)
+
+- Drag-selecting and then right-clicking lost the selection, so the menu's Cut and Copy had
+  nothing to act on: egui's text widget moves the caret on any button's press and, on the
+  release, treats the press as a drag that moves the selection's end to the pointer. The editor
+  now remembers the selection a right-click lands in and holds it while the button is down
+  (`EditorState::right_click_keep`); a right-click outside the selection still moves the caret
+  there, as in a macOS text view.
+- Test: `right_click_keeps_the_selection_it_lands_in` (fails without the fix: `(0, 11)` became
+  `(0, 0)` on the release). Checked in the dev app over `ui.drag` + `ui.pointer
+  {click: "secondary"}`: selection 64..101 kept with the menu up; outside, the caret moved to
+  the click.
+- Not checked: the menu's Copy into the system clipboard (left alone in the test run).
+
+## A newly opened file no longer shows the start-up Untitled's PDF (2026-11-01)
+
+- At launch LIVE mode typesets the pristine Untitled behind the welcome window. Opening a file
+  replaced the document but kept its PDF ("Untitled Article / Your Name") and typeset nothing,
+  as a pass was only scheduled when the pane was empty. `PdfState::root` now records the root a
+  PDF was typeset from; `open_file` empties the pane when the new root has no PDF yet and the
+  shown one belongs to another root (`clear_pdf`), then schedules the pass. A pass whose root
+  no open document is or belongs to (the replaced Untitled's, finishing late) leaves the pane
+  alone (`pdf_wanted`). File → Open… typesets whenever nothing shows after opening (MANUAL and
+  AUTO too). The PDF viewer drops its pages when the pane is emptied (empty state / spinner).
+- Tests: `an_opened_file_replaces_the_untitled_pdf`, `an_opened_file_keeps_its_own_projects_pdf`
+  (a typeset-before PDF shows at once; a chapter keeps its project's PDF, a live one too).
+  Checked in the dev app with a copy of a real acmart paper: after the Untitled's live pass,
+  `file.openPath` → pane empty, pass running → the paper's 6 pages.
+- Not checked in the app: the Open panel path in MANUAL mode (modal panel, not drivable).
+  Still open: switching tabs does not switch the PDF to the active document's.
+
+## Editor scrolls while drag-selecting; AI commit messages (2026-11-01)
+
+- Drag-selecting never scrolled the editor: egui's text widget only scrolls to the caret when
+  the selection changes, and egui's scroll area ignores the wheel while anything is dragged. A
+  drag with the pointer past the editor's edge now scrolls it every frame (120 pt/s at the edge,
+  +10 pt/s per point beyond, up to 2,400) and the selection follows; the wheel scrolls during the
+  drag. Test `drag_selection_scrolls_the_editor` (before: 0 pt in a second held below; after:
+  ~700 pt, wheel and scroll back up checked). Dev app: a drag from line 3 to below the window
+  scrolled to line ~54 and selected to line 128.
+- Source Control: a sparkles button in the header row (`git.generateMessage`) has the
+  Assistant's model write a one- or two-sentence commit message for the staged changes (else all
+  of them) into the message box. `texcraft-git` `Op::Changes` reads the summary, new files and the
+  diff (cut at 12,000 characters); `texcraft_ai::commit` asks for at most 25 words in English and
+  cleans the answer (fences, labels, quotes, remarks after a quoted message, at most two
+  sentences and 200 characters). The button spins while the model writes. Tests: git crate
+  (changes staged/all/cut), ai crate (`clean`), engine (fake model: message, diff sent, errors
+  without a model or changes). Dev app checked against a local fake model.
+- Open: the message language is English whatever the interface language; wheel scrolling during
+  a drag is checked in the harness only (`ui.drag` cannot hold the button).
+
+## AI reads the project; links in answers; Sync Changes; CJK punctuation; find (2026-11-01)
+
+- The Assistant may read the project (`crates/engine/src/ai_tools.rs`): `list_files`,
+  `read_file` (numbered, 1,500 lines a call, open documents as edited) and `search_files`
+  (case-insensitive, 100 matches). Read-only: there is no tool that writes; paths stay inside
+  the project folder (`..`, absolute paths and symbolic links out are refused, symlinks are not
+  listed). `texcraft-ai` sends tools and tool results in both APIs (OpenAI `tool_calls` /
+  `role: tool`, echoing `reasoning_content` for DeepSeek and Kimi; Anthropic `tool_use` /
+  `tool_result`, inputs assembled from `input_json_delta`). The engine runs up to 12 rounds of
+  calls per answer; a model that refuses tools is asked again without them. Answers list the
+  files read above the text ("Read main.tex, lines 1–5", a click opens it).
+- Links in answers: `[name](path#L12)` and inline code naming a project file open the file in
+  a tab at that line (web links in the browser). A sidebar click now reaches the editor in the
+  same frame (`apply_effects` after the sidebar): before, a focused editor wrote its caret back
+  over the jump (outline and search clicks had the same race).
+- Source Control button as VS Code's: Commit while there are changes, else "Sync Changes ↓n ↑m"
+  (`git.sync`: pull, then push), else "Publish Branch" when there is a remote, else idle; the
+  header drops its ahead/behind while the button shows them. Pull merges when Git asks how to
+  reconcile divergent branches and the user set neither pull.rebase nor pull.ff (it failed
+  outright before). `Snapshot::has_remote`.
+- Full-width ？（）！ came from egui's built-in icon font, ahead of PingFang in the fallback
+  chain (checked every font's cmap): the CJK font now follows the system font in every family;
+  only those four characters change font.
+- Find: Done (or Escape) forgets the search; the next ⌘F starts empty or with the selection.
+- Tests: ai (tool wire formats, streamed calls), engine (tools stay in the project, partial
+  reads, unsaved text, search; a full tool round against a fake model), git (Sync with a bare
+  remote and a diverged clone), ui (font order, span/link parsing, the button's states, a
+  sidebar link over a focused editor in full frames, find after Done). Checked in the dev app
+  with a local fake model: rows, links (new tab, line), Sync pushed to a local remote, find.
+- Open: tool calls run on the UI thread (bounded: 2 MB files, depth 6); earlier questions go
+  back to the model as their final text only; untested against real providers' tool calling
+  here (DeepSeek, Anthropic): watch the first real conversations.
+
+## AI Assistant on the right, conversation history, ⌘A in Save panels (2026-11-01)
+
+- The AI Assistant left the sidebar: a toolbar button (a new icon after the app's: the Σ tile
+  with a red sparkle) shows it as a resizable panel on the right, beside the PDF (`View::
+  assistant`, `view.assistant` ⌥⌘7; an old setting's Assistant tab moves over by itself,
+  `View::normalize`). The toolbar's Back / Forward / New Document buttons are gone (menu and
+  shortcuts keep them). The sidebar has six tabs.
+- Conversations are saved per project in TexCraft's data folder (`chats/<folder>-<hash>/`,
+  `crates/engine/src/chats.rs`), never in the project, after each question, answer and Stop.
+  Opening another project saves the conversation and shows that project's history; the
+  panel's clock button lists them (open, × delete); `ai.openChat`, `ai.deleteChat`,
+  `state.inspect` `ai.history`. At start-up, conversations of projects that no longer exist
+  (deleted or moved) are removed. Images and the files read are kept; Anthropic's raw content
+  blocks are not (the text goes back instead).
+- ⌘A (and ⌘C, ⌘V, ⌘X, ⌘Z, ⇧⌘Z) did nothing in Open and Save panels: the Edit menu's items
+  send their commands to egui. A key monitor (`texcraft_macos::route_edit_keys_to_modal_
+  panels`) gives them to the panel's text field as AppKit's own Edit menu would, only while a
+  native modal panel is up.
+- Tests: chats (outside the project, listed, read back, deleted, swept; a session's history
+  across two projects), macOS key mapping, the zh-Hans UI test draws the Assistant panel; the
+  sidebar link test uses the panel. Dev app: panel and icon, two conversations saved and
+  reopened from the history, a deleted project's conversations swept at the next start.
+- Not checked: ⌘A in a real Save panel (no way to send it a key from here); moving a project
+  folder loses its conversations (its old path is gone).
+
+## Assistant panel colours, its toolbar icon redrawn (2026-11-01)
+
+- The Assistant panel has its own background (`Tokens::assistant_bg`): white beside the PDF
+  page in light mode, #232325 in dark; the question box and code cards (`composer_bg`,
+  `composer_border`, used only there) were re-tuned to sit on it (#F5F5F7 / #DEDEE1 light).
+- The toolbar's AI button is drawn from the app icon (`icons::ai_texcraft`): the page tilted
+  by 6° with its folded corner and Σ, and the key in front of its corner holding a sparkle
+  where the icon has the backslash; one ink like the other toolbar glyphs (the earlier red
+  sparkle on a tile read as a dot). Checked by eye in light and dark, open and closed.

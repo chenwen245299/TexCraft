@@ -61,6 +61,8 @@ pub enum Request {
 
 /// How long the sidebar takes to slide open or shut.
 const SIDEBAR_SLIDE_SECONDS: f32 = 0.22;
+/// The AI Assistant panel's first width (it is resizable).
+const ASSISTANT_WIDTH: f32 = 400.0;
 
 /// The window's UI state.
 pub struct Workbench {
@@ -70,6 +72,8 @@ pub struct Workbench {
     pub pdf: pdf_view::PdfView,
     /// Sidebar state.
     pub sidebar: sidebar::SidebarState,
+    /// The AI Assistant panel (on the right).
+    pub ai: ai_panel::AiPanelState,
     /// The open dialog.
     pub dialog: Dialog,
     /// The Settings window and the Typeset Configuration sheet.
@@ -113,6 +117,7 @@ impl Workbench {
             editor: editor::EditorState::default(),
             pdf: pdf_view::PdfView::default(),
             sidebar: sidebar::SidebarState::default(),
+            ai: ai_panel::AiPanelState::default(),
             dialog: Dialog::None,
             prefs: prefs::Prefs::default(),
             welcome: welcome::Welcome::default(),
@@ -321,7 +326,9 @@ impl Workbench {
                 Effect::FindNext { backwards } => {
                     editor::find_next(session, &mut self.editor, backwards)
                 }
-                Effect::ConfirmClose { doc } => self.dialog = Dialog::ConfirmClose(doc),
+                Effect::ConfirmClose { doc } => {
+                    self.dialog = Dialog::ConfirmClose { doc, quit: false };
+                }
                 Effect::Alert { title, message } => self.dialog = Dialog::Alert { title, message },
                 Effect::About => self.dialog = Dialog::About,
                 Effect::Shortcuts => self.dialog = Dialog::Shortcuts,
@@ -415,6 +422,7 @@ impl Workbench {
     pub fn ui(&mut self, root: &mut egui::Ui, session: &mut Session) {
         let ctx = &root.ctx().clone();
         self.update_theme(ctx, session);
+        session.view.normalize();
         self.shortcuts(ctx, session);
         if let Some(wait) = session.tick(Instant::now()) {
             ctx.request_repaint_after(wait);
@@ -467,6 +475,30 @@ impl Workbench {
             });
         ctx.global_style_mut(|s| s.animation_time = quick);
         session.view.sidebar = open;
+        // The AI Assistant: a panel of its own on the right, beside the PDF (more room than the
+        // sidebar), sliding like it.
+        let mut assistant = session.view.assistant;
+        ctx.global_style_mut(|s| s.animation_time = SIDEBAR_SLIDE_SECONDS);
+        egui::Panel::right("assistant")
+            .resizable(true)
+            .default_size(ASSISTANT_WIDTH)
+            .size_range(300.0..=760.0)
+            .frame(egui::Frame::NONE.fill(t.assistant_bg))
+            .show_separator_line(true)
+            .drag_to_open(false)
+            .show_collapsible(root, &mut assistant, |ui| {
+                let rect = ui.max_rect();
+                ui.expand_to_include_rect(rect);
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                c.set_clip_rect(rect);
+                ai_panel::show(&mut c, &t, session, &mut self.ai);
+            });
+        ctx.global_style_mut(|s| s.animation_time = quick);
+        session.view.assistant = assistant;
+        // What the side panels asked for (a link in an answer, an outline entry: reveal a
+        // line) reaches the editor this frame, before a focused editor writes its own caret
+        // back into the session over it.
+        self.apply_effects(ctx, session);
         // The PDF in its own window (e.g. on an external display): the main window shows only
         // the editor meanwhile.
         if self.pdf.window {
@@ -567,6 +599,7 @@ impl Workbench {
         } else {
             dialogs::show(ctx, &t, session, &mut self.dialog);
         }
+        dialogs::quitting(ctx, &t, session);
         if !self.update_window || !self.prefs.open || self.prefs.inline {
             self.update_on_settings = false;
         }
@@ -866,6 +899,142 @@ mod tests {
                 },
             );
         });
+    }
+
+    /// Done forgets the search: the next ⌘F starts empty, or with the selected text; Match Case
+    /// stays as chosen.
+    #[test]
+    fn find_starts_fresh_after_done() {
+        let ctx = Context::default();
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.update.url = "/nonexistent/texcraft-latest.json".into();
+        session
+            .run("edit.setText", &serde_json::json!({"text": "alpha beta\n"}))
+            .unwrap();
+        let find = |bench: &mut Workbench, session: &mut Session| {
+            session.effects.push_back(Effect::Find { replace: false });
+            bench.apply_effects(&ctx, session);
+        };
+        find(&mut bench, &mut session);
+        bench.editor.find.query = "\\ORCID".into();
+        bench.editor.find.replacement = "x".into();
+        bench.editor.find.case_sensitive = true;
+        bench.editor.find.close();
+        assert!(!bench.editor.find.open && bench.editor.find.query.is_empty());
+        assert!(bench.editor.find.replacement.is_empty());
+        find(&mut bench, &mut session);
+        assert!(bench.editor.find.open && bench.editor.find.query.is_empty());
+        assert!(bench.editor.find.case_sensitive, "an option: kept");
+        // With text selected, ⌘F looks for it.
+        bench.editor.find.close();
+        if let Some(d) = session.docs.get_mut(0) {
+            d.selection = texcraft_engine::Selection {
+                anchor: 6,
+                cursor: 10,
+            };
+        }
+        find(&mut bench, &mut session);
+        assert_eq!(bench.editor.find.query, "beta");
+    }
+
+    /// A link in the sidebar (a file the Assistant read) moves the caret even while the editor
+    /// has the keys: the sidebar's reveal reaches the editor before the editor writes its own
+    /// caret back into the session.
+    #[test]
+    fn sidebar_links_reveal_over_a_focused_editor() {
+        use texcraft_engine::ai::ChatMessage;
+        use texcraft_engine::ai_tools::{ToolKind, ToolUse};
+        let dir = std::env::temp_dir().join(format!("texcraft-ui-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("main.tex");
+        let text: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&main, &text).unwrap();
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.update.url = "/nonexistent/texcraft-latest.json".into();
+        session.open_path(&main).unwrap();
+        session.view.sidebar = true;
+        session.view.assistant = true;
+        // A model is set up (the panel shows the conversation); nothing is sent.
+        let Some(local) = texcraft_ai::PRESETS.iter().find(|p| p.id == "ollama") else {
+            panic!("no local preset");
+        };
+        let i = session.ai.config.add(local);
+        session.ai.config.providers[i].models = vec!["m".into()];
+        session.ai.config.normalize();
+        let message = |role, text: &str, tools| ChatMessage {
+            role,
+            text: text.into(),
+            blocks: Vec::new(),
+            model: None,
+            provider: None,
+            pending: false,
+            thinking: false,
+            error: None,
+            note: None,
+            images: Vec::new(),
+            tools,
+        };
+        let read = ToolUse {
+            kind: ToolKind::Read,
+            target: "main.tex".into(),
+            lines: Some((3, 5)),
+            failed: false,
+        };
+        session.ai.messages = vec![
+            message(texcraft_ai::Role::User, "Where?", Vec::new()),
+            message(texcraft_ai::Role::Assistant, "There.", vec![read]),
+        ];
+        let frame = |bench: &mut Workbench, session: &mut Session, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1388.0, 824.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| bench.ui(ui, session));
+            out.textures_delta.clear();
+        };
+        let line = |s: &Session| {
+            s.doc()
+                .map(|d| texcraft_engine::edit::line_of_char(&d.text, d.selection.cursor))
+        };
+        for _ in 0..2 {
+            frame(&mut bench, &mut session, Vec::new());
+        }
+        session
+            .run("edit.gotoLine", &serde_json::json!({"line": 9}))
+            .unwrap();
+        for _ in 0..3 {
+            frame(&mut bench, &mut session, Vec::new());
+        }
+        assert_eq!(line(&session), Some(9));
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "the editor has the keys"
+        );
+        let Some(row) = ctx.read_response(egui::Id::new(("ai-tool", 1usize, 0usize))) else {
+            panic!("no row for the file read");
+        };
+        let p = row.rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut bench, &mut session, vec![egui::Event::PointerMoved(p)]);
+        frame(&mut bench, &mut session, vec![button(true)]);
+        frame(&mut bench, &mut session, vec![button(false)]);
+        for _ in 0..2 {
+            frame(&mut bench, &mut session, Vec::new());
+        }
+        assert_eq!(line(&session), Some(3), "the row's first line");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The main window comes forward for a dialog or a new document raised while another of the

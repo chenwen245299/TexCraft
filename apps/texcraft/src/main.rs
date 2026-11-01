@@ -167,6 +167,9 @@ impl App {
         // AI Assistant providers live next to the app's settings (owner-only file: API keys).
         if let Some(dir) = eframe::storage_dir("TexCraft") {
             session.load_ai_config(dir.join("ai.json"));
+            // Conversations: per project, in TexCraft's data folder (never in the project);
+            // those of deleted projects are removed.
+            session.set_chat_store(dir.join("chats"));
         }
         // Move to Trash through AppKit (Finder's Put Back works).
         #[cfg(target_os = "macos")]
@@ -261,6 +264,8 @@ impl App {
         #[cfg(target_os = "macos")]
         let menu = {
             let wake_ctx = ctx.clone();
+            // ⌘A, ⌘C, ⌘V… in the Open and Save panels (the Edit menu talks to egui).
+            texcraft_macos::route_edit_keys_to_modal_panels();
             let m = menu::NativeMenu::install(move || wake_ctx.request_repaint());
             bench.handle_shortcuts = m.is_none();
             m
@@ -331,7 +336,6 @@ impl App {
                         .add_filter(tr("All files"), &["*"])
                         .pick_files()
                     {
-                        let typeset_first = self.session.pdf.path.is_none();
                         for p in paths {
                             if let Err(e) = self.session.open_path(&p) {
                                 self.bench.dialog = texcraft_ui::dialogs::Dialog::Alert {
@@ -340,7 +344,8 @@ impl App {
                                 };
                             }
                         }
-                        if typeset_first && self.session.pdf.path.is_none() {
+                        // No PDF for what was opened (another document's gave way): typeset it.
+                        if self.session.pdf.path.is_none() {
                             let _ = self.session.typeset();
                         }
                     }
@@ -976,17 +981,22 @@ impl eframe::App for App {
         self.handle_control(&ctx, frame);
         self.apply_language(&ctx);
 
-        // Closing with unsaved changes: ask first.
-        if ctx.input(|i| i.viewport().close_requested())
-            && let Some(i) = self
+        // Closing with unsaved changes: ask first. Then, in LIVE mode, typeset the projects
+        // edited since their last full typeset (the session closes the window when done).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Some(i) = self
                 .session
                 .docs
                 .iter()
                 .position(|d| d.is_dirty() && d.path.is_some())
-        {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.session.active = i;
-            self.bench.dialog = texcraft_ui::dialogs::Dialog::ConfirmClose(i);
+            {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.session.active = i;
+                self.bench.dialog =
+                    texcraft_ui::dialogs::Dialog::ConfirmClose { doc: i, quit: true };
+            } else if self.session.quit_requested() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            }
         }
 
         self.bench.ui(ui, &mut self.session);

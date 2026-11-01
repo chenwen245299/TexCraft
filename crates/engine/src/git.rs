@@ -2,8 +2,10 @@
 //! read and changed through `texcraft-git` on a background thread, one action at a time.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use texcraft_ai::commit as ai_commit;
 use texcraft_git::{ChangeKind, Job, Op, Snapshot};
 use texcraft_i18n::{tr, trf};
 
@@ -31,6 +33,8 @@ pub struct GitState {
     pub diff: Option<(String, String)>,
     /// Re-read when convenient (files were saved).
     pub stale: bool,
+    /// A commit message being written by the AI model.
+    drafting: Option<Drafting>,
     job: Option<Job>,
     /// Actions waiting for the running one.
     queue: Vec<Op>,
@@ -39,10 +43,24 @@ pub struct GitState {
     dir: Option<PathBuf>,
 }
 
+/// Writing a commit message with the AI model: reading the changes, then the answer.
+enum Drafting {
+    Reading,
+    Asking {
+        job: texcraft_ai::Job,
+        answer: String,
+    },
+}
+
 impl GitState {
     /// A git command is running (an automatic refresh included, which shows no progress).
     pub fn is_busy(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// The AI model is writing a commit message.
+    pub fn is_drafting(&self) -> bool {
+        self.drafting.is_some()
     }
 }
 
@@ -192,6 +210,88 @@ impl Session {
         self.git_run(Op::Commit { message, all })
     }
 
+    /// Has the Assistant's model write a commit message for what the commit would record (the
+    /// staged changes, else all of them) into the message box, replacing what is there.
+    pub fn git_generate_message(&mut self) -> Result<(), CommandError> {
+        if self.git.drafting.is_some() {
+            return Ok(());
+        }
+        let repo = self
+            .git
+            .repo
+            .as_ref()
+            .ok_or_else(|| CommandError::Failed(tr("not a Git repository").into()))?;
+        if repo.status.is_clean() {
+            return Err(CommandError::Failed(
+                tr("There are no changes to commit.").into(),
+            ));
+        }
+        let staged = !repo.status.staged.is_empty();
+        // Say now when no model is set up, not after reading the changes.
+        self.ai_target()?;
+        self.git_run(Op::Changes { staged })?;
+        self.git.error = None;
+        self.git.drafting = Some(Drafting::Reading);
+        Ok(())
+    }
+
+    /// The changes were read: ask the model.
+    fn ask_for_message(&mut self, changes: &str) {
+        self.git.drafting = None;
+        if changes.trim().is_empty() {
+            self.git.error = Some(tr("There are no changes to commit.").into());
+            return;
+        }
+        match self.ai_target() {
+            Ok((provider, model, api_key)) => {
+                let req = ai_commit::request(&provider, &model, api_key, changes);
+                self.git.drafting = Some(Drafting::Asking {
+                    job: texcraft_ai::start(&req, Arc::clone(&self.waker)),
+                    answer: String::new(),
+                });
+            }
+            Err(e) => self.git.error = Some(e.to_string()),
+        }
+    }
+
+    /// Collects the model's commit message. Returns when to look again.
+    pub(crate) fn tick_git_message(&mut self) -> Option<Duration> {
+        let Some(Drafting::Asking { job, .. }) = &self.git.drafting else {
+            return None;
+        };
+        let events: Vec<texcraft_ai::Event> = std::iter::from_fn(|| job.try_recv()).collect();
+        for e in events {
+            let Some(Drafting::Asking { answer, .. }) = &mut self.git.drafting else {
+                break;
+            };
+            match e {
+                texcraft_ai::Event::Text(t) => answer.push_str(&t),
+                texcraft_ai::Event::Thinking | texcraft_ai::Event::Fallback(_) => {}
+                texcraft_ai::Event::Done { .. } => {
+                    let message = ai_commit::clean(answer);
+                    self.git.drafting = None;
+                    if message.is_empty() {
+                        self.git.error = Some(tr("The model sent an empty answer.").into());
+                    } else {
+                        self.git.message = message;
+                    }
+                }
+                texcraft_ai::Event::Refused(_) => {
+                    self.git.drafting = None;
+                    self.git.error = Some(tr("The model declined this request.").into());
+                }
+                texcraft_ai::Event::Failed(msg) => {
+                    self.git.drafting = None;
+                    self.git.error = Some(msg);
+                }
+            }
+        }
+        self.git
+            .drafting
+            .is_some()
+            .then_some(Duration::from_millis(100))
+    }
+
     /// Shows the diff of `path` (`staged`: the index's).
     pub fn git_diff(&mut self, path: &str, staged: bool) -> Result<(), CommandError> {
         let rel = self.git_rel(path);
@@ -217,7 +317,13 @@ impl Session {
             self.git.read_at = Some(now);
             self.git.not_repo = outcome.snapshot.is_none();
             let committed = matches!(outcome.op, Op::Commit { .. });
+            let changes = matches!(outcome.op, Op::Changes { .. });
             match outcome.result {
+                Ok(Some(text)) if changes => self.ask_for_message(&text),
+                Err(e) if changes => {
+                    self.git.drafting = None;
+                    self.git.error = Some(e.0);
+                }
                 Ok(Some(text)) => {
                     if let Op::Diff { path, staged, .. } = &outcome.op {
                         let title = if *staged {
@@ -283,5 +389,142 @@ impl Session {
         self.git
             .read_at
             .map(|t| REFRESH_EVERY.saturating_sub(now.saturating_duration_since(t)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// A local OpenAI-compatible server that streams `answer` to one request and returns the
+    /// request it saw.
+    fn fake_model(answer: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let chunk = serde_json::json!({"choices": [{"delta": {"content": answer}}]});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8_lossy(&req).to_string()
+        });
+        (port, handle)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    fn settle(s: &mut Session) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while (s.git.busy.is_some() || s.git.is_busy() || s.git.is_drafting())
+            && Instant::now() < deadline
+        {
+            s.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The model writes the message from the changes (cleaned to plain sentences), replacing
+    /// what was typed; without a model or without changes it says why.
+    #[test]
+    fn the_model_writes_the_commit_message() {
+        if !texcraft_git::available() {
+            eprintln!("skipping: no git");
+            return;
+        }
+        let mut s = Session::new(Arc::new(|| {}));
+        s.settings.live_typeset = false;
+        s.update.url = "/nonexistent/texcraft-latest.json".into();
+        let dir = std::env::temp_dir().join(format!(
+            "texcraft-engine-git-message-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.name", "TexCraft Test"]);
+        git(&dir, &["config", "user.email", "test@example.invalid"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("main.tex"), "Old text.\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "First"]);
+        std::fs::write(dir.join("main.tex"), "New text.\n").unwrap();
+        s.set_project_dir(dir.clone());
+        s.run("view.git", &Value::Null).unwrap();
+        s.run("git.refresh", &Value::Null).unwrap();
+        settle(&mut s);
+
+        let e = s.run("git.generateMessage", &Value::Null).unwrap_err();
+        assert!(e.to_string().contains("Settings → AI"), "{e}");
+        assert!(!s.git.is_drafting());
+
+        let (port, server) = fake_model("```\nCommit message: \"Rewrite the introduction.\"\n```");
+        let ollama = texcraft_ai::PRESETS
+            .iter()
+            .find(|p| p.id == "ollama")
+            .unwrap();
+        let i = s.ai.config.add(ollama);
+        s.ai.config.providers[i].base_url = format!("http://127.0.0.1:{port}/v1");
+        s.ai.config.providers[i].models = vec!["m".into()];
+        s.ai.config.normalize();
+        s.git.message = "typed before".into();
+        s.run("git.generateMessage", &Value::Null).unwrap();
+        assert!(s.git.is_drafting());
+        settle(&mut s);
+        assert_eq!(
+            s.git.message, "Rewrite the introduction.",
+            "{:?}",
+            s.git.error
+        );
+        let req = server.join().unwrap();
+        assert!(
+            req.contains("+New text."),
+            "the diff went to the model: {req}"
+        );
+        assert!(req.contains("main.tex"), "{req}");
+
+        git(&dir, &["commit", "-q", "-a", "-m", "Second"]);
+        s.run("git.refresh", &Value::Null).unwrap();
+        settle(&mut s);
+        let e = s.run("git.generateMessage", &Value::Null).unwrap_err();
+        assert!(e.to_string().contains("no changes"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

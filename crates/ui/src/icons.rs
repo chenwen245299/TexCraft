@@ -1566,6 +1566,81 @@ pub fn sparkles(p: &Painter, r: Rect, c: Color32, filled: bool) {
     }
 }
 
+/// The AI Assistant in the toolbar, drawn from the app icon (assets/icon/texcraft.svg): its
+/// page, tilted by 6°, with the folded corner and the sum (Σ), and in front of the page's
+/// lower corner the key, whose backslash has become a sparkle. One ink, like the other
+/// toolbar glyphs; `bg` (the capsule) shows through the key's sparkle and around the key.
+pub fn ai_texcraft(p: &Painter, c: Pos2, fg: Color32, bg: Color32) {
+    let (sin, cos) = (-6.0_f32).to_radians().sin_cos();
+    let pc = c + vec2(-2.3, -1.5);
+    let at = |x: f32, y: f32| pc + vec2(x * cos - y * sin, x * sin + y * cos);
+    // The page: half width, half height, the fold.
+    let (w, h, f) = (6.0, 7.7, 3.2);
+    let ink = Stroke::new(1.3, fg);
+    p.add(Shape::closed_line(
+        vec![
+            at(-w, -h),
+            at(w - f, -h),
+            at(w, -h + f),
+            at(w, h),
+            at(-w, h),
+        ],
+        ink,
+    ));
+    p.add(Shape::line(
+        vec![at(w - f, -h), at(w - f, -h + f), at(w, -h + f)],
+        Stroke::new(1.1, fg),
+    ));
+    // The sum, up and left on the page as on the icon.
+    let (sx, sy) = (-1.7, -1.8);
+    p.add(Shape::line(
+        vec![
+            at(sx + 2.4, sy - 3.0),
+            at(sx - 2.4, sy - 3.0),
+            at(sx + 0.7, sy),
+            at(sx - 2.4, sy + 3.0),
+            at(sx + 2.4, sy + 3.0),
+        ],
+        Stroke::new(1.25, fg),
+    ));
+    // The key over the page's corner, the sparkle cut out of it.
+    let key = Rect::from_center_size(c + vec2(4.7, 4.9), vec2(9.2, 9.2));
+    p.rect_filled(key.expand(1.4), 2.8, bg);
+    p.rect_filled(key, 1.9, fg);
+    let k = key.center();
+    fill_star(p, k, &sparkle_outline(k, 3.7, 0.3), bg);
+}
+
+/// A clock with an arrow turning back (History).
+pub fn history(p: &Painter, r: Rect, c: Color32) {
+    let u = unit(r);
+    let w = s(c, 1.25 * u);
+    let center = g(r, 8.5, 8.0);
+    let rad = 6.0 * u;
+    // Most of a circle, open at the upper left where the arrow comes back.
+    let pts: Vec<Pos2> = (0..=28)
+        .map(|i| {
+            let a = (-150.0 + i as f32 * 10.0_f32).to_radians();
+            center + vec2(a.cos(), a.sin()) * rad
+        })
+        .collect();
+    let start = pts.first().copied().unwrap_or(center);
+    p.add(Shape::line(pts, w));
+    p.add(Shape::line(
+        vec![
+            start + vec2(-0.6 * u, -2.6 * u),
+            start,
+            start + vec2(2.4 * u, -0.4 * u),
+        ],
+        w,
+    ));
+    // The hands.
+    p.add(Shape::line(
+        vec![g(r, 8.5, 4.8), g(r, 8.5, 8.2), g(r, 10.8, 9.6)],
+        w,
+    ));
+}
+
 /// An arrow up in a filled circle (Send).
 pub fn send(p: &Painter, r: Rect, c: Color32, fg: Color32) {
     let u = unit(r);

@@ -362,16 +362,31 @@ pub struct Job {
     pub root: PathBuf,
     /// A live-preview pass.
     pub live: bool,
+    /// [`JobEvent::Finished`] was handed out.
+    finished: std::cell::Cell<bool>,
 }
 
 impl Job {
-    /// Next event, if any.
+    /// Next event, if any. A run whose thread ended without reporting (it panicked) finishes
+    /// with an error, so callers never wait for it forever.
     pub fn try_recv(&self) -> Option<JobEvent> {
-        match self.rx.try_recv() {
+        let event = match self.rx.try_recv() {
             Ok(e) => Some(e),
             Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) if !self.finished.get() => {
+                Some(JobEvent::Finished(Box::new(Outcome {
+                    error: Some(tr("the typesetting thread stopped unexpectedly").into()),
+                    live: self.live,
+                    duration: self.started.elapsed(),
+                    ..Outcome::default()
+                })))
+            }
             Err(TryRecvError::Disconnected) => None,
+        };
+        if matches!(event, Some(JobEvent::Finished(_))) {
+            self.finished.set(true);
         }
+        event
     }
 
     /// Stops the run (and the engine processes it started).
@@ -435,6 +450,7 @@ pub fn start(req: Request, tc: &Toolchain, wake: Arc<dyn Fn() + Send + Sync>) ->
         started: Instant::now(),
         root: req.root.clone(),
         live: false,
+        finished: std::cell::Cell::new(false),
     };
     let tc = tc.clone();
     let spawned = std::thread::Builder::new()
@@ -663,6 +679,7 @@ pub fn start_live(req: LiveRequest, tc: &Toolchain, wake: Arc<dyn Fn() + Send + 
         started: Instant::now(),
         root: req.project_dir.join(&req.root_rel),
         live: true,
+        finished: std::cell::Cell::new(false),
     };
     let tc = tc.clone();
     let spawned = std::thread::Builder::new()
@@ -985,6 +1002,29 @@ mod tests {
             bib_tool: BibTool::Auto,
             pretex: None,
         }
+    }
+
+    #[test]
+    fn a_job_whose_thread_died_finishes_once_with_an_error() {
+        let (tx, rx) = channel();
+        let job = Job {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pid: Arc::new(Mutex::new(None)),
+            started: Instant::now(),
+            root: "/proj/main.tex".into(),
+            live: true,
+            finished: std::cell::Cell::new(false),
+        };
+        tx.send(JobEvent::Output("line".into())).unwrap();
+        assert!(matches!(job.try_recv(), Some(JobEvent::Output(_))));
+        // The thread panics: its sender goes without a Finished event.
+        drop(tx);
+        let Some(JobEvent::Finished(o)) = job.try_recv() else {
+            panic!("a dead job finishes");
+        };
+        assert!(o.live && o.error.is_some() && !o.success);
+        assert!(job.try_recv().is_none(), "only once");
     }
 
     #[test]

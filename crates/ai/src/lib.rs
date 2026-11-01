@@ -8,6 +8,7 @@
 //! on the command line where other processes could read them. Answers stream back as
 //! server-sent events, parsed here into [`Event`]s on a background thread ([`Job`]).
 
+pub mod commit;
 pub mod inline;
 pub mod models;
 
@@ -556,16 +557,17 @@ fn save_failed(e: impl std::fmt::Display) -> AiError {
 }
 
 /// Who wrote a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Role {
     /// The person.
+    #[default]
     User,
     /// The model.
     Assistant,
 }
 
 /// One turn of the conversation as sent to a provider.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Turn {
     /// Who.
     pub role: Role,
@@ -576,6 +578,47 @@ pub struct Turn {
     pub blocks: Vec<Value>,
     /// Images attached to a user turn (for models with vision).
     pub images: Vec<Image>,
+    /// The tools an assistant turn called (the next turn answers them).
+    pub tool_calls: Vec<ToolCall>,
+    /// The answers to the previous turn's tool calls (a user turn).
+    pub tool_results: Vec<ToolResult>,
+    /// The reasoning an OpenAI-compatible model streamed before calling tools, sent back with
+    /// its calls (DeepSeek and Kimi refuse the follow-up without it).
+    pub reasoning: String,
+}
+
+/// A tool the model may call: its name, what it does, and its parameters as a JSON Schema
+/// object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tool {
+    /// The name the model calls it by.
+    pub name: String,
+    /// What it does (for the model).
+    pub description: String,
+    /// JSON Schema of its arguments.
+    pub parameters: Value,
+}
+
+/// A call the model made to a [`Tool`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCall {
+    /// The provider's id for the call (the result refers to it).
+    pub id: String,
+    /// The tool.
+    pub name: String,
+    /// The arguments, as JSON text.
+    pub arguments: String,
+}
+
+/// What a [`ToolCall`] returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    /// The call's id.
+    pub id: String,
+    /// The tool.
+    pub name: String,
+    /// The answer (text for the model).
+    pub content: String,
 }
 
 /// An image attached to a question.
@@ -599,6 +642,20 @@ impl Image {
     pub fn base64(&self) -> String {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(&self.data[..])
+    }
+
+    /// An image from [`Image::base64`]'s text (saved conversations); `None` if it is not
+    /// base64.
+    pub fn from_base64(name: &str, media_type: &str, data: &str) -> Option<Self> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .ok()?;
+        Some(Self {
+            media_type: media_type.to_string(),
+            data: bytes.into(),
+            name: name.to_string(),
+        })
     }
 }
 
@@ -638,6 +695,8 @@ pub struct ChatRequest {
     /// (inline suggestions: a thinking model spends their small budget thinking and writes
     /// nothing).
     pub no_reasoning: bool,
+    /// Tools the model may call (none: it just answers).
+    pub tools: Vec<Tool>,
 }
 
 /// Models that accept Anthropic's server-side refusal fallback (`fallbacks: "default"`).
@@ -696,9 +755,32 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
                         }
                         json!({ "role": "user", "content": content })
                     }
+                    Role::User if !t.tool_results.is_empty() => {
+                        let content: Vec<Value> = t
+                            .tool_results
+                            .iter()
+                            .map(|r| {
+                                json!({"type": "tool_result", "tool_use_id": r.id,
+                                    "content": r.content})
+                            })
+                            .collect();
+                        json!({ "role": "user", "content": content })
+                    }
                     Role::User => json!({ "role": "user", "content": t.text }),
                     Role::Assistant if !t.blocks.is_empty() => {
                         json!({ "role": "assistant", "content": echo_blocks(&t.blocks) })
+                    }
+                    Role::Assistant if !t.tool_calls.is_empty() => {
+                        let mut content = Vec::new();
+                        if !t.text.trim().is_empty() {
+                            content.push(json!({ "type": "text", "text": t.text }));
+                        }
+                        content.extend(t.tool_calls.iter().map(|c| {
+                            let input: Value =
+                                serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({}));
+                            json!({"type": "tool_use", "id": c.id, "name": c.name, "input": input})
+                        }));
+                        json!({ "role": "assistant", "content": content })
                     }
                     Role::Assistant => json!({ "role": "assistant", "content": t.text }),
                 })
@@ -710,6 +792,16 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
                 "system": req.system,
                 "messages": messages,
             });
+            if !req.tools.is_empty() {
+                body["tools"] = req
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        json!({"name": t.name, "description": t.description,
+                            "input_schema": t.parameters})
+                    })
+                    .collect();
+            }
             let mut headers = vec![
                 format!("x-api-key: {}", req.api_key.trim()),
                 "anthropic-version: 2023-06-01".to_string(),
@@ -727,13 +819,41 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
         }
         Kind::OpenAi => {
             let mut messages = vec![json!({ "role": "system", "content": req.system })];
-            messages.extend(req.turns.iter().map(|t| {
+            messages.extend(req.turns.iter().flat_map(|t| {
                 let role = if t.role == Role::User {
                     "user"
                 } else {
                     "assistant"
                 };
-                if t.role == Role::User && !t.images.is_empty() {
+                if t.role == Role::User && !t.tool_results.is_empty() {
+                    // One message per result.
+                    t.tool_results
+                        .iter()
+                        .map(
+                            |r| json!({"role": "tool", "tool_call_id": r.id, "content": r.content}),
+                        )
+                        .collect()
+                } else if t.role == Role::Assistant && !t.tool_calls.is_empty() {
+                    let calls: Vec<Value> = t
+                        .tool_calls
+                        .iter()
+                        .map(|c| {
+                            json!({"id": c.id, "type": "function",
+                                "function": {"name": c.name, "arguments": c.arguments}})
+                        })
+                        .collect();
+                    let content = if t.text.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(t.text)
+                    };
+                    let mut m =
+                        json!({"role": "assistant", "content": content, "tool_calls": calls});
+                    if !t.reasoning.is_empty() {
+                        m["reasoning_content"] = json!(t.reasoning);
+                    }
+                    vec![m]
+                } else if t.role == Role::User && !t.images.is_empty() {
                     // Text and images as content parts; the images as data URLs.
                     let mut content = Vec::new();
                     if !t.text.trim().is_empty() {
@@ -742,9 +862,9 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
                     content.extend(t.images.iter().map(
                         |i| json!({ "type": "image_url", "image_url": { "url": i.data_url() } }),
                     ));
-                    json!({ "role": role, "content": content })
+                    vec![json!({ "role": role, "content": content })]
                 } else {
-                    json!({ "role": role, "content": t.text })
+                    vec![json!({ "role": role, "content": t.text })]
                 }
             }));
             let mut headers = vec!["content-type: application/json".to_string()];
@@ -753,6 +873,16 @@ pub fn build(req: &ChatRequest) -> (String, Vec<String>, Value) {
                 headers.push(format!("authorization: Bearer {key}"));
             }
             let mut body = json!({ "model": req.model, "stream": true, "messages": messages });
+            if !req.tools.is_empty() {
+                body["tools"] = req
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        json!({"type": "function", "function": {"name": t.name,
+                            "description": t.description, "parameters": t.parameters}})
+                    })
+                    .collect();
+            }
             if let Some(n) = req.max_tokens {
                 // OpenAI's own API takes the newer name (its reasoning models refuse the old).
                 let field = if base.contains("api.openai.com") {
@@ -806,6 +936,11 @@ pub enum Event {
         blocks: Vec<Value>,
         /// The model that answered.
         model: Option<String>,
+        /// The tools the model called (answer them and ask again).
+        tool_calls: Vec<ToolCall>,
+        /// An OpenAI-compatible model's streamed reasoning (`reasoning_content`), to send
+        /// back with its tool calls.
+        reasoning: String,
     },
     /// The model declined; any partial answer must be discarded.
     Refused(Option<String>),
@@ -824,6 +959,12 @@ pub struct SseParser {
     /// Lines that were not events (an error body).
     other: String,
     done: bool,
+    /// OpenAI-style tool calls, assembled from their fragments.
+    calls: Vec<ToolCall>,
+    /// OpenAI-style `reasoning_content`.
+    reasoning: String,
+    /// The JSON input of the Anthropic tool-use block being streamed.
+    partial: String,
 }
 
 impl SseParser {
@@ -924,6 +1065,14 @@ impl SseParser {
                         append(block, "thinking", t);
                         Vec::new()
                     }
+                    "input_json_delta" => {
+                        let j = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        self.partial.push_str(j);
+                        Vec::new()
+                    }
                     "signature_delta" => {
                         if let (Some(sig), Some(o)) = (
                             delta.get("signature").and_then(Value::as_str),
@@ -935,6 +1084,20 @@ impl SseParser {
                     }
                     _ => Vec::new(),
                 }
+            }
+            "content_block_stop" => {
+                // A tool-use block's input arrives as JSON fragments.
+                let partial = std::mem::take(&mut self.partial);
+                if let Some(block) = self.blocks.last_mut()
+                    && block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && !partial.trim().is_empty()
+                {
+                    let input: Value = serde_json::from_str(&partial).unwrap_or_else(|_| json!({}));
+                    if let Some(o) = block.as_object_mut() {
+                        o.insert("input".into(), input);
+                    }
+                }
+                Vec::new()
             }
             "message_delta" => {
                 if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
@@ -983,6 +1146,45 @@ impl SseParser {
             } else if reasoning_delta(choice) {
                 out.push(Event::Thinking);
             }
+            if let Some(r) = choice
+                .pointer("/delta/reasoning_content")
+                .and_then(Value::as_str)
+            {
+                self.reasoning.push_str(r);
+            }
+            for (k, c) in choice
+                .pointer("/delta/tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let i = c
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .unwrap_or(k)
+                    .min(64);
+                while self.calls.len() <= i {
+                    self.calls.push(ToolCall::default());
+                }
+                let Some(call) = self.calls.get_mut(i) else {
+                    continue;
+                };
+                if let Some(id) = c.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    call.id = id.to_string();
+                }
+                if let Some(name) = c.pointer("/function/name").and_then(Value::as_str)
+                    && call.name.is_empty()
+                {
+                    call.name = name.to_string();
+                }
+                if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str) {
+                    call.arguments.push_str(a);
+                }
+            }
             if let Some(r) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.stop_reason = Some(r.to_string());
             }
@@ -998,9 +1200,42 @@ impl SseParser {
         if !status_ok || (!self.done && self.blocks.is_empty() && self.stop_reason.is_none()) {
             return Event::Failed(error_message(&self.other));
         }
+        let tool_calls = match self.kind {
+            Kind::OpenAi => std::mem::take(&mut self.calls)
+                .into_iter()
+                .enumerate()
+                .filter(|(_, c)| !c.name.is_empty())
+                .map(|(i, mut c)| {
+                    if c.id.is_empty() {
+                        c.id = format!("call_{i}");
+                    }
+                    c
+                })
+                .collect(),
+            Kind::Anthropic => self
+                .blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .map(|b| ToolCall {
+                    id: b
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: b
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    arguments: b.get("input").map_or_else(|| "{}".into(), Value::to_string),
+                })
+                .collect(),
+        };
         Event::Done {
             blocks: std::mem::take(&mut self.blocks),
             model: self.model.clone(),
+            tool_calls,
+            reasoning: std::mem::take(&mut self.reasoning),
         }
     }
 }
@@ -1383,22 +1618,26 @@ mod tests {
                     text: "Hi".into(),
                     blocks: vec![],
                     images: Vec::new(),
+                    ..Default::default()
                 },
                 Turn {
                     role: Role::Assistant,
                     text: "Hello".into(),
                     blocks: vec![thinking.clone(), json!({"type": "text", "text": "Hello"})],
                     images: Vec::new(),
+                    ..Default::default()
                 },
                 Turn {
                     role: Role::User,
                     text: "Table?".into(),
                     blocks: vec![],
                     images: Vec::new(),
+                    ..Default::default()
                 },
             ],
             max_tokens: None,
             no_reasoning: false,
+            tools: Vec::new(),
         };
         let (url, headers, body) = build(&req);
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
@@ -1443,9 +1682,11 @@ mod tests {
                 text: "Q".into(),
                 blocks: vec![],
                 images: Vec::new(),
+                ..Default::default()
             }],
             max_tokens: None,
             no_reasoning: false,
+            tools: Vec::new(),
         };
         let (url, headers, body) = build(&req);
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
@@ -1513,6 +1754,7 @@ mod tests {
             turns: vec![],
             max_tokens: None,
             no_reasoning: false,
+            tools: Vec::new(),
         };
         assert_eq!(build(&req).2["reasoning_split"], true);
         req.provider = provider(Kind::OpenAi, "https://api.deepseek.com/v1");
@@ -1565,6 +1807,7 @@ mod tests {
             text: "What does this plot show?".into(),
             blocks: vec![],
             images,
+            ..Default::default()
         };
         let req = |kind, base: &str| ChatRequest {
             provider: provider(kind, base),
@@ -1574,6 +1817,7 @@ mod tests {
             turns: vec![turn(vec![]), turn(vec![png.clone()])],
             max_tokens: None,
             no_reasoning: false,
+            tools: Vec::new(),
         };
         let (_, _, body) = build(&req(Kind::OpenAi, "https://api.openai.com/v1"));
         assert_eq!(body["messages"][1]["content"], "What does this plot show?");
@@ -1749,7 +1993,7 @@ mod tests {
         assert_eq!(text, "Use \\begin{table}");
         assert!(thinking);
         match p.finish(true) {
-            Event::Done { blocks, model } => {
+            Event::Done { blocks, model, .. } => {
                 assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
                 assert_eq!(blocks[0]["signature"], "abc");
                 assert_eq!(blocks[1]["text"], "Use \\begin{table}");
@@ -1893,9 +2137,11 @@ mod tests {
                 text: "Q".into(),
                 blocks: vec![],
                 images: Vec::new(),
+                ..Default::default()
             }],
             max_tokens: None,
             no_reasoning: false,
+            tools: Vec::new(),
         };
         let job = start(&req, Arc::new(|| {}));
         let mut text = String::new();
@@ -1913,5 +2159,149 @@ mod tests {
         let seen = server.join().unwrap();
         assert!(seen.starts_with("POST /v1/chat/completions"), "{seen}");
         assert!(seen.contains("Bearer sk-test"), "{seen}");
+    }
+
+    /// Tools go out in each API's shape, with the calls and their answers.
+    #[test]
+    fn tool_calls_and_results_in_both_apis() {
+        let tool = Tool {
+            name: "read_file".into(),
+            description: "Read".into(),
+            parameters: json!({"type": "object"}),
+        };
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.tex"}"#.into(),
+        };
+        let turns = vec![
+            Turn {
+                role: Role::User,
+                text: "What is in a.tex?".into(),
+                ..Default::default()
+            },
+            Turn {
+                role: Role::Assistant,
+                tool_calls: vec![call],
+                reasoning: "Look first.".into(),
+                ..Default::default()
+            },
+            Turn {
+                role: Role::User,
+                tool_results: vec![ToolResult {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    content: "1  Hello".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let req = |kind| ChatRequest {
+            provider: Provider {
+                kind,
+                base_url: "http://127.0.0.1:1".into(),
+                ..Default::default()
+            },
+            model: "m".into(),
+            system: "s".into(),
+            api_key: String::new(),
+            turns: turns.clone(),
+            max_tokens: None,
+            no_reasoning: false,
+            tools: vec![tool.clone()],
+        };
+        let (_, _, body) = build(&req(Kind::OpenAi));
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "system, question, calls, one result");
+        assert_eq!(
+            msgs[2]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"a.tex"}"#
+        );
+        assert_eq!(msgs[2]["content"], Value::Null);
+        assert_eq!(msgs[2]["reasoning_content"], "Look first.");
+        assert_eq!(
+            msgs[3],
+            json!({"role": "tool", "tool_call_id": "c1", "content": "1  Hello"})
+        );
+        let (_, _, body) = build(&req(Kind::Anthropic));
+        assert_eq!(body["tools"][0]["input_schema"], json!({"type": "object"}));
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[1]["content"][0],
+            json!({"type": "tool_use", "id": "c1", "name": "read_file", "input": {"path": "a.tex"}})
+        );
+        assert_eq!(
+            msgs[2]["content"][0],
+            json!({"type": "tool_result", "tool_use_id": "c1", "content": "1  Hello"})
+        );
+        // No tools: no field (inline suggestions, commit messages).
+        let mut plain = req(Kind::OpenAi);
+        plain.tools.clear();
+        assert!(build(&plain).2.get("tools").is_none());
+    }
+
+    /// Streamed tool calls are put together from their fragments (both APIs).
+    #[test]
+    fn streamed_tool_calls_are_assembled() {
+        let mut p = SseParser::new(Kind::OpenAi);
+        for l in [
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Need the file."}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.tex\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            p.line(l);
+        }
+        match p.finish(true) {
+            Event::Done {
+                tool_calls,
+                reasoning,
+                ..
+            } => {
+                assert_eq!(
+                    tool_calls,
+                    vec![ToolCall {
+                        id: "call_9".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"a.tex"}"#.into(),
+                    }]
+                );
+                assert_eq!(reasoning, "Need the file.");
+            }
+            e => panic!("{e:?}"),
+        }
+        let mut p = SseParser::new(Kind::Anthropic);
+        for l in [
+            r#"data: {"type":"message_start","message":{"model":"claude"}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"list_files","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"sec"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"tions\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ] {
+            p.line(l);
+        }
+        match p.finish(true) {
+            Event::Done {
+                tool_calls, blocks, ..
+            } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "toolu_1");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&tool_calls[0].arguments).unwrap(),
+                    json!({"path": "sections"})
+                );
+                assert_eq!(
+                    blocks[0]["input"],
+                    json!({"path": "sections"}),
+                    "sent back as received"
+                );
+            }
+            e => panic!("{e:?}"),
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! and the English frames must show no Chinese.
 
 use egui::{Context, FullOutput, Pos2, RawInput, Rect, Shape, vec2};
-use texcraft_engine::{LanguageChoice, Session, SidebarTab, UpdateStatus};
+use texcraft_engine::{LanguageChoice, QuitTypeset, Session, SidebarTab, UpdateStatus};
 use texcraft_i18n::{Lang, scoped, tr_in};
 use texcraft_ui::Workbench;
 use texcraft_ui::dialogs::Dialog;
@@ -81,6 +81,10 @@ impl Rig {
             seen.push((format!("sidebar {tab:?}"), self.frames()));
         }
         self.session.view.sidebar_tab = SidebarTab::Contents;
+        // The AI Assistant panel on the right.
+        self.session.view.assistant = true;
+        seen.push(("AI Assistant".to_string(), self.frames()));
+        self.session.view.assistant = false;
         // Settings, drawn inside the main window (as `ui.prefs {inline: true}` does).
         self.bench.prefs.open = true;
         self.bench.prefs.inline = true;
@@ -118,7 +122,7 @@ impl Rig {
             Dialog::About,
             Dialog::Shortcuts,
             Dialog::GotoLine(String::new()),
-            Dialog::ConfirmClose(0),
+            Dialog::ConfirmClose { doc: 0, quit: true },
             Dialog::Alert {
                 title: "Alert".into(),
                 message: "Message".into(),
@@ -128,6 +132,14 @@ impl Rig {
             self.bench.dialog = dialog;
             seen.push((name, self.frames()));
         }
+        self.bench.dialog = Dialog::None;
+        // Typesetting before quitting (a queued run keeps the sheet up for these frames).
+        self.session.typeset.root = Some("main.tex".into());
+        self.session.typeset.queued = true;
+        self.session.typeset.quit = QuitTypeset::Running(Vec::new());
+        seen.push(("typesetting before quitting".to_string(), self.frames()));
+        self.session.typeset.quit = QuitTypeset::Idle;
+        self.session.typeset.queued = false;
         seen
     }
 }

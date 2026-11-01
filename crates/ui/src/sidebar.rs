@@ -55,8 +55,6 @@ pub struct SidebarState {
     renaming: Option<(PathBuf, String, bool)>,
     /// The Source Control tab.
     pub git: crate::git_panel::GitPanelState,
-    /// The AI Assistant tab.
-    pub ai: crate::ai_panel::AiPanelState,
 }
 
 impl SidebarState {
@@ -129,7 +127,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
         };
         let ir = Rect::from_center_size(c, vec2(16.0, 16.0));
         match tab {
-            SidebarTab::Contents => icons::viewfinder_doc(&p, ir, col),
+            SidebarTab::Contents | SidebarTab::Assistant => icons::viewfinder_doc(&p, ir, col),
             SidebarTab::Todos => icons::checkbox_checked(&p, ir, col),
             SidebarTab::Git => {
                 icons::git_branch(&p, ir, col);
@@ -154,7 +152,6 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
                     p.galley(b.center() - g.size() / 2.0, g, Color32::WHITE);
                 }
             }
-            SidebarTab::Assistant => icons::sparkles(&p, ir.expand(0.5), col, true),
             SidebarTab::Files => icons::folder_thin(&p, ir, col),
             SidebarTab::Results => {
                 icons::warning(&p, ir, col, false);
@@ -195,10 +192,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
         .unwrap_or_default()
         .to_lowercase();
     match tab {
-        SidebarTab::Contents => contents(&mut child, t, session, st, &filter),
+        // (An older setting's Assistant tab shows Contents until `View::normalize` runs.)
+        SidebarTab::Contents | SidebarTab::Assistant => {
+            contents(&mut child, t, session, st, &filter);
+        }
         SidebarTab::Todos => todos(&mut child, t, session, &filter),
         SidebarTab::Git => crate::git_panel::show(&mut child, t, session, &mut st.git),
-        SidebarTab::Assistant => crate::ai_panel::show(&mut child, t, session, &mut st.ai),
         SidebarTab::Files => files(&mut child, t, session, st, &filter),
         SidebarTab::Results => results(&mut child, t, session),
         SidebarTab::Search => search(&mut child, t, session, st),

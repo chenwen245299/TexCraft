@@ -11,7 +11,8 @@ use egui::{
 };
 use texcraft_ai::Role;
 use texcraft_engine::Session;
-use texcraft_i18n::tr;
+use texcraft_engine::ai_tools::{ToolKind, ToolUse};
+use texcraft_i18n::{tr, trf};
 
 use crate::menu::{self, ButtonKind};
 use crate::theme::{Tokens, editor_font, semibold};
@@ -280,6 +281,98 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
     composer_box(ui, t, session, st, composer);
 }
 
+/// The project's saved conversations: a click opens one, × deletes it.
+fn history_button(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelState, r: Rect) {
+    let resp = ui
+        .interact(r, Id::new("ai-history"), Sense::click())
+        .on_hover_text(tr("Conversation History"));
+    if resp.hovered() {
+        ui.painter().rect_filled(r, 5.0, t.row_hover);
+    }
+    icons::history(ui.painter(), r.shrink(3.5), t.sidebar_icon);
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            menu::begin(ui, 280.0);
+            menu::heading(ui, t, tr("Conversations in This Project"));
+            let history = session.ai.history.clone();
+            if history.is_empty() {
+                let (row, _) = ui.allocate_exact_size(vec2(280.0, 30.0), Sense::hover());
+                ui.painter().text(
+                    pos2(row.left() + 12.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    tr("No saved conversations yet"),
+                    FontId::proportional(12.0),
+                    t.text_weak,
+                );
+                return;
+            }
+            let mut open = None;
+            let mut delete = None;
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for c in &history {
+                        let w = menu::row_width(ui, 280.0);
+                        let (row, resp) = ui.allocate_exact_size(vec2(w, 36.0), Sense::click());
+                        let current = session.ai.chat_id.as_deref() == Some(c.id.as_str());
+                        let p = ui.painter();
+                        if resp.hovered() || current {
+                            p.rect_filled(row.shrink2(vec2(4.0, 1.0)), 5.0, t.row_hover);
+                        }
+                        let x = Rect::from_center_size(
+                            pos2(row.right() - 18.0, row.center().y),
+                            vec2(18.0, 18.0),
+                        );
+                        let f = FontId::proportional(12.0);
+                        let title = if c.title.is_empty() {
+                            tr("Untitled conversation").to_string()
+                        } else {
+                            c.title.clone()
+                        };
+                        let shown = widgets::elide(p, &title, &f, row.width() - 52.0);
+                        p.text(
+                            pos2(row.left() + 12.0, row.top() + 12.0),
+                            Align2::LEFT_CENTER,
+                            shown,
+                            f,
+                            t.text,
+                        );
+                        p.text(
+                            pos2(row.left() + 12.0, row.top() + 26.0),
+                            Align2::LEFT_CENTER,
+                            crate::git_panel::ago(i64::try_from(c.updated).unwrap_or(0)),
+                            FontId::proportional(10.0),
+                            t.text_weak,
+                        );
+                        let del = ui
+                            .interact(x, Id::new(("ai-history-del", &c.id)), Sense::click())
+                            .on_hover_text(tr("Delete Conversation"));
+                        if resp.hovered() || del.hovered() {
+                            if del.hovered() {
+                                ui.painter().rect_filled(x, 4.0, t.row_hover);
+                            }
+                            icons::close(ui.painter(), x.shrink(4.0), t.text_weak);
+                        }
+                        if del.clicked() {
+                            delete = Some(c.id.clone());
+                        } else if resp.clicked() {
+                            open = Some(c.id.clone());
+                        }
+                    }
+                });
+            if let Some(id) = delete {
+                let _ = session.run("ai.deleteChat", &serde_json::json!({ "id": id }));
+            }
+            if let Some(id) = open {
+                if let Err(e) = session.run("ai.openChat", &serde_json::json!({ "id": id })) {
+                    st.error = Some(e.to_string());
+                }
+                ui.close();
+            }
+        });
+}
+
 fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelState, r: Rect) {
     let p = ui.painter().clone();
     p.line_segment(
@@ -296,7 +389,9 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
         Some(key) => crate::ai_logos::paint(ui, key, logo_r, t.sidebar_text),
         None => icons::sparkles(&p, logo_r.shrink(0.5), t.accent, true),
     }
-    // Right: new conversation, settings.
+    // Right: history, new conversation, settings.
+    let hist_r = Rect::from_center_size(pos2(r.right() - 70.0, r.center().y), vec2(22.0, 22.0));
+    history_button(ui, t, session, st, hist_r);
     let new_r = Rect::from_center_size(pos2(r.right() - 44.0, r.center().y), vec2(22.0, 22.0));
     let set_r = Rect::from_center_size(pos2(r.right() - 18.0, r.center().y), vec2(22.0, 22.0));
     for (rect, id, tip) in [
@@ -321,7 +416,7 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
         }
     }
     icons::plus(&p, new_r.shrink(4.5), t.sidebar_icon);
-    icons::gear_solid(&p, set_r.shrink(4.0), t.gear, t.sidebar_bg);
+    icons::gear_solid(&p, set_r.shrink(4.0), t.gear, t.assistant_bg);
 
     // The model menu.
     let label = session
@@ -329,7 +424,7 @@ fn header_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelSt
         .map_or_else(|| tr("No model").to_string(), |m| m.label().to_string());
     let menu_r = Rect::from_min_max(
         pos2(r.left() + 28.0, r.center().y - 11.0),
-        pos2(new_r.left() - 6.0, r.center().y + 11.0),
+        pos2(hist_r.left() - 6.0, r.center().y + 11.0),
     );
     let resp = ui
         .interact(menu_r, Id::new("ai-model"), Sense::click())
@@ -546,8 +641,159 @@ fn segments(text: &str) -> Vec<Segment> {
     out
 }
 
-/// `text` with **bold** and `code` spans.
-fn inline(ui: &Ui, t: &Tokens, text: &str, font: FontId, width: f32) -> Arc<Galley> {
+/// A piece of a paragraph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Span {
+    Plain(String),
+    Bold(String),
+    Code(String),
+    /// A Markdown link `[label](target)`.
+    Link {
+        label: String,
+        target: String,
+    },
+}
+
+/// `text`'s **bold**, `code` and `[label](target)` spans (unclosed markers stay text).
+fn spans(text: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let pos = [rest.find("**"), rest.find('`'), rest.find('[')]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(pos) = pos else {
+            out.push(Span::Plain(rest.to_string()));
+            break;
+        };
+        if pos > 0 {
+            out.push(Span::Plain(rest.get(..pos).unwrap_or("").to_string()));
+        }
+        let at = rest.get(pos..).unwrap_or("");
+        let (span, used) = if let Some(after) = at.strip_prefix("**") {
+            match after.find("**") {
+                Some(end) => (
+                    Span::Bold(after.get(..end).unwrap_or("").to_string()),
+                    end + 4,
+                ),
+                None => (Span::Plain("**".into()), 2),
+            }
+        } else if let Some(after) = at.strip_prefix('`') {
+            match after.find('`') {
+                Some(end) => (
+                    Span::Code(after.get(..end).unwrap_or("").to_string()),
+                    end + 2,
+                ),
+                None => (Span::Plain("`".into()), 1),
+            }
+        } else {
+            // `[label](target)`, on one line, both non-empty.
+            let link = at.find("](").and_then(|mid| {
+                let label = at.get(1..mid)?;
+                let after = at.get(mid + 2..)?;
+                let end = after.find(')')?;
+                let target = after.get(..end)?;
+                (!label.is_empty()
+                    && !label.contains(['\n', '['])
+                    && !target.trim().is_empty()
+                    && !target.contains('\n'))
+                .then(|| {
+                    (
+                        Span::Link {
+                            label: label.to_string(),
+                            target: target.trim().to_string(),
+                        },
+                        mid + 2 + end + 1,
+                    )
+                })
+            });
+            link.unwrap_or_else(|| (Span::Plain("[".into()), 1))
+        };
+        out.push(span);
+        rest = at.get(used..).unwrap_or("");
+    }
+    out
+}
+
+/// A link in a laid-out paragraph: its characters and where it goes.
+struct Link {
+    chars: std::ops::Range<usize>,
+    target: String,
+}
+
+/// A link target: its path and line (`sections/intro.tex#L42`, `main.tex:42`, `<a b.tex>`).
+fn split_target(target: &str) -> (String, Option<u32>) {
+    let t = target
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .replace("%20", " ");
+    let t = t.strip_prefix("./").unwrap_or(&t).to_string();
+    if let Some((path, frag)) = t.split_once('#') {
+        let line = frag
+            .trim_start_matches('L')
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok());
+        return (path.to_string(), line);
+    }
+    if let Some((path, n)) = t.rsplit_once(':')
+        && let Ok(line) = n.parse()
+    {
+        return (path.to_string(), Some(line));
+    }
+    (t, None)
+}
+
+/// Whether `code` (an inline code span) looks like a file path worth checking for.
+fn path_like(code: &str) -> bool {
+    code.len() < 200
+        && !code.contains(char::is_whitespace)
+        && !code.starts_with('\\')
+        && std::path::Path::new(code)
+            .extension()
+            .is_some_and(|e| e.len() <= 5 && e.to_string_lossy().chars().all(char::is_alphanumeric))
+}
+
+/// Opens link `target`: a file of the project in the editor (at its line), or a web page.
+fn open_link(ctx: &egui::Context, session: &mut Session, target: &str) {
+    if target.starts_with("https://") || target.starts_with("http://") {
+        ctx.open_url(egui::OpenUrl::new_tab(target));
+        return;
+    }
+    let (path, line) = split_target(target);
+    let Some(root) = session.git_dir().and_then(|r| r.canonicalize().ok()) else {
+        return;
+    };
+    let Some(file) = root
+        .join(&path)
+        .canonicalize()
+        .ok()
+        .filter(|f| f.starts_with(&root) && f.is_file())
+    else {
+        session.set_status(trf!("{file} is not in the project", file = path));
+        return;
+    };
+    let result = match line {
+        Some(line) => session.jump(&file, line.max(1)),
+        None => session.open_path(&file).map(|_| ()),
+    };
+    if let Err(e) = result {
+        session.set_status(e.to_string());
+    }
+}
+
+/// `text` with **bold**, `code` and link spans; returns the galley and its links. Code that
+/// names a file of the project (`is_file`) links to it too.
+fn inline(
+    ui: &Ui,
+    t: &Tokens,
+    text: &str,
+    font: FontId,
+    width: f32,
+    is_file: &dyn Fn(&str) -> bool,
+) -> (Arc<Galley>, Vec<Link>) {
     let mut job = LayoutJob::default();
     let size = font.size;
     let plain = TextFormat {
@@ -566,35 +812,42 @@ fn inline(ui: &Ui, t: &Tokens, text: &str, font: FontId, width: f32) -> Arc<Gall
         background: t.row_hover,
         ..plain.clone()
     };
-    let mut rest = text;
-    while !rest.is_empty() {
-        let b = rest.find("**");
-        let c = rest.find('`');
-        let (pos, marker) = match (b, c) {
-            (Some(b), Some(c)) if c < b => (c, "`"),
-            (Some(b), _) => (b, "**"),
-            (None, Some(c)) => (c, "`"),
-            (None, None) => (rest.len(), ""),
+    let underline = Stroke::new(1.0, t.accent.gamma_multiply(0.6));
+    let link = TextFormat {
+        color: t.accent,
+        underline,
+        ..plain.clone()
+    };
+    let code_link = TextFormat {
+        color: t.accent,
+        underline,
+        ..code.clone()
+    };
+    let mut links = Vec::new();
+    let mut chars = 0usize;
+    for span in spans(text) {
+        let (s, fmt, target) = match span {
+            Span::Plain(s) => (s, &plain, None),
+            Span::Bold(s) => (s, &bold, None),
+            Span::Code(s) if path_like(&s) && is_file(&s) => {
+                let target = s.clone();
+                (s, &code_link, Some(target))
+            }
+            Span::Code(s) => (s, &code, None),
+            Span::Link { label, target } => (label, &link, Some(target)),
         };
-        job.append(rest.get(..pos).unwrap_or(""), 0.0, plain.clone());
-        if marker.is_empty() {
-            break;
+        let n = s.chars().count();
+        if let Some(target) = target {
+            links.push(Link {
+                chars: chars..chars + n,
+                target,
+            });
         }
-        let after = rest.get(pos + marker.len()..).unwrap_or("");
-        match after.find(marker) {
-            Some(end) => {
-                let fmt = if marker == "`" { &code } else { &bold };
-                job.append(after.get(..end).unwrap_or(""), 0.0, fmt.clone());
-                rest = after.get(end + marker.len()..).unwrap_or("");
-            }
-            None => {
-                job.append(marker, 0.0, plain.clone());
-                rest = after;
-            }
-        }
+        job.append(&s, 0.0, fmt.clone());
+        chars += n;
     }
     job.wrap.max_width = width;
-    ui.fonts_mut(|f| f.layout_job(job))
+    (ui.fonts_mut(|f| f.layout_job(job)), links)
 }
 
 /// A small icon-and-label button; returns whether it was clicked.
@@ -625,6 +878,79 @@ fn chip(
     resp.clicked()
 }
 
+/// The row of tool use `k` of answer `index`.
+fn tool_row_id(index: usize, k: usize) -> Id {
+    Id::new(("ai-tool", index, k))
+}
+
+/// One file the model looked at (above its answer).
+fn tool_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    session: &mut Session,
+    id: Id,
+    used: &ToolUse,
+    x: f32,
+    text_w: f32,
+) {
+    let w = ui.available_width();
+    let label = match used.kind {
+        ToolKind::Read => match used.lines {
+            Some((first, last)) => trf!(
+                "Read {file}, lines {first}–{last}",
+                file = used.target,
+                first = first,
+                last = last
+            ),
+            None => trf!("Read {file}", file = used.target),
+        },
+        ToolKind::List if used.target.is_empty() => tr("Listed the project's files").into(),
+        ToolKind::List => trf!("Listed {folder}", folder = used.target),
+        ToolKind::Search => trf!("Searched for “{text}”", text = used.target),
+    };
+    let opens = used.kind == ToolKind::Read && !used.failed;
+    let sense = if opens {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (r, _) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
+    let resp = ui.interact(r, id, sense);
+    let color = if used.failed {
+        t.error
+    } else if opens && resp.hovered() {
+        t.accent
+    } else {
+        t.text_weak
+    };
+    let icon = Rect::from_center_size(pos2(r.left() + x + 5.5, r.center().y), vec2(11.0, 11.0));
+    let p = ui.painter();
+    match used.kind {
+        ToolKind::Read => icons::document_pt(p, icon, color, ""),
+        ToolKind::List => icons::folder_pt(p, icon, color),
+        ToolKind::Search => icons::magnifier(p, icon, color, None),
+    }
+    let f = FontId::proportional(10.5);
+    let text = widgets::elide(p, &label, &f, (text_w - 16.0).max(0.0));
+    p.text(
+        pos2(icon.right() + 5.0, r.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        f,
+        color,
+    );
+    if opens {
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            let target = match used.lines {
+                Some((first, _)) => format!("{}#L{first}", used.target),
+                None => used.target.clone(),
+            };
+            open_link(ui.ctx(), session, &target);
+        }
+    }
+}
+
 fn answer(
     ui: &mut Ui,
     t: &Tokens,
@@ -647,6 +973,12 @@ fn answer(
             t.text_weak,
         );
     }
+    // The project files the model looked at: a click opens a file that was read.
+    for (k, used) in m.tools.iter().enumerate() {
+        tool_row(ui, t, session, tool_row_id(index, k), used, x, text_w);
+    }
+    let root = session.git_dir();
+    let is_file = |s: &str| root.as_ref().is_some_and(|r| r.join(s).is_file());
     for (k, seg) in segments(&m.text).into_iter().enumerate() {
         match seg {
             Segment::Text { text, level } => {
@@ -655,10 +987,28 @@ fn answer(
                 } else {
                     FontId::proportional(12.0)
                 };
-                let g = inline(ui, t, &text, font, text_w);
-                let (r, _) = ui.allocate_exact_size(vec2(w, g.size().y + 6.0), Sense::hover());
-                ui.painter()
-                    .galley(pos2(r.left() + x, r.top() + 3.0), g, t.text);
+                let (g, links) = inline(ui, t, &text, font, text_w, &is_file);
+                let sense = if links.is_empty() {
+                    Sense::hover()
+                } else {
+                    Sense::click()
+                };
+                let (r, resp) = ui.allocate_exact_size(vec2(w, g.size().y + 6.0), sense);
+                let at = pos2(r.left() + x, r.top() + 3.0);
+                // The link under the pointer: a hand, and a click opens it.
+                let under = resp.hover_pos().and_then(|p| {
+                    let i = g.cursor_from_pos(p - at).index.0;
+                    links
+                        .iter()
+                        .find(|l| l.chars.start <= i && i < l.chars.end.max(l.chars.start + 1))
+                });
+                if let Some(l) = under {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        open_link(ui.ctx(), session, &l.target);
+                    }
+                }
+                ui.painter().galley(at, g, t.text);
             }
             Segment::Code { lang, body } => {
                 // Code keeps its lines: long ones scroll sideways inside the block.
@@ -1028,6 +1378,63 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
             },
             semibold(12.0),
             if reads { t.accent } else { t.error },
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    /// Answers' Markdown: bold, code and links; unclosed markers stay text.
+    #[test]
+    fn spans_find_links_code_and_bold() {
+        assert_eq!(
+            spans("See [intro.tex:42](sections/intro.tex#L42) and `main.tex`, **now**."),
+            vec![
+                Span::Plain("See ".into()),
+                Span::Link {
+                    label: "intro.tex:42".into(),
+                    target: "sections/intro.tex#L42".into()
+                },
+                Span::Plain(" and ".into()),
+                Span::Code("main.tex".into()),
+                Span::Plain(", ".into()),
+                Span::Bold("now".into()),
+                Span::Plain(".".into()),
+            ]
+        );
+        assert_eq!(
+            spans("a [b] c [d]( ) `e"),
+            vec![
+                Span::Plain("a ".into()),
+                Span::Plain("[".into()),
+                Span::Plain("b] c ".into()),
+                Span::Plain("[".into()),
+                Span::Plain("d]( ) ".into()),
+                Span::Plain("`".into()),
+                Span::Plain("e".into()),
+            ]
+        );
+        // `\ref{fig:a}`-style code is not a path; file names are.
+        assert!(path_like("sections/intro.tex") && path_like("refs.bib"));
+        assert!(!path_like("\\ref{x}") && !path_like("a b.tex") && !path_like("equation"));
+    }
+
+    #[test]
+    fn link_targets_carry_lines() {
+        assert_eq!(
+            split_target("sections/intro.tex#L42"),
+            ("sections/intro.tex".into(), Some(42))
+        );
+        assert_eq!(
+            split_target("./main.tex#L3-L9"),
+            ("main.tex".into(), Some(3))
+        );
+        assert_eq!(split_target("main.tex:7"), ("main.tex".into(), Some(7)));
+        assert_eq!(
+            split_target("<my%20paper.tex>"),
+            ("my paper.tex".into(), None)
         );
     }
 }

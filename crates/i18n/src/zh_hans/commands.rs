@@ -69,10 +69,13 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Discard Changes", "放弃更改"),
     ("Commit", "提交"),
     ("Open Changes", "打开更改"),
+    ("Generate Commit Message", "用 AI 生成提交信息"),
     ("Refresh", "刷新"),
     ("Pull", "拉取"),
     ("Push", "推送"),
     ("Fetch", "获取"),
+    ("Sync Changes", "同步更改"),
+    ("Open Conversation", "打开对话"),
     // Edit
     ("Undo", "撤销"),
     ("Redo", "重做"),
@@ -177,4 +180,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Welcome Window", "欢迎窗口"),
     // Help
     ("Keyboard Shortcuts", "键盘快捷键"),
+    // Typesetting before quitting (LIVE mode)
+    ("Quit Now", "立即退出"),
+    ("Don't Quit", "不退出"),
 ];

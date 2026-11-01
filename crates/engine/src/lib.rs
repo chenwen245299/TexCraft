@@ -17,9 +17,12 @@ use texcraft_synctex::{PdfRect, SyncTex};
 use texcraft_typeset::{Job, JobEvent, LiveRequest, Mirror, Outcome, Request, Toolchain};
 
 pub mod ai;
+pub mod ai_tools;
+pub mod chats;
 pub mod commands;
 pub mod edit;
 pub mod files;
+pub mod full;
 pub mod git;
 pub mod index;
 pub mod inline;
@@ -28,6 +31,7 @@ pub mod update;
 
 pub use commands::{CommandSpec, Shortcut, registry};
 pub use edit::Selection;
+pub use full::QuitTypeset;
 pub use index::ProjectIndex;
 pub use update::{CURRENT_VERSION, UpdateState, UpdateStatus};
 
@@ -123,21 +127,21 @@ pub enum SidebarTab {
     Results,
     /// Project-wide text search and jump-to (tag) search.
     Search,
-    /// Chat with an AI model about the document.
+    /// Older settings only: the AI Assistant was a tab here. It is a panel on the right now
+    /// ([`View::assistant`]); [`View::normalize`] moves such settings over.
     Assistant,
 }
 
 impl SidebarTab {
-    /// All tabs in display order (the AI Assistant before Search). The ⌘⌥1–5 shortcuts keep the
-    /// target's numbering (Contents, Todos, Files, Results, Search); Source Control is ⌘⌥6 and
-    /// the Assistant ⌘⌥7.
-    pub const ALL: [SidebarTab; 7] = [
+    /// All tabs in display order. The ⌘⌥1–5 shortcuts keep the target's numbering (Contents,
+    /// Todos, Files, Results, Search); Source Control is ⌘⌥6 (⌘⌥7 shows the AI Assistant on
+    /// the right).
+    pub const ALL: [SidebarTab; 6] = [
         Self::Contents,
         Self::Todos,
         Self::Git,
         Self::Files,
         Self::Results,
-        Self::Assistant,
         Self::Search,
     ];
 
@@ -298,6 +302,8 @@ impl LanguageChoice {
 pub struct View {
     /// Sidebar visible.
     pub sidebar: bool,
+    /// The AI Assistant panel on the right is shown.
+    pub assistant: bool,
     /// Sidebar mode.
     pub sidebar_tab: SidebarTab,
     /// Contents tab mode.
@@ -360,10 +366,22 @@ pub struct View {
     pub last_update_check: u64,
 }
 
+impl View {
+    /// Settings saved when the Assistant was a sidebar tab: the sidebar shows Contents, and the
+    /// Assistant its panel.
+    pub fn normalize(&mut self) {
+        if self.sidebar_tab == SidebarTab::Assistant {
+            self.sidebar_tab = SidebarTab::Contents;
+            self.assistant = true;
+        }
+    }
+}
+
 impl Default for View {
     fn default() -> Self {
         Self {
             sidebar: true,
+            assistant: false,
             sidebar_tab: SidebarTab::Contents,
             contents_mode: ContentsMode::Structure,
             results_mode: ResultsMode::Issues,
@@ -583,6 +601,19 @@ pub struct TypesetState {
     pub root: Option<PathBuf>,
     /// When the last run finished.
     pub finished_at: Option<std::time::SystemTime>,
+    /// Projects (their root files) edited since their last full typeset, with when the first
+    /// such edit was made. In LIVE mode TexCraft typesets them now and then and before quitting
+    /// (see [`full`]).
+    pub stale: Vec<(PathBuf, Instant)>,
+    /// When a document was last edited.
+    pub last_edit_at: Option<Instant>,
+    /// The running (or last) full typeset was started by TexCraft, not by the user.
+    pub background: bool,
+    /// The running live pass was stopped on purpose (it took too long, or TexCraft is quitting):
+    /// it leaves no trace.
+    pub live_dropped: bool,
+    /// Typesetting before quitting.
+    pub quit: QuitTypeset,
 }
 
 impl TypesetState {
@@ -603,6 +634,8 @@ impl TypesetState {
 pub struct PdfState {
     /// The file.
     pub path: Option<PathBuf>,
+    /// The root file it was typeset from (None for a PDF opened by itself).
+    pub root: Option<PathBuf>,
     /// Increases every time the file is replaced.
     pub generation: u64,
     /// SyncTeX data for it.
@@ -901,11 +934,19 @@ impl Session {
             self.set_project_dir(dir.to_path_buf());
         }
         self.remember_recent(path);
-        // Show the matching PDF right away if one was typeset before.
+        // Show the matching PDF right away if one was typeset before. Another document's PDF
+        // (the start-up Untitled's, say) gives way: the pane waits for this one's.
         if let Some(root) = self.root_path() {
             let pdf = texcraft_project::output_pdf(&root);
-            if pdf.is_file() && self.pdf.path.as_deref() != Some(pdf.as_path()) {
-                self.show_pdf(pdf);
+            if pdf.is_file() {
+                if self.pdf.path.as_deref() != Some(pdf.as_path()) {
+                    self.show_pdf(pdf);
+                }
+                self.pdf.root = Some(root);
+            } else if self.pdf.root.as_deref().is_some_and(|r| {
+                texcraft_project::normalize(r) != texcraft_project::normalize(&root)
+            }) {
+                self.clear_pdf();
             }
         }
         if self.pdf.path.is_none() {
@@ -1149,6 +1190,7 @@ impl Session {
         if let Some(d) = self.doc_mut() {
             d.revision += 1;
         }
+        self.note_stale();
         self.schedule_live();
         self.inline_after_edit();
     }
@@ -1191,6 +1233,16 @@ impl Session {
         let root = self
             .root_path()
             .ok_or_else(|| CommandError::Failed(tr("nothing to typeset").into()))?;
+        self.start_full(root, false)
+    }
+
+    /// Starts a full typeset of `root` (nothing may be running). `background`: TexCraft started
+    /// it by itself (no alert or issues list when it fails).
+    pub(crate) fn start_full(
+        &mut self,
+        root: PathBuf,
+        background: bool,
+    ) -> Result<(), CommandError> {
         // Write what the engine will read: open buffers of this project (saved docs) and the
         // scratch file of an untitled document.
         let save_all = self.settings.save_before_typeset;
@@ -1215,7 +1267,7 @@ impl Session {
                 self.save(i)?;
             }
         }
-        let plan = self.typeset_plan();
+        let plan = self.compute_plan(Some(root.clone()));
         let req = Request {
             root: root.clone(),
             engine: plan.engine,
@@ -1224,8 +1276,12 @@ impl Session {
             pretex: self.pretex_for(&plan),
         };
         self.typeset.console.clear();
+        // The PDF beside this root will be current again.
+        let key = texcraft_project::normalize(&root);
+        self.typeset.stale.retain(|(r, _)| *r != key);
         self.typeset.root = Some(root);
         self.typeset.live_job = false;
+        self.typeset.background = background;
         self.typeset.job = Some(texcraft_typeset::start(
             req,
             &self.toolchain,
@@ -1290,6 +1346,7 @@ impl Session {
         self.typeset.root = Some(root);
         self.typeset.job_edit_at = self.typeset.pending_edit_at.take();
         self.typeset.live_job = true;
+        self.typeset.background = false;
         self.typeset.job = Some(texcraft_typeset::start_live(
             req,
             &self.toolchain,
@@ -1314,6 +1371,7 @@ impl Session {
             self.tick_updates(now),
             self.tick_typeset(now),
             self.tick_git(now),
+            self.tick_git_message(),
             self.tick_ai(),
             self.tick_inline(now),
         ]
@@ -1338,8 +1396,11 @@ impl Session {
         }
         if let Some(outcome) = finished {
             self.typeset.job = None;
-            // A live pass stopped to make way for a full typeset leaves no trace.
-            let superseded = outcome.live && outcome.cancelled && self.typeset.queued;
+            // A live pass stopped to make way for a full typeset, or on purpose, leaves no trace.
+            let superseded = outcome.live
+                && outcome.cancelled
+                && (self.typeset.queued || self.typeset.live_dropped);
+            self.typeset.live_dropped = false;
             if !superseded {
                 self.finish_typeset(*outcome);
             }
@@ -1356,7 +1417,9 @@ impl Session {
                 }
             }
         }
+        self.watch_live(now);
         // Live typesetting.
+        let mut live_wait = None;
         if let Some(due) = self.typeset.live_due {
             if !self.settings.live_typeset || self.live_paused {
                 self.typeset.live_due = None;
@@ -1380,25 +1443,60 @@ impl Session {
                     }
                 }
             } else {
-                return Some(due - now);
+                live_wait = Some(due.saturating_duration_since(now));
             }
         }
+        // Full typesets TexCraft starts by itself (LIVE mode, quitting).
+        let full_wait = self.tick_full(now);
         if self.typeset.is_running() {
             return Some(Duration::from_millis(100));
         }
-        None
+        live_wait.into_iter().chain(full_wait).min()
+    }
+
+    /// A live pass that hangs, or runs far longer than usual, while newer edits wait is stopped:
+    /// the next pass typesets them (otherwise every later edit would wait behind it).
+    fn watch_live(&mut self, now: Instant) {
+        let usual = self
+            .typeset
+            .last_live
+            .map_or(Duration::ZERO, |d| d.saturating_mul(4));
+        let stuck = self.typeset.live_job
+            && self.typeset.queued_live
+            && !self.typeset.live_dropped
+            && self.typeset.job.as_ref().is_some_and(|job| {
+                now.saturating_duration_since(job.started) >= full::LIVE_STUCK.max(usual)
+            });
+        if !stuck {
+            return;
+        }
+        if let Some(job) = &self.typeset.job {
+            job.cancel();
+        }
+        self.typeset.live_dropped = true;
+        self.set_status(tr("A live preview pass took too long and was restarted"));
     }
 
     fn finish_typeset(&mut self, outcome: Outcome) {
         self.typeset.runs += 1;
         self.typeset.finished_at = Some(std::time::SystemTime::now());
         self.typeset.issues = outcome.report.issues.clone();
+        let background = !outcome.live && self.typeset.background;
+        if !outcome.live
+            && (outcome.cancelled || outcome.error.is_some())
+            && let Some(root) = self.typeset.root.clone()
+        {
+            // The PDF beside the source did not change after all.
+            self.mark_stale(&root, Instant::now());
+        }
         if let Some(err) = &outcome.error {
             self.set_status(err.clone());
-            self.effect(Effect::Alert {
-                title: tr("Typesetting could not start").into(),
-                message: err.clone(),
-            });
+            if !background {
+                self.effect(Effect::Alert {
+                    title: tr("Typesetting could not start").into(),
+                    message: err.clone(),
+                });
+            }
         } else if outcome.cancelled {
             self.set_status(tr("Typesetting stopped"));
         } else if outcome.live {
@@ -1422,7 +1520,7 @@ impl Session {
                 errors = errors_text,
                 warnings = warnings_text
             ));
-            if errors > 0 && self.view.show_issues_after_error && !outcome.live {
+            if errors > 0 && self.view.show_issues_after_error && !outcome.live && !background {
                 self.view.sidebar = true;
                 self.view.sidebar_tab = SidebarTab::Results;
                 self.view.results_mode = ResultsMode::Issues;
@@ -1437,7 +1535,14 @@ impl Session {
             && self.settings.live_keep_good
             && outcome.report.errors() > 0
             && self.pdf.path.is_some();
-        if let Some(pdf) = outcome.pdf.clone().filter(|_| !keep_previous) {
+        // A pass for a document that has gone meanwhile (the start-up Untitled an opened file
+        // replaced) leaves the pane alone.
+        let wanted = self
+            .typeset
+            .root
+            .as_deref()
+            .is_none_or(|r| self.pdf_wanted(r));
+        if let Some(pdf) = outcome.pdf.clone().filter(|_| !keep_previous && wanted) {
             // Reload only when the file changed (an up-to-date run leaves it alone).
             if outcome.pdf_fresh
                 || self.pdf.path.as_ref() != Some(&pdf)
@@ -1449,6 +1554,7 @@ impl Session {
                     .and_then(|p| SyncTex::load(p).ok());
                 self.pdf.mirror = outcome.mirror.clone();
                 self.pdf.path = Some(pdf);
+                self.pdf.root = self.typeset.root.clone();
                 self.pdf.generation += 1;
                 self.pdf.edit_at = if outcome.live {
                     self.typeset.job_edit_at
@@ -1470,8 +1576,34 @@ impl Session {
         self.pdf.synctex = synctex;
         self.pdf.mirror = None;
         self.pdf.path = Some(pdf);
+        self.pdf.root = None;
         self.pdf.generation += 1;
         self.effect(Effect::PdfChanged);
+    }
+
+    /// Empties the PDF pane (its PDF belongs to a document no longer shown).
+    fn clear_pdf(&mut self) {
+        self.pdf.synctex = None;
+        self.pdf.mirror = None;
+        self.pdf.path = None;
+        self.pdf.root = None;
+        self.pdf.edit_at = None;
+        self.pdf.selected_text.clear();
+        self.pdf.generation += 1;
+        self.effect(Effect::PdfChanged);
+    }
+
+    /// Whether `root`'s PDF belongs in the pane: an open document is that root, or the active
+    /// one belongs to it.
+    fn pdf_wanted(&self, root: &Path) -> bool {
+        let root = texcraft_project::normalize(root);
+        self.docs
+            .iter()
+            .filter_map(Document::typeset_path)
+            .any(|p| texcraft_project::normalize(p) == root)
+            || self
+                .root_path()
+                .is_some_and(|r| texcraft_project::normalize(&r) == root)
     }
 
     /// Forward search: shows the caret's line in the PDF.
@@ -1684,6 +1816,7 @@ impl Session {
         let (text, sel) = f(&doc.text, doc.selection);
         doc.replace_text(text, sel);
         self.effect(Effect::SelectionChanged { doc: idx });
+        self.note_stale();
         self.schedule_live();
         Ok(())
     }
@@ -1737,6 +1870,9 @@ impl Session {
                 "seconds": self.typeset.last.as_ref().map(|o| o.duration.as_secs_f32()),
                 "fastEnv": self.typeset.last.as_ref().map(|o| o.fast_env),
                 "latencyMs": self.typeset.last_latency.map(|d| d.as_millis() as u64),
+                "background": self.typeset.is_full_running() && self.typeset.background,
+                "staleProjects": self.typeset.stale.iter().map(|(r, _)| r).collect::<Vec<_>>(),
+                "quitting": self.typeset.is_quitting(),
             },
             "pdf": {
                 "path": self.pdf.path,
@@ -1747,6 +1883,10 @@ impl Session {
             "status": self.status.as_ref().map(|s| s.0.clone()),
             "toolchain": toolchain,
             "ai": {
+                "chatId": self.ai.chat_id,
+                "history": self.ai.history.iter().map(|c| serde_json::json!({
+                    "id": c.id, "title": c.title, "updated": c.updated,
+                })).collect::<Vec<_>>(),
                 "provider": self.ai.config.selection().map(|(p, _)| p.name.clone()),
                 "model": self.ai.config.selection().map(|(_, m)| m.to_string()),
                 "providers": self.ai.config.providers.iter().map(|p| serde_json::json!({
@@ -1775,6 +1915,8 @@ impl Session {
                 "commits": self.git.repo.as_ref().map_or(0, |r| r.log.len()),
                 "busy": self.git.busy,
                 "error": self.git.error,
+                "message": self.git.message,
+                "drafting": self.git.is_drafting(),
             },
         })
     }

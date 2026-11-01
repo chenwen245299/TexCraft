@@ -47,7 +47,7 @@ fn kind_color(t: &Tokens, k: ChangeKind) -> Color32 {
 }
 
 /// "3 min ago", "2 h ago", "4 days ago", else the date.
-fn ago(time: i64) -> String {
+pub(crate) fn ago(time: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
@@ -103,6 +103,40 @@ fn empty(ui: &mut Ui, t: &Tokens, title: &str, text: &str, button: Option<&str>)
         }
     });
     clicked
+}
+
+/// What the button under the message box does, as VS Code's: commit while there is something
+/// to commit; else sync while the branch is ahead of or behind its upstream; else publish a
+/// branch with commits but no upstream (when there is a remote to publish to); else nothing to
+/// do (Commit, which says so).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Primary {
+    Commit { all: bool },
+    Sync { ahead: u32, behind: u32 },
+    Publish,
+    Idle,
+}
+
+fn primary_action(repo: &texcraft_git::Snapshot) -> Primary {
+    let st = &repo.status;
+    if !st.is_clean() {
+        Primary::Commit {
+            all: st.staged.is_empty(),
+        }
+    } else if st.upstream.is_some() && (st.ahead > 0 || st.behind > 0) {
+        Primary::Sync {
+            ahead: st.ahead,
+            behind: st.behind,
+        }
+    } else if st.upstream.is_none()
+        && st.branch.is_some()
+        && repo.has_remote
+        && !repo.log.is_empty()
+    {
+        Primary::Publish
+    } else {
+        Primary::Idle
+    }
 }
 
 /// A small icon button; returns whether it was clicked.
@@ -203,7 +237,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         t.sidebar_icon,
     );
     let busy = session.git.busy;
-    let buttons_w = 4.0 * 24.0 + 6.0;
+    // Generate Commit Message, Refresh, Pull, Push, More.
+    const BUTTONS: f32 = 5.0;
+    let buttons_w = BUTTONS * 24.0 + 6.0;
     let branch = status
         .branch
         .clone()
@@ -214,12 +250,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                 .map(|h| trf!("{head} (detached)", head = h))
         })
         .unwrap_or_else(|| tr("No commits yet").into());
+    // Ahead / behind, unless the Sync Changes button below shows them (the branch name needs
+    // the room).
     let mut sync = String::new();
-    if status.behind > 0 {
-        sync.push_str(&format!("↓{} ", status.behind));
-    }
-    if status.ahead > 0 {
-        sync.push_str(&format!("↑{}", status.ahead));
+    if !matches!(primary_action(&repo), Primary::Sync { .. }) {
+        if status.behind > 0 {
+            sync.push_str(&format!("↓{} ", status.behind));
+        }
+        if status.ahead > 0 {
+            sync.push_str(&format!("↑{}", status.ahead));
+        }
     }
     let sync = sync.trim().to_string();
     let sync_w = if sync.is_empty() {
@@ -257,7 +297,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
             t.text_weak,
             ui.input(|i| i.time) as f32 * 6.0,
         );
-        let room = (hr.right() - 6.0 - 4.0 * 24.0 - sx - 18.0).max(0.0);
+        let room = (hr.right() - 6.0 - BUTTONS * 24.0 - sx - 18.0).max(0.0);
         let text = widgets::elide(&p, &format!("{label}…"), &FontId::proportional(11.0), room);
         p.text(
             pos2(sx + 16.0, hr.center().y),
@@ -277,13 +317,41 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         );
     }
     let idle = busy.is_none();
-    let mut x = hr.right() - 6.0 - 4.0 * 24.0;
+    let mut x = hr.right() - 6.0 - BUTTONS * 24.0;
     let mut next = || {
         let r = Rect::from_center_size(pos2(x + 12.0, hr.center().y), vec2(22.0, 22.0));
         x += 24.0;
         r
     };
-    let (r_refresh, r_pull, r_push, r_more) = (next(), next(), next(), next());
+    let (r_message, r_refresh, r_pull, r_push, r_more) = (next(), next(), next(), next(), next());
+    // The AI model writes the message: the button spins meanwhile (the progress line has no
+    // room left in a narrow sidebar).
+    let drafting = session.git.is_drafting();
+    let spin = ui.input(|i| i.time) as f32 * 6.0;
+    if icon_button(
+        ui,
+        t,
+        r_message,
+        Id::new("git-generate-message"),
+        if drafting {
+            tr("Writing commit message")
+        } else {
+            tr("Generate Commit Message")
+        },
+        !status.is_clean() && !drafting,
+        |p, r, c| {
+            if drafting {
+                icons::spinner(p, r.shrink(1.5), t.text_weak, spin);
+            } else {
+                icons::sparkles(p, r, c, false);
+            }
+        },
+    ) {
+        run(session, "git.generateMessage", no_params());
+    }
+    if drafting {
+        ui.ctx().request_repaint();
+    }
     if icon_button(
         ui,
         t,
@@ -392,6 +460,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(7, 5));
     let mut commit_now = false;
+    let mut button = false;
+    let primary = primary_action(&repo);
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(Rect::from_min_size(inner.min, vec2(inner.width(), 200.0))),
         |ui| {
@@ -415,25 +485,44 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut GitPanelSta
                 }
             });
             ui.add_space(6.0);
-            let label = if status.is_clean() {
-                tr("Commit")
-            } else if status.staged.is_empty() {
-                tr("Commit All")
-            } else {
-                tr("Commit")
+            let (label, kind) = match primary {
+                Primary::Commit { all } => (
+                    format!("✓ {}", if all { tr("Commit All") } else { tr("Commit") }),
+                    if session.git.message.trim().is_empty() {
+                        ButtonKind::Normal
+                    } else {
+                        ButtonKind::Default
+                    },
+                ),
+                Primary::Sync { ahead, behind } => {
+                    let mut counts = String::new();
+                    if behind > 0 {
+                        counts.push_str(&format!(" ↓{behind}"));
+                    }
+                    if ahead > 0 {
+                        counts.push_str(&format!(" ↑{ahead}"));
+                    }
+                    (
+                        format!("↻ {}{counts}", tr("Sync Changes")),
+                        ButtonKind::Default,
+                    )
+                }
+                Primary::Publish => (format!("↑ {}", tr("Publish Branch")), ButtonKind::Default),
+                Primary::Idle => (format!("✓ {}", tr("Commit")), ButtonKind::Normal),
             };
-            let kind = if status.is_clean() || session.git.message.trim().is_empty() {
-                ButtonKind::Normal
-            } else {
-                ButtonKind::Default
-            };
-            if menu::dialog_button(ui, t, &format!("✓ {label}"), kind, ui.available_width()) {
-                commit_now = true;
+            if menu::dialog_button(ui, t, &label, kind, ui.available_width()) {
+                button = true;
             }
         },
     );
     if commit_now {
         run(session, "git.commit", no_params());
+    } else if button {
+        match primary {
+            Primary::Sync { .. } => run(session, "git.sync", no_params()),
+            Primary::Publish => run(session, "git.push", no_params()),
+            Primary::Commit { .. } | Primary::Idle => run(session, "git.commit", no_params()),
+        }
     }
     if let Some(e) = session.git.error.clone() {
         error_line(ui, t, &e);
@@ -985,4 +1074,72 @@ fn diff_line(ui: &mut Ui, t: &Tokens, line: &str, font: &FontId, w: f32) {
     }
     ui.painter()
         .galley(pos2(r.left() + 12.0, r.top() + 1.0), g, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use texcraft_git::{Snapshot, Status};
+
+    /// The button follows VS Code's: Commit, then Sync Changes while commits wait to be pushed
+    /// or pulled, Publish Branch for an unpublished branch with a remote, else idle.
+    #[test]
+    fn the_button_after_a_commit_syncs_or_publishes() {
+        let commit = texcraft_git::Commit {
+            hash: "abc1234".into(),
+            subject: "First".into(),
+            author: "A".into(),
+            time: 0,
+        };
+        let snap = |status: Status, has_remote: bool| Snapshot {
+            root: std::path::PathBuf::from("/repo"),
+            status,
+            log: vec![commit.clone()],
+            has_remote,
+        };
+        let change = Change {
+            path: "main.tex".into(),
+            orig: None,
+            kind: ChangeKind::Modified,
+        };
+        let base = Status {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ..Status::default()
+        };
+        let dirty = Status {
+            changes: vec![change.clone()],
+            ahead: 1,
+            ..base.clone()
+        };
+        assert_eq!(
+            primary_action(&snap(dirty, true)),
+            Primary::Commit { all: true }
+        );
+        let ahead = Status {
+            ahead: 1,
+            ..base.clone()
+        };
+        assert_eq!(
+            primary_action(&snap(ahead, true)),
+            Primary::Sync {
+                ahead: 1,
+                behind: 0
+            }
+        );
+        let unpublished = Status {
+            upstream: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            primary_action(&snap(unpublished.clone(), true)),
+            Primary::Publish
+        );
+        assert_eq!(
+            primary_action(&snap(unpublished, false)),
+            Primary::Idle,
+            "nowhere to publish"
+        );
+        assert_eq!(primary_action(&snap(base, true)), Primary::Idle);
+    }
 }
