@@ -27,7 +27,7 @@ regex = "1.13"
 
 [dev-dependencies]
 # The SVG renderer egui_extras uses (same version), to check every AI logo actually renders.
-resvg = { version = "0.45.1", default-features = false }
+resvg = { version = "0.49.0", default-features = false }
 
 [lints]
 workspace = true
