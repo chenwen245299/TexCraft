@@ -415,7 +415,7 @@ git push origin v0.2.0
 - 版本号以 tag 为准：CI 会把 tag 写进 `Cargo.toml` 的 workspace 版本再编译，所以本地忘了改版本号也不要紧。
 - 产物分两类：
   - **给人下载安装的**：
-    - `TexCraft-<版本>-macos.dmg`：打开后把 TexCraft 拖进旁边的 Applications（`scripts/make-dmg.sh`）。通用二进制（Apple 芯片 + Intel），ad-hoc 签名，**未公证**：macOS 15 起第一次打开要到 系统设置 › 隐私与安全性 点“仍要打开”，14 及以前右键 › 打开；
+    - `TexCraft-<版本>-macos.dmg`：打开后把 TexCraft 拖进旁边的 Applications（`scripts/make-dmg.sh`）。只有 Apple 芯片版（不出 Intel 版），ad-hoc 签名，**未公证**：macOS 15 起第一次打开要到 系统设置 › 隐私与安全性 点“仍要打开”，14 及以前右键 › 打开；
     - `TexCraft-<版本>-windows-x64-setup.exe`：Inno Setup 安装程序（`scripts/windows-installer.iss`），装到当前用户的 `%LOCALAPPDATA%\Programs\TexCraft`，**不要管理员权限**（这样更新器才能替换自己），有开始菜单项、可选桌面快捷方式和卸载程序；未签名，SmartScreen 会提示一次（更多信息 › 仍要运行）。`AppId` 永远不能改，新版安装程序靠它找到旧版并原地升级；
   - **给自动更新用的**：`TexCraft-<版本>-macos.zip`、`TexCraft-<版本>-windows-x64.zip`（exe 内嵌图标），以及 `latest.json`：更新清单，由 `scripts/ci/latest_json.py` 生成，含每个平台 zip 的下载地址、SHA-256 和大小，以及 tag 里的说明。
 - Release 页面的正文是 tag 里的说明，后面接 `scripts/ci/download.md`（下载哪个文件、怎么安装、第一次打开怎么放行）；app 的更新窗口只显示 tag 里的说明。

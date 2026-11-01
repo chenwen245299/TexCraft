@@ -96,8 +96,9 @@ pub struct Staged {
 }
 
 /// The manifest key of this build's archive, or `None` where TexCraft publishes no builds.
+/// `macos` is Apple silicon only: there is no Intel build to update to.
 pub fn platform_key() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("macos")
     } else if cfg!(all(windows, target_arch = "x86_64")) {
         Some("windows-x86_64")
@@ -605,6 +606,16 @@ mod tests {
         assert!(newer_release(&m, "0.3.0", "macos").is_none());
         assert!(newer_release(&m, "0.1.0", "linux").is_none());
         assert!(parse_manifest("{oops").is_err());
+    }
+
+    /// release.yml publishes no Intel Mac build, so an Intel Mac must never be offered the
+    /// Apple silicon archive.
+    #[test]
+    fn only_apple_silicon_macs_look_for_updates() {
+        if cfg!(target_os = "macos") {
+            let expected = cfg!(target_arch = "aarch64").then_some("macos");
+            assert_eq!(platform_key(), expected);
+        }
     }
 
     fn temp(name: &str) -> PathBuf {

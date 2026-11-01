@@ -1068,3 +1068,16 @@ the welcome-window and update-window bugs; what landed:
   no other button). With the dropping turned off, both fail. Dev app at 880/1040/1388 pt and
   with the ••• menu open, in English and zh-Hans.
 - Open: Texifier's behaviour below "Pag…" isn't documented, so the drop order is our own call.
+
+## Release: Apple silicon only, built on macos-26 (2026-11-02)
+
+- GitHub retired the macos-14 runner image on 2 Nov 2026 (actions/runner-images#13518); the
+  v0.5.0 run's Build macOS job failed in a brownout, so nothing was published. `release.yml`
+  now builds on `macos-26` (Xcode 26).
+- No Intel build any more: the job builds natively for Apple silicon through
+  `scripts/bundle-macos.sh` (the cross-build, `lipo` and `TEXCRAFT_SKIP_BUILD` are gone).
+  `update::platform_key` is `macos` on Apple silicon only, so a from-source Intel build never
+  downloads the arm64 archive (test `only_apple_silicon_macs_look_for_updates`). The download
+  table, development guide and parity page say Apple silicon.
+- Intel Macs still on 0.4.0 or earlier will be offered 0.5.0 by their old updater, and it
+  will not open there; accepted.

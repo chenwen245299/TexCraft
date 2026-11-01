@@ -78,7 +78,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Area | Status | Notes |
 |---|---|---|
 | Automatic update check, download and install | ✅ | GitHub releases + `latest.json`; the target uses its own updater, TexCraft's window follows the author's Argus app |
-| Release builds | ✅ | tag-triggered GitHub Actions: macOS universal (ad-hoc signed, not notarised), Windows x64 |
+| Release builds | ✅ | tag-triggered GitHub Actions: macOS Apple silicon (ad-hoc signed, not notarised), Windows x64 |
 
 ## Files and export
 

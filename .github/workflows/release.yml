@@ -1,4 +1,4 @@
-# Builds TexCraft for macOS (universal) and Windows (x64) when a version tag is pushed, and
+# Builds TexCraft for macOS (Apple silicon) and Windows (x64) when a version tag is pushed, and
 # publishes a GitHub release with what people install from (a .dmg, scripts/make-dmg.sh; a
 # Setup .exe, scripts/windows-installer.iss), the archives the app's updater downloads, and
 # latest.json (the manifest it reads from releases/latest/download/latest.json). The release
@@ -71,7 +71,9 @@ jobs:
   macos:
     name: Build macOS
     needs: [version, secrets, audit]
-    runs-on: macos-14
+    # Apple silicon (the runner's own architecture); no Intel build. macos-14 was retired on
+    # 2 Nov 2026 (actions/runner-images#13518).
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,22 +82,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Use the tag's version
         run: perl -pi -e 's/^version = "[^"]*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
-      - name: Build (Apple silicon + Intel)
-        run: |
-          for t in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --target "$t" -p texcraft -p texcraft-cli
-          done
-          mkdir -p target/release
-          for b in texcraft texcraft-cli; do
-            lipo -create -output "target/release/$b" \
-              "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
-          done
-      - name: Bundle, sign (ad hoc), zip and disk image
-        env:
-          TEXCRAFT_SKIP_BUILD: "1"
+      - name: Build, bundle, sign (ad hoc), zip and disk image
         run: |
           sh scripts/bundle-macos.sh
           codesign --force --deep --sign - target/macos/TexCraft.app

@@ -2,7 +2,7 @@
 
 | System | File | How to install |
 |---|---|---|
-| macOS 11 or later (Apple silicon and Intel) | `TexCraft-{{VERSION}}-macos.dmg` | Open it and drag TexCraft onto Applications |
+| Mac with Apple silicon (M1 or later) | `TexCraft-{{VERSION}}-macos.dmg` | Open it and drag TexCraft onto Applications |
 | Windows 10 or 11 (64-bit) | `TexCraft-{{VERSION}}-windows-x64-setup.exe` | Run it (no administrator rights needed) |
 
 Once installed, TexCraft updates itself. The `.zip` files and `latest.json` are what its updater

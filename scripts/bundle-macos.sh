@@ -3,10 +3,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-# CI builds a universal binary first and sets TEXCRAFT_SKIP_BUILD=1.
-if [ -z "${TEXCRAFT_SKIP_BUILD:-}" ]; then
-  cargo build --release -p texcraft -p texcraft-cli
-fi
+cargo build --release -p texcraft -p texcraft-cli
 APP="$TARGET_DIR/macos/TexCraft.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 rm -rf "$APP"
