@@ -11,7 +11,7 @@ publish.workspace = true
 texcraft-i18n.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 getrandom = "0.4"
 # Images attached to questions go as base64 (already in the tree through usvg).
 base64 = "0.22"
