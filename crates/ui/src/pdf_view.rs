@@ -887,6 +887,200 @@ fn empty_state(ui: &mut Ui, t: &Tokens, session: &Session, view: &PdfView, body:
     }
 }
 
+/// An item of the PDF header. When the pane is too narrow for all of them, the page label is
+/// elided first (as in Texifier: "Pag…"), then buttons move into the ••• menu, lowest
+/// [`rank`](HeaderItem::rank) first; ••• itself always stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum HeaderItem {
+    Grid,
+    ZoomOut,
+    Zoom,
+    ZoomIn,
+    First,
+    Prev,
+    Next,
+    Last,
+    Lock,
+    Open,
+    Window,
+    Pause,
+    More,
+}
+
+impl HeaderItem {
+    /// Every item, in the bar's order.
+    pub(crate) const ALL: [Self; 13] = [
+        Self::Grid,
+        Self::ZoomOut,
+        Self::Zoom,
+        Self::ZoomIn,
+        Self::First,
+        Self::Prev,
+        Self::Next,
+        Self::Last,
+        Self::Lock,
+        Self::Open,
+        Self::Window,
+        Self::Pause,
+        Self::More,
+    ];
+
+    /// How long the item stays in the bar as the pane narrows: the higher, the longer. Pairs
+    /// go together.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Window => 1,
+            Self::First | Self::Last => 2,
+            Self::Grid => 3,
+            Self::Lock => 4,
+            Self::ZoomOut | Self::ZoomIn => 5,
+            Self::Pause => 6,
+            Self::Prev | Self::Next => 7,
+            Self::Zoom => TOP_RANK,
+            Self::More => u8::MAX,
+        }
+    }
+
+    /// The id of its interaction.
+    pub(crate) fn id(self) -> Id {
+        Id::new(("pdf-hdr", self))
+    }
+}
+
+/// The highest rank that can give way.
+const TOP_RANK: u8 = 8;
+/// The least room between a cluster's edge and the anchor of its first item.
+const EDGE: f32 = 10.0;
+
+/// A slot of a header cluster: an item (`None`: a separator) and the room it takes before and
+/// after its anchor (a glyph's centre, where the zoom percentage starts), counted from the
+/// cluster's edge. At full width the anchors are the measured positions and neighbouring slots
+/// meet halfway between them, so they never overlap.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    item: Option<HeaderItem>,
+    lead: f32,
+    trail: f32,
+}
+
+const fn slot(item: Option<HeaderItem>, lead: f32, trail: f32) -> Slot {
+    Slot { item, lead, trail }
+}
+
+/// The left cluster from the pane's left edge: anchors at 12, 33.25, 42.75, 81.5, 95.25
+/// (separator), 109 and 127 pt.
+const LEFT: [Slot; 7] = [
+    slot(Some(HeaderItem::Grid), 12.0, 10.625),
+    slot(Some(HeaderItem::ZoomOut), 10.625, 7.5),
+    slot(Some(HeaderItem::Zoom), 2.0, 28.25),
+    slot(Some(HeaderItem::ZoomIn), 10.5, 6.875),
+    slot(None, 6.875, 6.875),
+    slot(Some(HeaderItem::First), 6.875, 9.0),
+    slot(Some(HeaderItem::Prev), 9.0, 10.75),
+];
+
+/// The right cluster from the pane's right edge: anchors at 11 (•••), 34.25, 58.25, 81,
+/// 104.5, 120.75 (separator), 135 and 153 pt.
+const RIGHT: [Slot; 8] = [
+    slot(Some(HeaderItem::More), 11.0, 11.625),
+    slot(Some(HeaderItem::Pause), 11.625, 12.0),
+    slot(Some(HeaderItem::Window), 12.0, 11.375),
+    slot(Some(HeaderItem::Open), 11.375, 11.75),
+    slot(Some(HeaderItem::Lock), 11.75, 8.125),
+    slot(None, 8.125, 7.125),
+    slot(Some(HeaderItem::Last), 7.125, 9.0),
+    slot(Some(HeaderItem::Next), 9.0, 10.75),
+];
+
+/// A slot placed by [`pack`]: where its room starts, its anchor and where its room ends, as
+/// distances from the cluster's edge.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    item: Option<HeaderItem>,
+    near: f32,
+    at: f32,
+    far: f32,
+}
+
+/// Packs a cluster's items of rank `keep` and up towards its edge; a separator stays only
+/// between two of them.
+fn pack(slots: &[Slot], keep: u8) -> Vec<Placed> {
+    let shown = |s: &Slot| s.item.is_some_and(|i| i.rank() >= keep);
+    let mut out: Vec<Placed> = Vec::new();
+    let mut x = 0.0;
+    for (i, s) in slots.iter().enumerate() {
+        let on = match s.item {
+            Some(_) => shown(s),
+            None => slots.iter().take(i).any(shown) && slots.iter().skip(i + 1).any(shown),
+        };
+        if !on {
+            continue;
+        }
+        let lead = if out.is_empty() {
+            s.lead.max(EDGE)
+        } else {
+            s.lead
+        };
+        out.push(Placed {
+            item: s.item,
+            near: x,
+            at: x + lead,
+            far: x + lead + s.trail,
+        });
+        x += lead + s.trail;
+    }
+    out
+}
+
+/// How far a packed cluster reaches from its edge.
+fn reach(placed: &[Placed]) -> f32 {
+    placed.last().map_or(0.0, |p| p.far)
+}
+
+/// The PDF header laid out in a given width.
+#[derive(Debug)]
+struct HeaderLayout {
+    left: Vec<Placed>,
+    right: Vec<Placed>,
+    /// Items ranked below this are in the ••• menu instead.
+    keep: u8,
+}
+
+impl HeaderLayout {
+    /// Keeps as many items as fit in `width`, dropping the lowest ranks first.
+    fn new(width: f32) -> Self {
+        let mut keep = 0;
+        loop {
+            let (left, right) = (pack(&LEFT, keep), pack(&RIGHT, keep));
+            if keep > TOP_RANK || reach(&left) + reach(&right) <= width {
+                return Self { left, right, keep };
+            }
+            keep += 1;
+        }
+    }
+
+    fn shown(&self, item: HeaderItem) -> bool {
+        item.rank() >= self.keep
+    }
+
+    /// Where `item` is in a header spanning `pl..pr`: its room's left edge, its anchor and its
+    /// room's right edge; `None` when it is in the ••• menu.
+    fn place(&self, item: HeaderItem, pl: f32, pr: f32) -> Option<(f32, f32, f32)> {
+        let is = |p: &&Placed| p.item == Some(item);
+        self.left
+            .iter()
+            .find(is)
+            .map(|p| (pl + p.near, pl + p.at, pl + p.far))
+            .or_else(|| {
+                self.right
+                    .iter()
+                    .find(is)
+                    .map(|p| (pr - p.far, pr - p.at, pr - p.near))
+            })
+    }
+}
+
 fn header_bar(
     ui: &mut Ui,
     t: &Tokens,
@@ -902,31 +1096,50 @@ fn header_bar(
         Stroke::new(1.0, t.divider),
     );
     let (pl, pr, cy) = (header.left(), header.right(), header.center().y);
+    let layout = HeaderLayout::new(header.width());
+    let place = |item| layout.place(item, pl, pr);
+    // An item's own room around a `w`-wide box centred on `cx`: never into its neighbours'.
+    let room = |item, cx: f32, w: f32| {
+        place(item).map(|(x0, _, x1)| {
+            let r = Rect::from_center_size(pos2(cx, cy), vec2(w, 22.0));
+            Rect::from_x_y_ranges(r.left().max(x0)..=r.right().min(x1), r.y_range())
+        })
+    };
     let n = view.pages.len();
     let has = n > 0;
     let cur = view.current_page;
+    let last = n.saturating_sub(1);
     let run = |session: &mut Session, id: &str| {
         if let Err(e) = session.run(id, &serde_json::Value::Null) {
             session.set_status(e.to_string());
         }
     };
-    // A glyph button: (centre x, width, id, tooltip, enabled) → clicked.
-    let button = |cx: f32,
+    // Page navigation: (label, enabled, page it goes to).
+    let nav = |item| match item {
+        HeaderItem::First => (tr("First Page"), has && cur > 0, 0),
+        HeaderItem::Prev => (tr("Previous Page"), has && cur > 0, cur.saturating_sub(1)),
+        HeaderItem::Next => (tr("Next Page"), has && cur < last, (cur + 1).min(last)),
+        _ => (tr("Last Page"), has && cur < last, last),
+    };
+    // A glyph button `w` wide, unless the item is in the ••• menu → clicked.
+    let button = |item: HeaderItem,
                   w: f32,
-                  id: &str,
                   tip: &str,
                   enabled: bool,
                   draw: &dyn Fn(&egui::Painter, Rect, Color32)|
      -> bool {
-        let r = Rect::from_center_size(pos2(cx, cy), vec2(w + 6.0, 22.0));
+        let Some((_, cx, _)) = place(item) else {
+            return false;
+        };
+        let Some(r) = room(item, cx, w + 6.0) else {
+            return false;
+        };
         let sense = if enabled {
             Sense::click()
         } else {
             Sense::hover()
         };
-        let resp = ui
-            .interact(r, ui.id().with(("pdf-hdr", id)), sense)
-            .on_hover_text(tip);
+        let resp = ui.interact(r, item.id(), sense).on_hover_text(tip);
         if enabled && resp.hovered() {
             p.rect_filled(r, 5.0, t.row_hover);
         }
@@ -938,19 +1151,18 @@ fn header_bar(
         draw(&p, Rect::from_center_size(pos2(cx, cy), vec2(w, w)), c);
         resp.clicked()
     };
-    let sep = |x: f32| {
-        p.line_segment(
-            [pos2(x, cy - 8.75), pos2(x, cy + 8.75)],
-            Stroke::new(1.0, t.divider.gamma_multiply(0.8)),
-        )
-    };
+    for s in layout.left.iter().filter(|s| s.item.is_none()) {
+        sep(&p, t, pl + s.at, cy);
+    }
+    for s in layout.right.iter().filter(|s| s.item.is_none()) {
+        sep(&p, t, pr - s.at, cy);
+    }
 
     // ---- Left cluster.
     let thumbs = view.thumbnails;
     if button(
-        pl + 12.0,
+        HeaderItem::Grid,
         16.0,
-        "grid",
         tr("Page Thumbnails"),
         has,
         &|p, r, c| icons::grid_rounded(p, r, if thumbs { t.accent } else { c }),
@@ -958,127 +1170,100 @@ fn header_bar(
         view.thumbnails = !view.thumbnails;
     }
     if button(
-        pl + 33.25,
+        HeaderItem::ZoomOut,
         15.0,
-        "zoom-out",
         tr("Zoom Out (⌘−)"),
         has,
         &|p, r, c| icons::magnifier(p, r, c, Some('-')),
     ) {
         run(session, "pdf.zoomOut");
     }
-    let pct = p.layout_no_wrap(
-        format!("{zoom_pct:.0}%"),
-        egui::FontId::proportional(10.75),
-        t.pdf_icon,
-    );
-    let pct_rect = Rect::from_min_size(pos2(pl + 42.75, cy - pct.size().y / 2.0), pct.size());
-    let pct_resp = ui
-        .interact(
-            pct_rect.expand(3.0),
-            ui.id().with("pdf-pct"),
-            Sense::click(),
+    if let Some((_, x, _)) = place(HeaderItem::Zoom) {
+        let pct = p.layout_no_wrap(
+            format!("{zoom_pct:.0}%"),
+            egui::FontId::proportional(10.75),
+            t.pdf_icon,
+        );
+        let pct_rect = Rect::from_min_size(pos2(x, cy - pct.size().y / 2.0), pct.size());
+        let hit = room(
+            HeaderItem::Zoom,
+            pct_rect.center().x,
+            pct_rect.width() + 6.0,
         )
-        .on_hover_text(tr("Zoom"));
-    p.galley(pct_rect.min, pct, t.pdf_icon);
-    egui::Popup::from_toggle_button_response(&pct_resp)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-        .show(|ui| {
-            menu::begin(ui, 170.0);
-            for (label, z) in [
-                ("50%", 0.5),
-                ("75%", 0.75),
-                ("100%", 1.0),
-                ("125%", 1.25),
-                ("150%", 1.5),
-                ("200%", 2.0),
-                ("400%", 4.0),
-            ] {
-                let opts = menu::Item {
-                    checked: Some(session.view.zoom == Zoom::Fixed(z)),
-                    ..Default::default()
-                };
-                if menu::item(ui, t, label, opts).clicked() {
-                    session.view.zoom = Zoom::Fixed(z);
+        .unwrap_or(pct_rect);
+        let pct_resp = ui
+            .interact(hit, HeaderItem::Zoom.id(), Sense::click())
+            .on_hover_text(tr("Zoom"));
+        p.galley(pct_rect.min, pct, t.pdf_icon);
+        egui::Popup::from_toggle_button_response(&pct_resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                menu::begin(ui, 170.0);
+                for (label, z) in [
+                    ("50%", 0.5),
+                    ("75%", 0.75),
+                    ("100%", 1.0),
+                    ("125%", 1.25),
+                    ("150%", 1.5),
+                    ("200%", 2.0),
+                    ("400%", 4.0),
+                ] {
+                    let opts = menu::Item {
+                        checked: Some(session.view.zoom == Zoom::Fixed(z)),
+                        ..Default::default()
+                    };
+                    if menu::item(ui, t, label, opts).clicked() {
+                        session.view.zoom = Zoom::Fixed(z);
+                    }
                 }
-            }
-            menu::separator(ui, t);
-            for (zoom, label) in [
-                (Zoom::FitWidth, tr("Zoom to Fit Width")),
-                (Zoom::FitPage, tr("Zoom to Fit Page")),
-            ] {
-                let opts = menu::Item {
-                    checked: Some(session.view.zoom == zoom),
-                    ..Default::default()
-                };
-                if menu::item(ui, t, label, opts).clicked() {
-                    session.view.zoom = zoom;
+                menu::separator(ui, t);
+                for (zoom, label) in [
+                    (Zoom::FitWidth, tr("Zoom to Fit Width")),
+                    (Zoom::FitPage, tr("Zoom to Fit Page")),
+                ] {
+                    let opts = menu::Item {
+                        checked: Some(session.view.zoom == zoom),
+                        ..Default::default()
+                    };
+                    if menu::item(ui, t, label, opts).clicked() {
+                        session.view.zoom = zoom;
+                    }
                 }
-            }
-        });
+            });
+    }
     if button(
-        pl + 81.5,
+        HeaderItem::ZoomIn,
         15.0,
-        "zoom-in",
         tr("Zoom In (⌘+)"),
         has,
         &|p, r, c| icons::magnifier(p, r, c, Some('+')),
     ) {
         run(session, "pdf.zoomIn");
     }
-    sep(pl + 95.25);
     let mut target = None;
-    if button(
-        pl + 109.0,
-        17.0,
-        "first",
-        tr("First Page"),
-        has && cur > 0,
-        &|p, r, c| icons::chevron_double(p, r, c, false),
-    ) {
-        target = Some(0);
+    for (item, w, double, right) in [
+        (HeaderItem::First, 17.0, true, false),
+        (HeaderItem::Prev, 15.5, false, false),
+        (HeaderItem::Next, 15.5, false, true),
+        (HeaderItem::Last, 17.0, true, true),
+    ] {
+        let (tip, enabled, to) = nav(item);
+        if button(item, w, tip, enabled, &|p, r, c| {
+            if double {
+                icons::chevron_double(p, r, c, right)
+            } else {
+                icons::chevron_thin(p, r, c, right)
+            }
+        }) {
+            target = Some(to);
+        }
     }
-    if button(
-        pl + 127.0,
-        15.5,
-        "prev",
-        tr("Previous Page"),
-        has && cur > 0,
-        &|p, r, c| icons::chevron_thin(p, r, c, false),
-    ) {
-        target = Some(cur.saturating_sub(1));
-    }
+
     // ---- Right cluster (anchored to the right edge).
-    let last = n.saturating_sub(1);
-    if button(
-        pr - 153.0,
-        15.5,
-        "next",
-        tr("Next Page"),
-        has && cur < last,
-        &|p, r, c| icons::chevron_thin(p, r, c, true),
-    ) {
-        target = Some((cur + 1).min(last));
-    }
-    if button(
-        pr - 135.0,
-        17.0,
-        "last",
-        tr("Last Page"),
-        has && cur < last,
-        &|p, r, c| icons::chevron_double(p, r, c, true),
-    ) {
-        target = Some(last);
-    }
-    if let Some(p) = target {
-        view.goto_page = Some(p);
-    }
-    sep(pr - 120.75);
     let lock = session.view.scroll_lock;
     if button(
-        pr - 104.5,
+        HeaderItem::Lock,
         15.0,
-        "lock",
         tr("Scroll Lock: the PDF follows the editor"),
         true,
         &|p, r, c| icons::sync_lock(p, r, if lock { t.accent } else { c }),
@@ -1086,9 +1271,8 @@ fn header_bar(
         run(session, "pdf.scrollLock");
     }
     if button(
-        pr - 81.0,
+        HeaderItem::Open,
         15.0,
-        "open",
         tr("Open PDF in Default Viewer"),
         session.pdf.path.is_some(),
         &|p, r, c| icons::open_external(p, r, c),
@@ -1097,9 +1281,8 @@ fn header_bar(
     }
     let detached = view.window;
     if button(
-        pr - 58.25,
+        HeaderItem::Window,
         16.5,
-        "window",
         tr("Show the PDF in a Separate Window"),
         has,
         &|p, r, c| icons::windows_two(p, r, if detached { t.accent } else { c }),
@@ -1113,7 +1296,7 @@ fn header_bar(
     } else {
         tr("Pause Auto-Typeset")
     };
-    if button(pr - 34.25, 16.6, "pause", pause_tip, live, &|p, r, c| {
+    if button(HeaderItem::Pause, 16.6, pause_tip, live, &|p, r, c| {
         if paused {
             icons::play(p, r, t.accent)
         } else {
@@ -1122,20 +1305,77 @@ fn header_bar(
     }) {
         run(session, "typeset.pauseLive");
     }
-    let dots_r = Rect::from_center_size(pos2(pr - 11.0, cy), vec2(20.0, 22.0));
+    let dots_x = place(HeaderItem::More).map_or(pr - 11.0, |(_, x, _)| x);
+    let dots_r = room(HeaderItem::More, dots_x, 20.0)
+        .unwrap_or_else(|| Rect::from_center_size(pos2(dots_x, cy), vec2(20.0, 22.0)));
     let dots = ui
-        .interact(dots_r, ui.id().with("pdf-more"), Sense::click())
+        .interact(dots_r, HeaderItem::More.id(), Sense::click())
         .on_hover_text(tr("More"));
     if dots.hovered() {
         p.rect_filled(dots_r, 5.0, t.row_hover);
     }
     for k in [-1.0, 0.0, 1.0] {
-        p.circle_filled(pos2(pr - 11.25 + 6.25 * k, cy + 0.5), 1.5, t.pdf_icon);
+        p.circle_filled(pos2(dots_x - 0.25 + 6.25 * k, cy + 0.5), 1.5, t.pdf_icon);
     }
     egui::Popup::from_toggle_button_response(&dots)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             menu::begin(ui, 250.0);
+            // What the bar had no room for.
+            let hidden: Vec<HeaderItem> = HeaderItem::ALL
+                .into_iter()
+                .filter(|&i| !layout.shown(i))
+                .collect();
+            for &item in &hidden {
+                match item {
+                    HeaderItem::Grid | HeaderItem::Window => {
+                        let (label, on) = if item == HeaderItem::Grid {
+                            (tr("Page Thumbnails"), &mut view.thumbnails)
+                        } else {
+                            (tr("Show the PDF in a Separate Window"), &mut view.window)
+                        };
+                        let opts = menu::Item {
+                            checked: Some(*on),
+                            disabled: !has,
+                            ..Default::default()
+                        };
+                        if menu::item(ui, t, label, opts).clicked() {
+                            *on = !*on;
+                        }
+                    }
+                    HeaderItem::First | HeaderItem::Prev | HeaderItem::Next | HeaderItem::Last => {
+                        let (label, enabled, to) = nav(item);
+                        let opts = menu::Item {
+                            checked: Some(false),
+                            disabled: !enabled,
+                            ..Default::default()
+                        };
+                        if menu::item(ui, t, label, opts).clicked() {
+                            target = Some(to);
+                        }
+                    }
+                    HeaderItem::Zoom => {
+                        for id in ["pdf.fitWidth", "pdf.fitPage"] {
+                            menu::command(ui, t, session, id, None, true);
+                        }
+                    }
+                    HeaderItem::ZoomOut => {
+                        menu::command(ui, t, session, "pdf.zoomOut", None, true);
+                    }
+                    HeaderItem::ZoomIn => menu::command(ui, t, session, "pdf.zoomIn", None, true),
+                    HeaderItem::Lock => menu::command(ui, t, session, "pdf.scrollLock", None, true),
+                    HeaderItem::Open => {
+                        menu::command(ui, t, session, "pdf.openExternally", None, true);
+                    }
+                    HeaderItem::Pause => {
+                        menu::command(ui, t, session, "typeset.pauseLive", None, true);
+                    }
+                    HeaderItem::More => {}
+                }
+            }
+            if !hidden.is_empty() {
+                menu::separator(ui, t);
+            }
             menu::heading(ui, t, tr("Select Page Mode"));
             for id in [
                 "pdf.singleContinuous",
@@ -1159,16 +1399,20 @@ fn header_bar(
                 }
             }
         });
-    // ---- Page label, centred between the two clusters.
-    let left_end = pl + 131.0;
-    let right_start = pr - 161.0;
-    if has && right_start - left_end > 50.0 {
+    if let Some(p) = target {
+        view.goto_page = Some(p);
+    }
+    // ---- Page label, centred between the two clusters (elided first, before any button
+    // gives way).
+    let left_end = pl + reach(&layout.left);
+    let right_start = pr - reach(&layout.right);
+    if has && right_start - left_end >= 24.0 {
         let font = egui::FontId::proportional(10.75);
         let label = widgets::elide(
             &p,
             &trf!("Page {page} of {pages}", page = cur + 1, pages = n),
             &font,
-            right_start - left_end - 8.0,
+            right_start - left_end,
         );
         p.text(
             pos2((left_end + right_start) / 2.0, cy),
@@ -1178,6 +1422,14 @@ fn header_bar(
             t.jump_text,
         );
     }
+}
+
+/// A vertical hairline between two groups of header buttons.
+fn sep(p: &egui::Painter, t: &Tokens, x: f32, cy: f32) {
+    p.line_segment(
+        [pos2(x, cy - 8.75), pos2(x, cy + 8.75)],
+        Stroke::new(1.0, t.divider.gamma_multiply(0.8)),
+    );
 }
 
 impl PdfView {
@@ -1216,5 +1468,75 @@ mod tests {
         assert_eq!(&px[4..7], &[180, 180, 180]);
         // Red stays reddish.
         assert!(px[8] > px[9] && px[8] > px[10]);
+    }
+
+    /// The header keeps its measured positions while everything fits; narrower, the lowest
+    /// ranks go into the ••• menu and what stays never overlaps or leaves the pane.
+    #[test]
+    fn header_items_give_way_by_rank() {
+        let full = HeaderLayout::new(400.0);
+        assert_eq!(full.keep, 0, "everything fits");
+        let at = |item| full.place(item, 0.0, 400.0).map(|(_, x, _)| x);
+        for (item, x) in [
+            (HeaderItem::Grid, 12.0),
+            (HeaderItem::ZoomOut, 33.25),
+            (HeaderItem::Zoom, 42.75),
+            (HeaderItem::ZoomIn, 81.5),
+            (HeaderItem::First, 109.0),
+            (HeaderItem::Prev, 127.0),
+            (HeaderItem::Next, 400.0 - 153.0),
+            (HeaderItem::Last, 400.0 - 135.0),
+            (HeaderItem::Lock, 400.0 - 104.5),
+            (HeaderItem::Open, 400.0 - 81.0),
+            (HeaderItem::Window, 400.0 - 58.25),
+            (HeaderItem::Pause, 400.0 - 34.25),
+            (HeaderItem::More, 400.0 - 11.0),
+        ] {
+            assert_eq!(at(item), Some(x), "{item:?}");
+        }
+        let mut keep = 0;
+        for w in (0..=400).map(|w| w as f32) {
+            let l = HeaderLayout::new(w);
+            let mut slots: Vec<(f32, f32)> = (l.left.iter().map(|p| (p.near, p.far)))
+                .chain(l.right.iter().map(|p| (w - p.far, w - p.near)))
+                .collect();
+            slots.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for pair in slots.windows(2) {
+                assert!(pair[0].1 <= pair[1].0, "{w}: {pair:?} overlap");
+            }
+            if l.keep <= TOP_RANK {
+                assert!(
+                    slots.iter().all(|s| s.0 >= 0.0 && s.1 <= w),
+                    "{w}: {slots:?}"
+                );
+            }
+            // Widening never hides anything.
+            assert!(l.keep <= keep || w == 0.0, "{w}");
+            keep = l.keep;
+            assert!(l.shown(HeaderItem::More));
+            for item in HeaderItem::ALL {
+                assert_eq!(
+                    l.place(item, 0.0, w).is_some(),
+                    l.shown(item),
+                    "{w} {item:?}"
+                );
+            }
+        }
+        // About 140 pt (an 880 pt window with the sidebar and the Assistant open): the zoom
+        // percentage and the page arrows stay, the rest is in the ••• menu.
+        let narrow = HeaderLayout::new(140.0);
+        let shown: Vec<HeaderItem> = HeaderItem::ALL
+            .into_iter()
+            .filter(|&i| narrow.shown(i))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                HeaderItem::Zoom,
+                HeaderItem::Prev,
+                HeaderItem::Next,
+                HeaderItem::More
+            ]
+        );
     }
 }

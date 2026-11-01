@@ -1044,3 +1044,27 @@ the welcome-window and update-window bugs; what landed:
 - Open: the card is plain text (no Markdown rendering for Explain's answer); one result at a time
   (a new action replaces it); actions have no shortcuts; the card's Try Again gives one answer at
   a time (no ‹ › through earlier ones as Writing Tools has).
+
+## Editor and PDF headers fit narrow panes (2026-11-01)
+
+- In an 880 pt window with the sidebar and the Assistant open (editor and PDF about 140 pt
+  each) the header glyphs drew over each other: "100%" on the zoom buttons, the page arrows
+  into the pause button, the file name under √x.
+- PDF header (`pdf_view::HeaderLayout`): each item owns a slot reaching halfway to its
+  neighbours, so the measured positions are unchanged at full width (≥ 302 pt) and hit and
+  hover rects never overlap. The page label is elided first ("Pag…", as in Texifier). After
+  that, buttons move into the ••• menu, lowest rank first: Open in Default Viewer, Separate
+  Window, First/Last, Thumbnails, Scroll Lock, Zoom −/+, Pause, Previous/Next, then the zoom
+  percentage. ••• always stays, a separator only shows between two shown items, and the
+  menu lists the moved buttons above Select Page Mode. At 140 pt the bar shows
+  `100% | ‹ › | •••`.
+- Editor jump bar: the root's part (`main.tex ›`) goes first, then the file name is elided,
+  then the icon. The AI suggestion button, then √x, give way only when the file icon no
+  longer fits beside them.
+- Tests: `header_items_give_way_by_rank` (every width 0–400 pt: slots disjoint and inside the
+  pane, measured anchors at full width, nothing hides as the pane widens) and
+  `narrow_panes_keep_header_items_apart` (the whole window at 880 and 1388 pt with a real PDF
+  and a root › file path: header buttons disjoint and inside their panes, drawn texts touch
+  no other button). With the dropping turned off, both fail. Dev app at 880/1040/1388 pt and
+  with the ••• menu open, in English and zh-Hans.
+- Open: Texifier's behaviour below "Pag…" isn't documented, so the drop order is our own call.

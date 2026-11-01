@@ -1135,6 +1135,150 @@ mod tests {
         assert_eq!(long, ai_panel::MODEL_MENU_MAX);
     }
 
+    /// In a narrow window (880 pt with the sidebar and the Assistant open: editor and PDF about
+    /// 140 pt each) the header bars keep their buttons and labels apart: what doesn't fit is
+    /// elided, or in the PDF header's ••• menu. At a normal width everything shows.
+    #[test]
+    fn narrow_panes_keep_header_items_apart() {
+        use pdf_view::HeaderItem;
+        let dir = std::env::temp_dir().join(format!("texcraft-ui-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.tex"),
+            "\\documentclass{article}\n\\begin{document}\n\\input{chapter-one}\n\\end{document}\n",
+        )
+        .unwrap();
+        let chapter = dir.join("chapter-one.tex");
+        std::fs::write(&chapter, "% !TEX root = main.tex\nText.\n").unwrap();
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.update.url = "/nonexistent/texcraft-latest.json".into();
+        session.open_path(&dir.join("main.tex")).unwrap();
+        session.open_path(&chapter).unwrap();
+        // Edited: the longest name the jump bar shows.
+        session
+            .run(
+                "edit.setText",
+                &serde_json::json!({"text": "% !TEX root = main.tex\nMore.\n"}),
+            )
+            .unwrap();
+        session.view.sidebar = true;
+        session.view.assistant = true;
+        session.show_pdf(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../pdf/tests/data/select-en.pdf"),
+        );
+        let frame = |bench: &mut Workbench, session: &mut Session, width: f32| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 600.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| bench.ui(ui, session));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        // The PDF opens on the render thread.
+        for _ in 0..500 {
+            frame(&mut bench, &mut session, 880.0);
+            if bench.pdf.page_count() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(bench.pdf.page_count() > 0, "the PDF opened");
+        let panel = |id: &str| {
+            let Some(state) = egui::PanelState::load(&ctx, egui::Id::new(id)) else {
+                panic!("no {id} panel");
+            };
+            state.outer_rect
+        };
+        for (width, all) in [(880.0, false), (1388.0, true)] {
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = frame(&mut bench, &mut session, width);
+            }
+            // The header bars: between the side panels, one header high under the toolbar
+            // and tab bar.
+            let top = TOOLBAR_HEIGHT + HEADER_HEIGHT;
+            let band = Rect::from_x_y_ranges(
+                panel("sidebar").right()..=panel("assistant").left(),
+                top..=top + HEADER_HEIGHT,
+            );
+            let mut buttons: Vec<(String, Rect)> = Vec::new();
+            for item in HeaderItem::ALL {
+                if let Some(r) = ctx.read_response(item.id()) {
+                    buttons.push((format!("{item:?}"), r.rect));
+                } else {
+                    assert!(!all, "{width}: {item:?} in the bar");
+                }
+            }
+            for id in ["ai-inline-button", "symbols-button"] {
+                let Some(r) = ctx.read_response(egui::Id::new(id)) else {
+                    panic!("{width}: no {id}");
+                };
+                buttons.push((id.into(), r.rect));
+            }
+            assert!(
+                ctx.read_response(HeaderItem::Open.id()).is_some() == all,
+                "{width}: Open PDF in Default Viewer in the ••• menu when narrow"
+            );
+            // Texts drawn in the bars (file names, page label, zoom, √x), clipped as drawn.
+            let texts: Vec<(String, Rect)> = shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(s) => Some((
+                        s.galley.text().to_string(),
+                        s.visual_bounding_rect().intersect(c.clip_rect),
+                    )),
+                    _ => None,
+                })
+                .filter(|(_, r)| r.is_positive() && band.contains_rect(r.shrink(0.5)))
+                .collect();
+            assert!(
+                texts.iter().any(|(s, _)| s.starts_with("chapt")),
+                "{width}: the file name shows ({texts:?})"
+            );
+            if all {
+                for label in ["main.tex", "chapter-one.tex — Edited", "Page 1 of 1"] {
+                    assert!(
+                        texts.iter().any(|(s, _)| s == label),
+                        "{width}: {label} ({texts:?})"
+                    );
+                }
+            }
+            // Sharing an edge is fine; covering any area is not.
+            let overlap = |a: &Rect, b: &Rect| a.intersect(*b).is_positive();
+            for (name, r) in &buttons {
+                assert!(
+                    band.contains_rect(*r),
+                    "{width}: {name} {r:?} outside {band:?}"
+                );
+            }
+            for (i, (a, ra)) in buttons.iter().enumerate() {
+                for (b, rb) in buttons.iter().skip(i + 1) {
+                    assert!(!overlap(ra, rb), "{width}: {a} {ra:?} overlaps {b} {rb:?}");
+                }
+            }
+            for (i, (a, ra)) in texts.iter().enumerate() {
+                // A button's own label lies inside it; nothing else may touch it.
+                for (b, rb) in &buttons {
+                    assert!(
+                        rb.contains_rect(*ra) || !overlap(ra, rb),
+                        "{width}: {a:?} {ra:?} runs into {b} {rb:?}"
+                    );
+                }
+                for (b, rb) in texts.iter().skip(i + 1) {
+                    assert!(!overlap(ra, rb), "{width}: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The main window comes forward for a dialog or a new document raised while another of the
     /// app's windows is in front, and at launch while it waits hidden behind the welcome window.
     #[test]

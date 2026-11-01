@@ -715,67 +715,102 @@ fn jump_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
     let root = session.root_path();
     let cy = header.center().y;
     let font = egui::FontId::proportional(11.75);
-    let mut x = header.left() + 10.0;
+    // The buttons stay while the file's icon still fits beside them: the AI suggestion button
+    // goes first, √x last.
+    let path_left = header.left() + 10.0;
+    let fits = |right: f32| right - PATH_GAP - path_left >= ICON_ROOM;
+    let inline = inline_button(header);
+    let show_inline = fits(inline.left());
+    let symbols = symbols_button(header);
+    let show_symbols = fits(symbols.left());
+    let path_right = if show_inline {
+        inline.left()
+    } else if show_symbols {
+        symbols.left()
+    } else {
+        header.right()
+    } - PATH_GAP;
+
+    // The path: root › file. When it doesn't fit, the root's part goes, then the file name
+    // is elided, then the icon goes.
+    let mut x = path_left;
     let is_root = root.as_deref() == doc.typeset_path();
-    if let Some(root) = root.as_ref().filter(|_| !is_root) {
-        icons::tex_document(
-            p,
-            Rect::from_min_size(pos(x, cy - 8.0), vec2(12.0, 16.0)),
-            t.jump_text,
-        );
-        x += 17.5;
-        let root_name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let g = p.layout_no_wrap(root_name, font.clone(), t.jump_text);
-        let w = g.size().x;
-        p.galley(pos(x, cy - g.size().y / 2.0), g, t.jump_text);
-        x += w + 5.0;
-        icons::chevron_thin(
-            p,
-            Rect::from_min_size(pos(x, cy - 6.0), vec2(8.0, 12.0)),
-            t.jump_text,
-            true,
-        );
-        x += 13.0;
-    }
-    icons::tex_document(
-        p,
-        Rect::from_min_size(pos(x, cy - 8.0), vec2(12.0, 16.0)),
-        t.jump_text,
-    );
-    x += 17.5;
     let dirty = doc.is_dirty() && !doc.is_pristine() && doc.path.is_some();
     let label = if dirty {
         trf!("{name} — Edited", name = name)
     } else {
         name
     };
-    let g = p.layout_no_wrap(label, font, t.jump_text);
-    p.galley(pos(x, cy - g.size().y / 2.0), g, t.jump_text);
-
-    // A divider between the AI suggestion button and √x (symbols).
-    let sep_x = header.right() - 35.0;
-    p.line_segment(
-        [pos(sep_x, cy - 8.0), pos(sep_x, cy + 8.0)],
-        Stroke::new(1.0, t.divider.gamma_multiply(0.8)),
-    );
-    let mut open = st.inline_open;
-    crate::ai_inline::header_button(ui, t, session, &mut open, inline_button(header));
-    if open && !st.inline_open {
-        st.symbols_open = false;
+    let label_w = p
+        .layout_no_wrap(label.clone(), font.clone(), t.jump_text)
+        .size()
+        .x;
+    if let Some(root) = root.as_ref().filter(|_| !is_root) {
+        let root_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let g = p.layout_no_wrap(root_name, font.clone(), t.jump_text);
+        let w = g.size().x;
+        if x + ICON_ROOM + w + 18.0 + ICON_ROOM + label_w <= path_right {
+            icons::tex_document(
+                p,
+                Rect::from_min_size(pos(x, cy - 8.0), vec2(12.0, 16.0)),
+                t.jump_text,
+            );
+            x += ICON_ROOM;
+            p.galley(pos(x, cy - g.size().y / 2.0), g, t.jump_text);
+            x += w + 5.0;
+            icons::chevron_thin(
+                p,
+                Rect::from_min_size(pos(x, cy - 6.0), vec2(8.0, 12.0)),
+                t.jump_text,
+                true,
+            );
+            x += 13.0;
+        }
     }
-    st.inline_open = open;
-    let br = Rect::from_center_size(pos(header.right() - 17.5, cy), vec2(26.0, 20.0));
+    if x + 12.0 <= path_right {
+        icons::tex_document(
+            p,
+            Rect::from_min_size(pos(x, cy - 8.0), vec2(12.0, 16.0)),
+            t.jump_text,
+        );
+    }
+    x += ICON_ROOM;
+    let label = widgets::elide(p, &label, &font, path_right - x);
+    if label != "…" {
+        let g = p.layout_no_wrap(label, font, t.jump_text);
+        p.galley(pos(x, cy - g.size().y / 2.0), g, t.jump_text);
+    }
+
+    if show_inline {
+        // A divider between the AI suggestion button and √x (symbols).
+        let sep_x = header.right() - 35.0;
+        p.line_segment(
+            [pos(sep_x, cy - 8.0), pos(sep_x, cy + 8.0)],
+            Stroke::new(1.0, t.divider.gamma_multiply(0.8)),
+        );
+        let mut open = st.inline_open;
+        crate::ai_inline::header_button(ui, t, session, &mut open, inline);
+        if open && !st.inline_open {
+            st.symbols_open = false;
+        }
+        st.inline_open = open;
+    } else {
+        st.inline_open = false;
+    }
+    if !show_symbols {
+        return;
+    }
     let resp = ui
-        .interact(br, Id::new("symbols-button"), Sense::click())
+        .interact(symbols, Id::new("symbols-button"), Sense::click())
         .on_hover_text(tr("Symbols"));
     if st.symbols_open || resp.hovered() {
-        ui.painter().rect_filled(br, 4.0, t.row_hover);
+        ui.painter().rect_filled(symbols, 4.0, t.row_hover);
     }
     ui.painter().text(
-        br.center(),
+        symbols.center(),
         egui::Align2::CENTER_CENTER,
         "√x",
         egui::FontId::proportional(14.0),
@@ -790,10 +825,23 @@ fn jump_bar(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorState
     }
 }
 
+/// The room a file icon takes in the editor header, with the gap after it.
+const ICON_ROOM: f32 = 17.5;
+/// The least gap between the editor header's path and its buttons.
+const PATH_GAP: f32 = 6.0;
+
 /// Where the AI suggestion button sits in the header (left of √x).
 fn inline_button(header: Rect) -> Rect {
     Rect::from_center_size(
         pos(header.right() - 52.5, header.center().y),
+        vec2(26.0, 20.0),
+    )
+}
+
+/// Where √x (the symbols popover) sits in the header, at its right end.
+fn symbols_button(header: Rect) -> Rect {
+    Rect::from_center_size(
+        pos(header.right() - 17.5, header.center().y),
         vec2(26.0, 20.0),
     )
 }
