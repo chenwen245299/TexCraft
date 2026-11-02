@@ -138,6 +138,14 @@ impl Rig {
         self.session.typeset.queued = true;
         self.session.typeset.quit = QuitTypeset::Running(Vec::new());
         seen.push(("typesetting before quitting".to_string(), self.frames()));
+        self.session.typeset.quit = QuitTypeset::Failed {
+            root: "main.tex".into(),
+            message: tr_in(self.session.lang(), "Typesetting stopped").into(),
+        };
+        seen.push((
+            "failed typesetting before quitting".to_string(),
+            self.frames(),
+        ));
         self.session.typeset.quit = QuitTypeset::Idle;
         self.session.typeset.queued = false;
         seen
@@ -197,4 +205,19 @@ fn english_shows_no_chinese() {
             "{surface}: Chinese in the English interface:\n{text}"
         );
     }
+}
+
+#[test]
+fn an_exit_failure_created_in_english_is_translated_after_switching_to_chinese() {
+    let _zh = scoped(Lang::ZhHans);
+    let mut rig = Rig::new(LanguageChoice::ChineseSimplified);
+    let reason = "The full typeset did not produce a PDF without errors.";
+    rig.session.typeset.quit = QuitTypeset::Failed {
+        root: "main.tex".into(),
+        message: reason.into(),
+    };
+    let text = rig.frames();
+    assert!(text.contains(tr_in(Lang::ZhHans, reason)));
+    assert!(!text.contains(reason));
+    assert!(!text.contains("Quit Now"));
 }

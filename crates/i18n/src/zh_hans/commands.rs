@@ -180,7 +180,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Welcome Window", "欢迎窗口"),
     // Help
     ("Keyboard Shortcuts", "键盘快捷键"),
-    // Typesetting before quitting (LIVE mode)
-    ("Quit Now", "立即退出"),
+    // Typesetting before quitting
+    ("Retry Typesetting", "重新编译"),
     ("Don't Quit", "不退出"),
 ];

@@ -223,7 +223,12 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Grade Entire Viewer Output", "为整个查看器输出调色"),
     ("No Grading", "不调色"),
     ("Page {page} of {pages}", "第 {page} 页，共 {pages} 页"),
-    // Typesetting before quitting (LIVE mode)
+    // Typesetting before quitting
+    ("PDF could not be updated", "无法更新 PDF"),
+    (
+        "TexCraft will stay open because the PDF for “{name}” may be out of date. {detail}",
+        "“{name}”的 PDF 可能不是最新版本，TexCraft 将保持打开。{detail}",
+    ),
     ("Typesetting before quitting…", "退出前正在排版…"),
     (
         "TexCraft typesets “{name}” so that the PDF beside it has your latest changes.",

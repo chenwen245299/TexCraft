@@ -27,6 +27,7 @@ Replies: `{"id": 1, "ok": true, "result": …}` or `{"id": 1, "ok": false, "erro
 | `editor.getText` | — | the active document's text |
 | `ui.key` | `{text}` or `{key, command?, shift?, alt?, ctrl?}` (egui key names) | types into the focused widget |
 | `ui.fullscreen` | `{on?}` | enters or leaves full screen (toggles without `on`) the way the green window button does (AppKit's `toggleFullScreen:` on macOS); returns `{was, on}` |
+| `ui.close` | `{source?: window\|application}` | sends the actual native red-button (`window`, default) or Dock-Quit (`application`, AppKit `terminate:`) action; both go through save prompts and the final full-build gate; returns `{source, native}` |
 | `ui.pointer` | `{x, y, click?, command?}` (points; `click` `"primary"` or `"secondary"`; `command: true` holds ⌘) | moves the pointer there (hover) and optionally clicks: menus, context menus, tooltips, ⌘-click inverse search in the PDF |
 | `ui.drag` | `{from: [x, y], to: [x, y], steps?}` (points) | presses at `from`, moves to `to` over `steps` frames (default 8), releases: dividers, sliders, text selection |
 | `ui.wait` | `{frames}` | returns after that many frames |
@@ -49,9 +50,17 @@ glyph range and highlight boxes in PDF points), `typeset.revealIssue {index}`, `
 reveal, copyPath, rename `{path, name}`, duplicate, trash, newFolder/newFile `{dir}`), `git.*`
 (refresh, init, stage/unstage/discard `{path}`, stageAll, unstageAll, commit `{message?}`, pull,
 push, fetch, diff `{path, staged?}`), `ai.*` (send `{text?}`, stop, clear, insert/copy `{index}`,
-selectModel `{provider, model}`, inline.toggle, inline.trigger (⌥\\), inline.accept (Tab), inline.acceptSentence (⌘→), inline.acceptWord, attachImage `{path}` (PNG/JPEG/GIF/WebP, models with Vision), removeImage `{index}`, inline.dismiss, inline.settings, toggleDocument, settings). `state.inspect` reports `typeset.mode`,
-`git` (branch, staged, changes, busy, error) and `ai` (providers with `hasKey` only — API keys are
-never reported — model, messages). `commands.list` documents the rest.
+selectModel `{provider, model}`, inline.toggle, inline.trigger (⌥\\), inline.accept (Tab), inline.acceptSentence (⌘→), inline.acceptWord, attachImage `{path}` (PNG/JPEG/GIF/WebP, models with Vision), removeImage `{index}`, inline.dismiss, inline.settings, toggleDocument, settings). `state.inspect` reports `typeset.mode`;
+its `ui.welcome` reports `launch` (the welcome window is the only window) and `mainHidden`
+(the editor window is hidden behind it). `git` reports branch, staged, changes, busy and error;
+`ai` reports providers with `hasKey` only — API keys are never reported — plus model and
+messages. `commands.list` documents the rest.
+
+`typeset.quitting` covers both the running exit rebuild and a failed exit waiting for action.
+`typeset.quitError` is `null` or `{root, message}`. `app.retryQuit` retries a failed exit;
+`app.cancelQuit` keeps the app open. Every successful exit rebuild publishes the final PDF
+before the process closes. `ui.nativeQuitRouting` reports whether the macOS Dock/Apple-event
+interception is installed.
 
 ## Languages
 

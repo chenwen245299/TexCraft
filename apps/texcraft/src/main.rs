@@ -9,6 +9,8 @@
 mod control;
 #[cfg(target_os = "macos")]
 mod menu;
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +33,9 @@ struct Persisted {
     /// Bumped when defaults change in a way saved settings should pick up.
     #[serde(default)]
     version: u32,
+    /// None is the legacy format, which only had a recent-documents list.
+    #[serde(default)]
+    workspace: Option<texcraft_engine::workspace::Workspace>,
 }
 
 /// Current [`Persisted::version`]. 1: live preview starts on the first keystroke (no delay).
@@ -50,6 +55,36 @@ struct Options {
     lang: Option<LanguageChoice>,
     welcome: bool,
     commands: Vec<String>,
+}
+
+/// Explicit launch paths take precedence over session restoration. Older installs have no
+/// workspace yet: reopen their most recent existing project once, then save the new format.
+fn open_startup(
+    session: &mut Session,
+    opts: &Options,
+    saved: Option<&texcraft_engine::workspace::Workspace>,
+) {
+    let errors = if !opts.paths.is_empty() {
+        opts.paths
+            .iter()
+            .filter_map(|p| session.open_path(p).err())
+            .collect::<Vec<_>>()
+    } else if let Some(workspace) = saved {
+        session.restore_workspace(workspace)
+    } else if let Some(path) = session.recent.iter().find(|p| p.exists()).cloned() {
+        session.open_path(&path).err().into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    if !errors.is_empty() {
+        session.set_status(
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -149,6 +184,8 @@ struct App {
     #[cfg(target_os = "macos")]
     menu: Option<menu::NativeMenu>,
     started: Instant,
+    /// Dock/Apple-event Quit is routed through the same close gate as the red window button.
+    native_quit_routing: bool,
 }
 
 impl App {
@@ -158,7 +195,11 @@ impl App {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint()) as Arc<dyn Fn() + Send + Sync>
         };
-        let mut session = Session::new(waker);
+        let mut session = Session::empty(waker);
+        let quit_ctx = ctx.clone();
+        let native_quit_routing = texcraft_macos::route_quit_requests(Arc::new(move || {
+            quit_ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Close);
+        }));
         // The Language setting's System choice follows these.
         session.system_languages = texcraft_macos::preferred_languages();
         if session.system_languages.is_empty() {
@@ -184,10 +225,12 @@ impl App {
             session.update.url = url;
         }
         let mut bench = Workbench::new(&ctx);
+        let mut workspace = None;
         if let Some(p) = cc
             .storage
             .and_then(|s| eframe::get_value::<Persisted>(s, STORAGE_KEY))
         {
+            workspace = p.workspace;
             if let Some(v) = p.view {
                 session.view = v;
             }
@@ -216,19 +259,19 @@ impl App {
         }
         // Before anything shows text: the menu bar, the welcome window, status messages.
         texcraft_i18n::set_language(session.lang());
-        let mut opened = false;
-        for p in &opts.paths {
-            match session.open_path(p) {
-                Ok(_) => opened = true,
-                Err(e) => session.set_status(e.to_string()),
-            }
-        }
-        if opened {
+        open_startup(&mut session, &opts, workspace.as_ref());
+        if session.root_path().is_some() {
             // Typeset right away so the PDF appears (like opening a project in the target app).
             if let Err(e) = session.typeset() {
                 session.set_status(e.to_string());
             }
-        } else if opts.welcome && session.view.show_welcome && opts.screenshot.is_none() {
+        } else if session.docs.is_empty()
+            && session.project_dir.is_none()
+            && session.pdf.path.is_none()
+            && opts.welcome
+            && session.view.show_welcome
+            && opts.screenshot.is_none()
+        {
             bench.welcome.show_window(true);
         }
         for id in &opts.commands {
@@ -272,6 +315,7 @@ impl App {
         };
 
         Self {
+            native_quit_routing,
             session,
             bench,
             control,
@@ -337,11 +381,14 @@ impl App {
                         .pick_files()
                     {
                         for p in paths {
-                            if let Err(e) = self.session.open_path(&p) {
-                                self.bench.dialog = texcraft_ui::dialogs::Dialog::Alert {
-                                    title: tr("Cannot open").into(),
-                                    message: e.to_string(),
-                                };
+                            match self.session.open_path(&p) {
+                                Ok(_) => self.bench.document_opened(ctx),
+                                Err(e) => {
+                                    self.bench.dialog = texcraft_ui::dialogs::Dialog::Alert {
+                                        title: tr("Cannot open").into(),
+                                        message: e.to_string(),
+                                    }
+                                }
                             }
                         }
                         // No PDF for what was opened (another document's gave way): typeset it.
@@ -354,8 +401,12 @@ impl App {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         if let Err(e) = self.session.open_path(&dir) {
                             self.session.set_status(e.to_string());
-                        } else if self.session.pdf.path.is_none() {
-                            let _ = self.session.typeset();
+                        } else {
+                            self.bench.document_opened(ctx);
+                            if self.session.root_path().is_some() && self.session.pdf.path.is_none()
+                            {
+                                let _ = self.session.typeset();
+                            }
                         }
                     }
                 }
@@ -468,9 +519,10 @@ impl App {
                         "monitorSize": ctx.input(|i| i.viewport().monitor_size.map(|s| [s.x, s.y])),
                         "trafficLights": texcraft_macos::traffic_light_frames(frame),
                         "windows": texcraft_macos::windows(),
-                        "welcome": { "open": self.bench.welcome.open, "glass": self.bench.welcome.glass() },
+                        "welcome": { "open": self.bench.welcome.open, "launch": self.bench.welcome.launch, "mainHidden": self.bench.main_hidden(), "glass": self.bench.welcome.glass() },
                         "modelPicker": self.bench.prefs.model_picker_info(),
                         "updateWindow": self.bench.update_window,
+                        "nativeQuitRouting": self.native_quit_routing,
                         // Why the last frame asked for another one (idle CPU diagnostics).
                         "repaintCauses": ctx.repaint_causes().iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
                         "completion": self.bench.editor.completion.as_ref().map(|c| c.items.iter().take(10).map(|i| i.label.clone()).collect::<Vec<_>>()),
@@ -497,6 +549,22 @@ impl App {
                     });
                     ctx.request_repaint();
                     continue;
+                }
+                "ui.close" => {
+                    let source = p.params.get("source").and_then(Value::as_str).unwrap_or("window");
+                    if !matches!(source, "window" | "application") {
+                        Err("unknown ui.close source (window or application)".into())
+                    } else {
+                        let native = if source == "window" {
+                            texcraft_macos::close_window(frame)
+                        } else {
+                            texcraft_macos::request_application_quit()
+                        };
+                        if !native {
+                            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Close);
+                        }
+                        Ok(json!({"source": source, "native": native}))
+                    }
                 }
                 "ui.welcome" => {
                     // {open?: bool, inline?: bool, leftTab?: n, rightTab?: n}
@@ -985,14 +1053,14 @@ impl eframe::App for App {
         self.handle_control(&ctx, frame);
         self.apply_language(&ctx);
 
-        // Closing with unsaved changes: ask first. Then, in LIVE mode, typeset the projects
-        // edited since their last full typeset (the session closes the window when done).
+        // All exit sources (red button, Dock, menu, shortcuts and control) arrive here.
+        // Ask about unsaved changes, then rebuild and publish every project's PDF before exit.
         if ctx.input(|i| i.viewport().close_requested()) {
             if let Some(i) = self
                 .session
                 .docs
                 .iter()
-                .position(|d| d.is_dirty() && d.path.is_some())
+                .position(|d| d.is_dirty() && !d.is_pristine())
             {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.session.active = i;
@@ -1043,6 +1111,7 @@ impl eframe::App for App {
             recent: self.session.recent.clone(),
             split: Some(self.bench.split),
             version: PERSISTED_VERSION,
+            workspace: Some(self.session.workspace()),
         };
         eframe::set_value(storage, STORAGE_KEY, &p);
     }

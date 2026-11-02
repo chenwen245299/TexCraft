@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds and starts a TexCraft for testing, isolated from your own settings and recent files
-# (its HOME is /tmp/texcraft-dev/home), with the control channel on $TEXCRAFT_PORT (47900).
+# (its HOME is $TEXCRAFT_DEV_DIR/home, default /tmp/texcraft-dev), with the control channel
+# on $TEXCRAFT_PORT (47900).
 #
 #   scripts/parity/run-dev-app.sh [FILE_OR_FOLDER] [extra texcraft options]
 #   scripts/parity/tc.py state.inspect '{}'
@@ -9,7 +10,7 @@
 # It refuses to replace a running instance that has unsaved documents (TEXCRAFT_DEV_FORCE=1 does).
 set -eu
 cd "$(dirname "$0")/../.."
-DEV=/tmp/texcraft-dev
+DEV="${TEXCRAFT_DEV_DIR:-/tmp/texcraft-dev}"
 PORT="${TEXCRAFT_PORT:-47900}"
 mkdir -p "$DEV/home"
 [ -f "$DEV/token" ] || (head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DEV/token")
@@ -18,7 +19,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 # Never throw away unsaved work: a running instance with unsaved documents (someone may be using
 # it) is left alone. TEXCRAFT_DEV_FORCE=1 restarts it anyway.
 if [ "${TEXCRAFT_DEV_FORCE:-}" != 1 ] && pgrep -f "$DEV/token" >/dev/null 2>&1 &&
-  python3 -I scripts/parity/tc.py state.inspect '{}' 2>/dev/null | grep -q '"dirty": true'; then
+  TEXCRAFT_TOKEN_FILE="$DEV/token" python3 -I scripts/parity/tc.py state.inspect '{}' 2>/dev/null | grep -q '"dirty": true'; then
   echo "run-dev-app: the running TexCraft has unsaved documents; save them first" >&2
   echo "  (or TEXCRAFT_DEV_FORCE=1 to discard them)." >&2
   exit 1

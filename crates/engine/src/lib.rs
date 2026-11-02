@@ -31,6 +31,7 @@ pub mod inline;
 pub mod live;
 pub mod sync;
 pub mod update;
+pub mod workspace;
 
 pub use commands::{CommandSpec, Shortcut, registry};
 pub use edit::Selection;
@@ -612,8 +613,8 @@ pub struct TypesetState {
     /// When the last run finished.
     pub finished_at: Option<std::time::SystemTime>,
     /// Projects (their root files) edited since their last full typeset, with when the first
-    /// such edit was made. In LIVE mode TexCraft typesets them now and then and before quitting
-    /// (see [`full`]).
+    /// such edit was made. LIVE mode refreshes them periodically; every exit rebuilds all open
+    /// projects plus these edited projects even if their tabs were closed (see [`full`]).
     pub stale: Vec<(PathBuf, Instant)>,
     /// When a document was last edited.
     pub last_edit_at: Option<Instant>,
@@ -760,7 +761,15 @@ impl Session {
     /// A new session with one untitled document. `waker` is called from background threads when
     /// something changed (request a repaint).
     pub fn new(waker: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let mut s = Self {
+        let mut s = Self::empty(waker);
+        s.new_untitled(texcraft_project::templates::TEMPLATES[1].source.to_string());
+        s
+    }
+
+    /// An empty session for application startup. A document is created only by an explicit
+    /// New command, opening a file, or restoring the saved workspace.
+    pub fn empty(waker: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
             docs: Vec::new(),
             active: 0,
             project_dir: None,
@@ -788,9 +797,7 @@ impl Session {
             trash: files::system_trash,
             system_languages: Vec::new(),
             waker,
-        };
-        s.new_untitled(texcraft_project::templates::TEMPLATES[1].source.to_string());
-        s
+        }
     }
 
     /// Runs command `id` with JSON `params` (use `serde_json::Value::Null` for none).
@@ -1066,25 +1073,35 @@ impl Session {
 
     /// Closes document `idx` without asking.
     pub fn close(&mut self, idx: usize) {
-        if idx < self.docs.len() {
-            self.docs.remove(idx);
+        if idx >= self.docs.len() {
+            return;
+        }
+        self.docs.remove(idx);
+        if idx < self.active {
+            self.active = self.active.saturating_sub(1);
         }
         if self.docs.is_empty() {
-            self.new_untitled(String::new());
+            self.project_dir = None;
+            self.file_tree.clear();
+            self.index = ProjectIndex::default();
+            self.typeset.live_due = None;
+            self.typeset.queued_live = false;
+            self.clear_pdf();
+            self.effect(Effect::Welcome);
         }
         self.active = self.active.min(self.docs.len().saturating_sub(1));
     }
 
-    /// Copies a full typeset's PDF beside its root ([`texcraft_project::published_pdf`]) when it
-    /// is new or the copy is missing. Written to a temporary file first and renamed, so a PDF
+    /// Publishes a successful full typeset beside its root, including an up-to-date build
+    /// whose published copy may be older. Written to a temporary file first and renamed, so a PDF
     /// viewer watching the file never reads half of it.
-    fn publish_pdf(&mut self, pdf: &Path, fresh: bool) {
+    fn publish_pdf(&mut self, pdf: &Path) -> Result<(), CommandError> {
         let Some(root) = self.typeset.root.clone() else {
-            return;
+            return Err(CommandError::Failed(tr("nothing to typeset").into()));
         };
         let dest = texcraft_project::published_pdf(&root);
-        if dest == pdf || (!fresh && dest.is_file()) {
-            return;
+        if dest == pdf {
+            return Ok(());
         }
         let name = dest
             .file_name()
@@ -1094,10 +1111,14 @@ impl Session {
         let copied = std::fs::copy(pdf, &part).and_then(|_| std::fs::rename(&part, &dest));
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&part);
-            self.set_status(trf!("Cannot write {name}: {e}", name = name, e = e));
-            return;
+            return Err(CommandError::Failed(trf!(
+                "Cannot write {name}: {e}",
+                name = name,
+                e = e
+            )));
         }
         self.refresh_files();
+        Ok(())
     }
 
     /// The PDF to reveal or open outside TexCraft: the one beside the root when a full typeset
@@ -1221,7 +1242,8 @@ impl Session {
     }
 
     fn schedule_live(&mut self) {
-        if !self.settings.live_typeset || self.live_paused {
+        if !self.settings.live_typeset || self.live_paused || self.typeset.quit != QuitTypeset::Idle
+        {
             return;
         }
         // Remember when the first edit not yet in the PDF happened (for the latency readout).
@@ -1320,6 +1342,7 @@ impl Session {
             shell_escape: self.settings.shell_escape,
             bib_tool: self.settings.bib_tool,
             pretex: self.pretex_for(&plan),
+            force: background && matches!(self.typeset.quit, QuitTypeset::Running(_)),
         };
         self.typeset.console.clear();
         // The PDF beside this root will be current again.
@@ -1551,8 +1574,10 @@ impl Session {
         self.typeset.issues = outcome.report.issues.clone();
         self.note_typeset(&outcome);
         let background = !outcome.live && self.typeset.background;
+        let quitting = background && matches!(self.typeset.quit, QuitTypeset::Running(_));
+        let mut publication_error = None;
         if !outcome.live
-            && (outcome.cancelled || outcome.error.is_some())
+            && !outcome.success
             && let Some(root) = self.typeset.root.clone()
         {
             // The PDF beside the source did not change after all.
@@ -1594,8 +1619,26 @@ impl Session {
                 self.view.sidebar_tab = SidebarTab::Results;
                 self.view.results_mode = ResultsMode::Issues;
             }
-            if let Some(pdf) = outcome.pdf.as_deref() {
-                self.publish_pdf(pdf, outcome.pdf_fresh);
+            if outcome.success
+                && let Some(pdf) = outcome.pdf.as_deref()
+                && let Err(e) = self.publish_pdf(pdf)
+            {
+                self.set_status(e.to_string());
+                publication_error = Some(e.to_string());
+            }
+        }
+        if quitting && (!outcome.success || publication_error.is_some()) {
+            let message = publication_error
+                .or_else(|| outcome.error.clone())
+                .unwrap_or_else(|| {
+                    if outcome.cancelled {
+                        tr("Typesetting stopped").to_string()
+                    } else {
+                        tr("The full typeset did not produce a PDF without errors.").to_string()
+                    }
+                });
+            if let Some(root) = self.typeset.root.clone() {
+                self.fail_quit(root, message);
             }
         }
         // While typing, a pass with errors usually shows half-typed markup: keep the last good
@@ -1942,6 +1985,10 @@ impl Session {
                 "background": self.typeset.is_full_running() && self.typeset.background,
                 "staleProjects": self.typeset.stale.iter().map(|(r, _)| r).collect::<Vec<_>>(),
                 "quitting": self.typeset.is_quitting(),
+                "quitError": match &self.typeset.quit {
+                    QuitTypeset::Failed { root, message } => Some(serde_json::json!({"root": root, "message": message})),
+                    _ => None,
+                },
                 "behind": self.live_behind(),
                 "unsettled": self.typeset.unsettled.is_some(),
                 "settlePasses": self.typeset.settle_passes,

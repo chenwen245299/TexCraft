@@ -159,8 +159,10 @@ pub fn show(
         });
     }
     let action = match pick? {
-        Pick::Open => Some(DialogAction::Open),
-        Pick::OpenFolder => Some(DialogAction::OpenFolder),
+        // A cancelled file panel returns here. Keep the welcome window until a document
+        // actually opened; the platform calls Workbench::document_opened on success.
+        Pick::Open => return Some(DialogAction::Open),
+        Pick::OpenFolder => return Some(DialogAction::OpenFolder),
         Pick::Done => None,
         // Closing the start-up window (the only window) quits, as on macOS; opened later from
         // the menu, it just closes.
@@ -659,10 +661,10 @@ fn recent_list(ui: &mut Ui, t: &Tokens, session: &mut Session, filter: &str) -> 
             .map(|m| trf!("Last Modified on {date}", date = crate::clock::date_time(m)))
             .unwrap_or_default();
         if list_row(ui, t, &title, &when, Some(&path.display().to_string())) {
-            if let Err(e) = session.open_path(path) {
-                session.set_status(e.to_string());
+            match session.open_path(path) {
+                Ok(_) => pick = Some(Pick::Done),
+                Err(e) => session.set_status(e.to_string()),
             }
-            pick = Some(Pick::Done);
         }
     }
     pick

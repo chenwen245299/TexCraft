@@ -494,16 +494,16 @@ static REGISTRY: &[CommandSpec] = &[
             Ok(())
         }
     ),
-    // The sheet shown while TexCraft typesets before quitting (LIVE mode).
+    // Every exit waits for a successful full rebuild and PDF publication.
     cmd!(
-        "app.quitNow",
-        "Quit Now",
+        "app.retryQuit",
+        "Retry Typesetting",
         None,
         0,
         None,
-        is_quitting,
+        |s| matches!(s.typeset.quit, crate::QuitTypeset::Failed { .. }),
         |s, _| {
-            s.quit_now();
+            s.retry_quit();
             Ok(())
         }
     ),

@@ -1,8 +1,8 @@
-//! Full typesets TexCraft starts by itself in LIVE mode. Live passes typeset the unsaved
+//! Full typesets TexCraft starts by itself. Live passes typeset the unsaved
 //! buffers into a preview, but the PDF beside the source (the one Finder, mail and other apps
 //! see) only changes with a full typeset. So a project edited since its last full typeset is
 //! typeset in full now and then ([`FULL_TYPESET_EVERY`] after the first such edit, at a pause in
-//! typing) and once more before TexCraft quits. Projects nobody edits cost nothing.
+//! typing). Before quitting, every open project gets a full rebuild in every mode.
 //!
 //! A full typeset reads the files on disk, so like ⌘T it saves the open documents first when
 //! "save before typesetting" is on. Before quitting it runs after the unsaved-changes prompt:
@@ -35,14 +35,24 @@ pub enum QuitTypeset {
     /// Typesetting these roots one after another (the one running is already off the list),
     /// then quitting.
     Running(Vec<PathBuf>),
-    /// Done or skipped: the window may close.
+    /// Compilation or publishing failed: keep the window open for Retry / Don't Quit.
+    Failed {
+        /// Project whose PDF could not be updated.
+        root: PathBuf,
+        /// Failure detail in the interface language.
+        message: String,
+    },
+    /// Every full rebuild and PDF publication succeeded: the window may close.
     Done,
 }
 
 impl TypesetState {
     /// TexCraft is typesetting before it quits.
     pub fn is_quitting(&self) -> bool {
-        matches!(self.quit, QuitTypeset::Running(_))
+        matches!(
+            self.quit,
+            QuitTypeset::Running(_) | QuitTypeset::Failed { .. }
+        )
     }
 }
 
@@ -83,17 +93,37 @@ impl Session {
         if self.typeset.is_running() || self.typeset.queued {
             return None;
         }
-        if self.typeset.is_quitting() {
+        if matches!(self.typeset.quit, QuitTypeset::Failed { .. }) {
+            return None;
+        }
+        if matches!(self.typeset.quit, QuitTypeset::Running(_)) {
+            // A later queued root must not silently save edits received after the save prompt.
+            if self.docs.iter().any(|d| d.is_dirty() && !d.is_pristine()) {
+                self.typeset.quit = QuitTypeset::Idle;
+                self.effect(Effect::Quit);
+                return None;
+            }
             // One root after another, then quit.
-            loop {
-                let next = match &mut self.typeset.quit {
-                    QuitTypeset::Running(roots) if !roots.is_empty() => roots.remove(0),
-                    _ => break,
-                };
-                match self.start_full(next, true) {
-                    Ok(()) => return None,
-                    Err(e) => self.set_status(e.to_string()),
+            let next = match &mut self.typeset.quit {
+                QuitTypeset::Running(roots) if !roots.is_empty() => Some(roots.remove(0)),
+                _ => None,
+            };
+            if let Some(next) = next {
+                if let Err(e) = self.start_full(next.clone(), true) {
+                    self.fail_quit(next, e.to_string());
                 }
+                return None;
+            }
+            let pending: Vec<_> = self
+                .typeset
+                .stale
+                .iter()
+                .map(|(r, _)| r.clone())
+                .filter(|r| r.is_file())
+                .collect();
+            if !pending.is_empty() {
+                self.typeset.quit = QuitTypeset::Running(pending);
+                return Some(Duration::ZERO);
             }
             self.typeset.quit = QuitTypeset::Done;
             self.effect(Effect::Quit);
@@ -137,31 +167,42 @@ impl Session {
         None
     }
 
-    /// TexCraft is about to quit (after the unsaved-changes prompt). In LIVE mode, projects
-    /// edited since their last full typeset are typeset first, so the PDF beside the source is
-    /// current; [`Effect::Quit`] follows when that is done. Returns true while that runs (the
-    /// window must stay open), false when it may close now.
+    /// After the save prompt, rebuild every open project and any edited project closed earlier.
+    /// The window stays open until compilation AND publishing its PDF succeed, in every mode.
     pub fn quit_requested(&mut self) -> bool {
         match self.typeset.quit {
             QuitTypeset::Done => return false,
             QuitTypeset::Running(_) => return true,
+            QuitTypeset::Failed { .. } => return true,
             QuitTypeset::Idle => {}
         }
-        if self.settings.mode() != TypesetMode::Live {
-            return false;
-        }
-        let roots: Vec<PathBuf> = self
+        let mut roots: Vec<PathBuf> = self
             .typeset
             .stale
             .iter()
             .map(|(r, _)| r.clone())
             .filter(|r| r.is_file())
             .collect();
+        for doc in &self.docs {
+            let Some(path) = &doc.path else { continue };
+            let root = texcraft_project::project_entry(path, &|p| self.text_of(p));
+            if !root
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("tex") || e.eq_ignore_ascii_case("ltx"))
+            {
+                continue;
+            }
+            let root = texcraft_project::normalize(&root);
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
         if roots.is_empty() {
             return false;
         }
         // The preview no longer matters: a live pass due or running gives way.
         self.typeset.live_due = None;
+        self.typeset.queued = false;
         self.typeset.queued_live = false;
         if self.typeset.live_job
             && let Some(job) = &self.typeset.job
@@ -173,13 +214,22 @@ impl Session {
         true
     }
 
-    /// Quits without waiting for the typesetting before quitting (it is stopped).
-    pub fn quit_now(&mut self) {
-        if self.typeset.is_quitting() && self.typeset.is_full_running() {
-            self.stop_typeset();
+    /// Keep the window open when either the full rebuild or publishing failed.
+    pub(crate) fn fail_quit(&mut self, root: PathBuf, message: String) {
+        self.mark_stale(&root, Instant::now());
+        self.set_status(message.clone());
+        self.typeset.quit = QuitTypeset::Failed { root, message };
+        self.typeset.queued = false;
+        self.typeset.queued_live = false;
+        self.typeset.live_due = None;
+    }
+
+    /// A failed exit can be retried after the save prompt has checked the buffers again.
+    pub fn retry_quit(&mut self) {
+        if matches!(self.typeset.quit, QuitTypeset::Failed { .. }) {
+            self.typeset.quit = QuitTypeset::Idle;
+            self.effect(Effect::Quit);
         }
-        self.typeset.quit = QuitTypeset::Done;
-        self.effect(Effect::Quit);
     }
 
     /// Does not quit after all. A full typeset that is running finishes; the projects not yet

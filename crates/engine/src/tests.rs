@@ -1419,60 +1419,194 @@ fn live_mode_typesets_edited_projects_in_full_now_and_then() {
     assert_eq!(s.typeset.stale.len(), 1, "stopped: still due");
 }
 
-#[test]
-fn quitting_in_live_mode_typesets_edited_projects_first() {
-    let (mut s, main) = edited_live_project("full-quit");
-    // MANUAL mode quits at once.
-    s.run("typeset.mode.manual", &Value::Null).unwrap();
-    assert!(!s.quit_requested());
-    s.run("typeset.mode.live", &Value::Null).unwrap();
-    assert!(!s.is_enabled("app.quitNow"));
-    // The app saved the document (unsaved-changes prompt) before it asks.
-    s.save(s.active).unwrap();
-    assert!(s.quit_requested());
-    assert!(s.typeset.is_quitting() && s.is_enabled("app.quitNow"));
-    assert_eq!(s.inspect()["typeset"]["quitting"], true);
-    assert!(s.quit_requested(), "still typesetting: the window stays");
+/// Exit completion includes queued roots; failure stops immediately for user action.
+fn settle_quit(s: &mut Session) {
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !s.effects.iter().any(|e| *e == Effect::Quit) && Instant::now() < deadline {
+    while matches!(s.typeset.quit, QuitTypeset::Running(_)) && Instant::now() < deadline {
         s.tick(Instant::now());
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        s.effects.iter().any(|e| *e == Effect::Quit),
-        "closes when done"
-    );
-    let o = s.typeset.last.as_ref().unwrap();
-    assert!(!o.live && s.typeset.background);
-    if o.error.is_none() {
-        assert!(o.success, "{}", o.console);
-        assert!(texcraft_project::published_pdf(&main).is_file());
-    }
-    assert!(!o.cancelled);
-    assert!(!s.effects.iter().any(|e| matches!(e, Effect::Alert { .. })));
-    assert!(!s.quit_requested(), "done: the window may close");
-    s.effects.clear();
+}
 
-    // Edited after all (the window stayed open): asks again. Don't Quit keeps TexCraft open.
-    s.run(
-        "edit.setText",
-        &json!({"text": "\\documentclass{article}\n\\begin{document}\nAgain.\n\\end{document}\n"}),
-    )
-    .unwrap();
-    assert!(s.quit_requested());
-    s.run("app.cancelQuit", &Value::Null).unwrap();
-    assert!(!s.typeset.is_quitting());
-    settle(&mut s);
-    assert!(!s.effects.iter().any(|e| *e == Effect::Quit));
-    // Quit Now stops the typesetting and quits.
-    s.run("edit.setText", &json!({"text": "\\documentclass{article}\n\\begin{document}\nOnce more.\n\\end{document}\n"}))
-        .unwrap();
+#[test]
+fn quitting_always_rebuilds_open_projects_in_every_mode() {
+    for mode in ["live", "auto", "manual"] {
+        let (mut s, main) = edited_live_project(&format!("full-quit-{mode}"));
+        if !s.toolchain.supports(Engine::PdfLatex) {
+            return;
+        }
+        s.run(&format!("typeset.mode.{mode}"), &Value::Null)
+            .unwrap();
+        s.save(s.active).unwrap();
+        // Neither the mode nor the absence of a stale marker may skip the exit rebuild.
+        s.typeset.stale.clear();
+        s.effects.clear();
+        assert!(s.quit_requested());
+        let queued = s.typeset.quit.clone();
+        assert!(s.quit_requested());
+        assert_eq!(
+            s.typeset.quit, queued,
+            "duplicate close does not restart the queue"
+        );
+        assert!(!s.is_enabled("app.quitNow"));
+        settle_quit(&mut s);
+        assert_eq!(s.typeset.quit, QuitTypeset::Done);
+        assert!(s.effects.contains(&Effect::Quit));
+        assert!(s.typeset.last.as_ref().unwrap().success);
+        assert!(!s.typeset.last.as_ref().unwrap().live);
+        assert!(texcraft_project::published_pdf(&main).is_file());
+        assert!(!s.quit_requested());
+    }
+}
+
+#[test]
+fn cancelling_quit_keeps_the_window_open_after_the_full_run_finishes() {
+    let (mut s, _) = edited_live_project("full-cancel-quit");
+    s.save(s.active).unwrap();
+    s.effects.clear();
     assert!(s.quit_requested());
     s.tick(Instant::now());
-    s.run("app.quitNow", &Value::Null).unwrap();
-    assert!(s.effects.iter().any(|e| *e == Effect::Quit));
-    assert!(!s.quit_requested());
+    s.run("app.cancelQuit", &Value::Null).unwrap();
     settle(&mut s);
+    assert_eq!(s.typeset.quit, QuitTypeset::Idle);
+    assert!(!s.effects.contains(&Effect::Quit));
+}
+
+#[test]
+fn failed_exit_typeset_keeps_the_previous_pdf_and_can_be_retried() {
+    let (mut s, main) = edited_live_project("full-quit-fail");
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        return;
+    }
+    s.run("edit.setText", &json!({"text": "\\documentclass{article}\n\\begin{document}\n\\undefinedcommand\n\\end{document}\n"})).unwrap();
+    s.save(s.active).unwrap();
+    let published = texcraft_project::published_pdf(&main);
+    std::fs::write(&published, b"previous good PDF").unwrap();
+    s.effects.clear();
+    assert!(s.quit_requested());
+    settle_quit(&mut s);
+    assert!(matches!(s.typeset.quit, QuitTypeset::Failed { .. }));
+    assert!(
+        s.quit_requested(),
+        "repeated close stays blocked on the failure"
+    );
+    assert!(!s.effects.contains(&Effect::Quit));
+    assert_eq!(std::fs::read(&published).unwrap(), b"previous good PDF");
+    assert!(s.inspect()["typeset"]["quitError"].is_object());
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n\\begin{document}\nFixed.\n\\end{document}\n"}),
+    )
+    .unwrap();
+    s.save(s.active).unwrap();
+    s.run("app.retryQuit", &Value::Null).unwrap();
+    s.effects.clear(); // The app consumes the retry's close request before entering the gate.
+    assert!(s.quit_requested());
+    settle_quit(&mut s);
+    assert_eq!(s.typeset.quit, QuitTypeset::Done);
+    assert!(s.effects.contains(&Effect::Quit));
+    assert_ne!(std::fs::read(&published).unwrap(), b"previous good PDF");
+}
+
+#[test]
+fn failure_to_publish_the_pdf_also_blocks_quit() {
+    let (mut s, main) = edited_live_project("full-quit-publish");
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        return;
+    }
+    s.save(s.active).unwrap();
+    let published = texcraft_project::published_pdf(&main);
+    std::fs::create_dir(&published).unwrap(); // rename cannot replace a directory with a file.
+    s.effects.clear();
+    assert!(s.quit_requested());
+    settle_quit(&mut s);
+    assert!(
+        s.typeset.last.as_ref().unwrap().success,
+        "the compiler succeeded"
+    );
+    assert!(matches!(s.typeset.quit, QuitTypeset::Failed { .. }));
+    assert!(!s.effects.contains(&Effect::Quit));
+    assert!(published.is_dir());
+    assert!(s.is_enabled("app.retryQuit"));
+    s.run("app.cancelQuit", &Value::Null).unwrap();
+    assert_eq!(s.typeset.quit, QuitTypeset::Idle);
+}
+
+#[test]
+fn missing_toolchain_does_not_silently_quit() {
+    let (mut s, _) = edited_live_project("full-quit-no-tex");
+    s.save(s.active).unwrap();
+    s.toolchain = Toolchain::default();
+    s.effects.clear();
+    assert!(s.quit_requested());
+    settle_quit(&mut s);
+    assert!(matches!(s.typeset.quit, QuitTypeset::Failed { .. }));
+    assert!(!s.effects.contains(&Effect::Quit));
+}
+
+#[test]
+fn a_successful_cached_build_republishes_an_older_pdf_beside_the_project() {
+    let (mut s, root) = edited_live_project("full-publish-cached");
+    let pdf = texcraft_project::output_pdf(&root);
+    std::fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+    std::fs::write(&pdf, b"current build PDF").unwrap();
+    let published = texcraft_project::published_pdf(&root);
+    std::fs::write(&published, b"older published PDF").unwrap();
+    s.typeset.root = Some(root);
+    s.finish_typeset(Outcome {
+        success: true,
+        pdf: Some(pdf),
+        pdf_fresh: false,
+        ..Default::default()
+    });
+    assert_eq!(std::fs::read(published).unwrap(), b"current build PDF");
+}
+
+#[test]
+fn quit_rebuilds_each_project_once_and_preserves_edits_received_during_the_build() {
+    let (mut s, main) = edited_live_project("full-quit-roots");
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        return;
+    }
+    s.save(s.active).unwrap();
+    let dir = main.parent().unwrap();
+    let chapter = dir.join("chapter.tex");
+    std::fs::write(&chapter, "% !TEX root = main.tex\nChapter.\n").unwrap();
+    s.open_path(&chapter).unwrap();
+    let other_dir = dir.join("other");
+    std::fs::create_dir(&other_dir).unwrap();
+    let other = other_dir.join("main.tex");
+    std::fs::write(
+        &other,
+        "\\documentclass{article}\n\\begin{document}\nOther.\n\\end{document}\n",
+    )
+    .unwrap();
+    s.open_path(&other).unwrap();
+    s.settings.live_typeset = false;
+    s.effects.clear();
+    assert!(s.quit_requested());
+    let QuitTypeset::Running(roots) = &s.typeset.quit else {
+        panic!("queued exit")
+    };
+    assert_eq!(roots.len(), 2);
+    settle_quit(&mut s);
+    assert_eq!(s.typeset.runs, 2);
+    assert!(texcraft_project::published_pdf(&main).is_file());
+    assert!(texcraft_project::published_pdf(&other).is_file());
+    s.typeset.quit = QuitTypeset::Idle;
+    s.effects.clear();
+    assert!(s.quit_requested());
+    s.tick(Instant::now());
+    s.run("edit.insertText", &json!({"text": "New edit"}))
+        .unwrap();
+    // Dirty text received after the save prompt is not silently saved by a later queued root.
+    settle_quit(&mut s);
+    assert!(s.doc().unwrap().is_dirty());
+    assert_eq!(s.typeset.quit, QuitTypeset::Idle);
+    assert!(
+        s.effects.contains(&Effect::Quit),
+        "the app must show its save prompt again"
+    );
 }
 
 #[test]

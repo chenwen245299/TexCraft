@@ -32,6 +32,10 @@ pub(super) const ENTRIES: super::Entries = &[
     ("the root file is not saved yet", "根文件尚未存储"),
     ("Typesetting could not start", "无法开始排版"),
     ("Typesetting stopped", "排版已停止"),
+    (
+        "The full typeset did not produce a PDF without errors.",
+        "完整编译未能生成无错误的 PDF。",
+    ),
     ("{n} error", "{n} 个错误"),
     ("{n} errors", "{n} 个错误"),
     ("{n} warning", "{n} 个警告"),

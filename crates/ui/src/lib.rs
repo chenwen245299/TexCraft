@@ -87,7 +87,7 @@ pub struct Workbench {
     pub update_window: bool,
     /// It shows on the Settings window (Check for Updates… was clicked there).
     update_on_settings: bool,
-    /// The open documents (count, active, its path) as of the last frame.
+    /// The open documents (count, active, its path or the empty workspace's folder/PDF).
     docs_seen: Option<(usize, usize, Option<PathBuf>)>,
     /// A dialog was up in the last frame.
     had_dialog: bool,
@@ -204,6 +204,23 @@ impl Workbench {
         &self.tokens
     }
 
+    /// Whether the editor window is hidden behind the welcome window.
+    pub fn main_hidden(&self) -> bool {
+        self.main_hidden
+    }
+
+    /// A file panel opened a document or project successfully. Cancelling the panel never
+    /// calls this, so the welcome window stays available.
+    pub fn document_opened(&mut self, ctx: &Context) {
+        self.welcome.open = false;
+        self.welcome.launch = false;
+        if self.main_hidden {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+            self.main_hidden = false;
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
+
     fn update_theme(&mut self, ctx: &Context, session: &Session) {
         let dark = match session.view.theme {
             ThemeChoice::Light => false,
@@ -304,7 +321,11 @@ impl Workbench {
                 Effect::CopyText(text) => self.requests.push(Request::CopyText(text)),
                 Effect::BeginRename(path) => self.sidebar.begin_rename(path),
                 Effect::GitDiff => self.sidebar.git.diff_open = true,
-                Effect::TemplateGallery | Effect::Welcome => self.welcome.show_window(false),
+                Effect::TemplateGallery | Effect::Welcome => self.welcome.show_window(
+                    session.docs.is_empty()
+                        && session.project_dir.is_none()
+                        && session.pdf.path.is_none(),
+                ),
                 Effect::GotoLineDialog => self.dialog = Dialog::GotoLine(String::new()),
                 Effect::Find { replace } => {
                     self.editor.find.open = true;
@@ -674,11 +695,17 @@ impl Workbench {
         let docs = (
             session.docs.len(),
             session.active,
-            session.doc().and_then(|d| d.path.clone()),
+            session
+                .doc()
+                .and_then(|d| d.path.clone())
+                .or_else(|| session.project_dir.clone())
+                .or_else(|| session.pdf.path.clone()),
         );
+        let has_content =
+            !session.docs.is_empty() || session.project_dir.is_some() || session.pdf.path.is_some();
         let changed = self.docs_seen.as_ref().is_some_and(|seen| *seen != docs);
         self.docs_seen = Some(docs);
-        let has_dialog = self.dialog != Dialog::None;
+        let has_dialog = self.dialog != Dialog::None || session.typeset.is_quitting();
         let dialog = has_dialog && !self.had_dialog;
         self.had_dialog = has_dialog;
         if !(changed || dialog) {
@@ -686,10 +713,10 @@ impl Workbench {
         }
         let root = egui::ViewportId::ROOT;
         if self.main_hidden {
-            if changed {
+            if changed && has_content {
                 // The document takes the start-up window's place, as picking it there does.
-                self.welcome.open = false;
-            } else {
+                self.document_opened(ctx);
+            } else if dialog {
                 // The dialog shows on the main window; the welcome window stays up as an
                 // ordinary window (closing it no longer quits).
                 ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Visible(true));
@@ -697,7 +724,7 @@ impl Workbench {
                 self.main_hidden = false;
                 self.welcome.launch = false;
             }
-            return true;
+            return changed && has_content || dialog;
         }
         let focused = |id| ctx.input_for(id, |i| i.viewport().focused == Some(true));
         let secondary = (self.prefs.open
@@ -1281,6 +1308,39 @@ mod tests {
 
     /// The main window comes forward for a dialog or a new document raised while another of the
     /// app's windows is in front, and at launch while it waits hidden behind the welcome window.
+    #[test]
+    fn main_window_comes_forward_for_a_folder_or_standalone_pdf_without_a_text_tab() {
+        for pdf in [false, true] {
+            let ctx = Context::default();
+            let mut bench = Workbench::new(&ctx);
+            let mut session = Session::empty(std::sync::Arc::new(|| {}));
+            bench.welcome.show_window(true);
+            bench.main_hidden = true;
+            assert!(!bench.bring_main_forward(&ctx, &session));
+            if pdf {
+                session.show_pdf(PathBuf::from("standalone.pdf"));
+            } else {
+                session.project_dir = Some(PathBuf::from("empty-folder"));
+            }
+            assert!(bench.bring_main_forward(&ctx, &session));
+            assert!(!bench.main_hidden && !bench.welcome.open);
+            assert!(session.docs.is_empty());
+        }
+    }
+
+    #[test]
+    fn exit_progress_and_failures_are_visible_when_welcome_hides_the_main_window() {
+        let ctx = Context::default();
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::empty(std::sync::Arc::new(|| {}));
+        bench.welcome.show_window(true);
+        bench.main_hidden = true;
+        assert!(!bench.bring_main_forward(&ctx, &session));
+        session.typeset.quit = texcraft_engine::QuitTypeset::Running(Vec::new());
+        assert!(bench.bring_main_forward(&ctx, &session));
+        assert!(!bench.main_hidden);
+    }
+
     #[test]
     fn main_window_comes_forward_for_documents_and_dialogs() {
         let ctx = Context::default();

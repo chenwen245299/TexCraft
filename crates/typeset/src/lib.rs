@@ -167,6 +167,8 @@ fn search_dirs() -> Vec<PathBuf> {
 /// What to typeset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
+    /// Rebuild even when latexmk considers its cached output current (mandatory on quit).
+    pub force: bool,
     /// The root `.tex` file (absolute).
     pub root: PathBuf,
     /// Engine.
@@ -255,6 +257,9 @@ pub fn command_line(req: &Request, tc: &Toolchain) -> Result<(PathBuf, Vec<Strin
             ];
             if req.shell_escape {
                 args.push("-shell-escape".into());
+            }
+            if req.force {
+                args.push("-g".into());
             }
             if req.bib_tool == BibTool::None {
                 args.push("-bibtex-".into());
@@ -1005,6 +1010,7 @@ mod tests {
 
     fn req(engine: Engine) -> Request {
         Request {
+            force: false,
             root: "/proj/main.tex".into(),
             engine,
             shell_escape: false,
@@ -1052,6 +1058,23 @@ mod tests {
     }
 
     #[test]
+    fn exit_rebuild_forces_latexmk_to_run_even_when_the_cache_is_current() {
+        for engine in [Engine::PdfLatex, Engine::XeLatex] {
+            let mut request = req(engine);
+            assert!(
+                !command_line(&request, &tc())
+                    .unwrap()
+                    .1
+                    .contains(&"-g".to_string())
+            );
+            request.force = true;
+            let (_, args) = command_line(&request, &tc()).unwrap();
+            assert!(args.contains(&"-g".to_string()));
+            assert_eq!(args.last().map(String::as_str), Some("main.tex"));
+        }
+    }
+
+    #[test]
     fn missing_tools_are_reported() {
         assert!(
             command_line(&req(Engine::LuaLatex), &tc())
@@ -1084,6 +1107,7 @@ mod tests {
         std::fs::write(&root, "\\documentclass{article}\n\\begin{document}\nHello \\undefinedcmd world.\n\\end{document}\n").unwrap();
         let job = start(
             Request {
+                force: false,
                 root: root.clone(),
                 engine: Engine::PdfLatex,
                 shell_escape: false,
@@ -1356,6 +1380,7 @@ mod tests {
         std::fs::write(&root, "\\documentclass{article}\n\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\begin{document}\n\\section{介绍}\n这是一个测试。\n\\end{document}\n").unwrap();
         let job = start(
             Request {
+                force: false,
                 root: root.clone(),
                 engine: Engine::XeLatex,
                 shell_escape: false,

@@ -1,5 +1,63 @@
 # TexCraft devlog
 
+## Release notes prepared for 0.6.0 (2026-11-02)
+
+- Wrote the local `texcraft-v0.6.0.md` tag-message file in the existing Chinese release format:
+  workspace restoration/welcome, mandatory final PDF rebuild/publication, AI icon and control.
+  Verified the remote tags end at v0.5.0 and the workflow reads the annotated tag's message for
+  both the release page and updater. Prepared commands with new-file staging and verbatim
+  Markdown tag contents; no commit, tag or push was performed.
+
+## Every normal exit rebuilds and publishes the final PDF (2026-11-02)
+
+- Red close, Dock/Apple-event Quit and menu/shortcut Quit share the save → forced full rebuild
+  → atomic PDF publication → exit gate, in LIVE/AUTO/MANUAL. All open roots are deduplicated;
+  edited projects closed earlier remain due. `latexmk -g` prevents an exit build from being
+  skipped because of cached state. Edits received during rebuilding return to the save prompt.
+- Compilation, cancellation, missing toolchain or publication failure keeps the app open with
+  Retry Typesetting / Don't Quit. Removed the skip-build Quit Now action. Failed builds preserve
+  the last published PDF; even an up-to-date successful build republishes its current PDF.
+- AppKit `applicationShouldTerminate:` now forwards Dock/system Quit to the normal root close
+  gate before winit's unconditional termination cleanup. The isolated macOS bridge subclasses
+  the existing delegate without adding ivars and refreshes AppKit's optional-selector cache.
+  Control adds `ui.close {source: window|application}`, `ui.nativeQuitRouting`, and
+  `typeset.quitError`; `app.retryQuit` retries a failed final build.
+- Checks: fmt; 199 tests across the seven affected crates passing (1 measurement test ignored);
+  all-target Clippy with warnings denied. Nine isolated native scenarios: both native exit
+  sources × three modes, unsaved prompt, compilation failure/retry, publication failure/retry.
+  Instrumented latexmk confirms `-g`; extracted PDF text confirms the latest saved contents
+  after each successful exit. English/zh-Hans progress/failure and dark-mode sheets inspected.
+- Native validation was on macOS; other platforms share the engine gate.
+
+## AI toolbar button uses the app artwork (2026-11-02)
+
+- Replaced the simplified monochrome toolbar drawing with `assets/icon/texcraft-ai.svg`,
+  the existing full-colour app icon with only its lower-right backslash changed to an AI
+  sparkle. The button's capsule and Assistant toggle command are unchanged.
+- Regression renders at 32/64/256 px prove the artwork is pixel-identical outside the key.
+  UI/i18n tests and UI Clippy pass; isolated English, zh-Hans and dark-mode screenshots
+  inspected, with the button clicked to open/close the Assistant. No open gaps for this change.
+
+## Startup, welcome and workspace lifecycle (2026-11-02)
+
+- Desktop startup is empty until a file is opened or restored; no hidden Article template or
+  automatic Untitled typeset. Quit/relaunch restores the project folder, saved tabs, active
+  file, character selections and typesetting root (including an active bibliography).
+  Standalone PDFs and empty project folders restore too. Legacy settings reopen the latest
+  existing recent project once; an explicitly closed workspace stays closed.
+- Cancelling Open keeps the welcome window. Closing the last tab clears the project/PDF and
+  returns to welcome; closing that only window quits. Closing welcome over a project keeps
+  the project. Commands opening folders/PDFs also reveal the hidden main window.
+- Quit prompts keep saved tabs for restoration; Don't Save reloads the disk version before
+  the final typeset. Edited untitled buffers now prompt on quit; Save As waits for success,
+  with cancellation retaining the text. A deleted file can still be discarded and quit.
+- Added 14 regression tests across engine, UI and desktop startup. Gates: fmt; 167 tests
+  passing, 1 measurement test ignored; Clippy with warnings denied. Isolated real-app checks
+  cover quit/relaunch, two tabs and selection, both welcome-close paths, last-tab close,
+  closed-workspace persistence, empty folders and standalone PDFs; English/zh-Hans screenshots
+  inspected. `run-dev-app.sh` accepts `TEXCRAFT_DEV_DIR` for independent test storage.
+- Open: PDF scroll-position restoration and unsaved-buffer crash recovery.
+
 ## texcraft-synctex
 
 - Pure-Rust SyncTeX reader (`crates/synctex`): gzip auto-detect, preamble/content/postamble/post

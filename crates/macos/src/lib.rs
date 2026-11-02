@@ -1,5 +1,5 @@
-//! macOS services that winit does not expose: window-button placement and the system spell
-//! checker.
+//! macOS services that winit does not expose: window-button placement, guarded application
+//! termination and the system spell checker.
 //!
 //! TexCraft draws its own toolbar under a transparent title bar. AppKit keeps the window buttons
 //! (close, minimise, zoom) at the top of a 28 pt title bar, but the target app's toolbar is taller
@@ -8,6 +8,49 @@
 //! every block carries a `SAFETY:` comment.
 
 use raw_window_handle::HasWindowHandle;
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod quit;
+
+/// Routes Dock/Apple-event Quit through the editor's ordinary close request, preserving
+/// winit's application delegate. Install once on the main thread after creating the app.
+pub fn route_quit_requests(request: std::sync::Arc<dyn Fn() + Send + Sync>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        quit::install(request)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = request;
+        false
+    }
+}
+
+/// Sends the AppKit action used by Dock Quit (for control-channel verification).
+pub fn request_application_quit() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        quit::request()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Performs the window's native red close-button action (for control-channel verification).
+pub fn close_window(window: &impl HasWindowHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        imp::close_window(window)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        false
+    }
+}
 
 /// Centres the window buttons vertically in a bar `height` points tall at the top of the window,
 /// the close button's left edge `left` points from the window edge. Cheap to call every frame:
@@ -355,6 +398,18 @@ mod imp {
     use objc2_app_kit::{NSApplication, NSView, NSWindow, NSWindowButton};
     use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    pub fn close_window(window: &impl HasWindowHandle) -> bool {
+        let Some(win) = ns_window(window) else {
+            return false;
+        };
+        // SAFETY: A live NSWindow obtained from the borrowed window handle on the main thread;
+        // performClose: sends its normal windowShouldClose: delegate request, like the red button.
+        unsafe {
+            win.performClose(None);
+        }
+        true
+    }
 
     pub fn system_dark() -> Option<bool> {
         use objc2_app_kit::{NSAppearanceNameAqua, NSAppearanceNameDarkAqua};

@@ -3,7 +3,7 @@
 //! [`crate::prefs`].
 
 use egui::{Id, Key, RichText, vec2};
-use texcraft_engine::{Session, registry};
+use texcraft_engine::{QuitTypeset, Session, registry};
 use texcraft_i18n::{tr, trf};
 
 use crate::menu::{self, ButtonKind};
@@ -64,19 +64,40 @@ fn heading(ui: &mut egui::Ui, t: &Tokens, title: &str, message: Option<&str>) {
     }
 }
 
-/// While TexCraft typesets before quitting (LIVE mode): a sheet saying so, with Don't Quit and
-/// Quit Now. It goes away by itself when the typesetting is done and the window closes.
+/// Every exit waits for the full rebuild and PDF publication. Failure keeps this sheet open;
+/// Retry and Don't Quit are available, with no action that silently skips the final build.
 pub fn quitting(ctx: &egui::Context, t: &Tokens, session: &mut Session) {
     if !session.typeset.is_quitting() {
         return;
     }
-    let name = session
-        .typeset
-        .root
-        .as_deref()
-        .and_then(std::path::Path::file_name)
+    let failed = match &session.typeset.quit {
+        QuitTypeset::Failed { root, message } => Some((root.clone(), message.clone())),
+        _ => None,
+    };
+    let name = failed
+        .as_ref()
+        .map(|(root, _)| root)
+        .or(session.typeset.root.as_ref())
+        .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let title = if failed.is_some() {
+        tr("PDF could not be updated")
+    } else {
+        tr("Typesetting before quitting…")
+    };
+    let description = if let Some((_, message)) = &failed {
+        trf!(
+            "TexCraft will stay open because the PDF for “{name}” may be out of date. {detail}",
+            name = name,
+            detail = tr(message)
+        )
+    } else {
+        trf!(
+            "TexCraft typesets “{name}” so that the PDF beside it has your latest changes.",
+            name = name
+        )
+    };
     let mut run = None;
     egui::Modal::new(Id::new("quit-typeset"))
         .frame(menu::sheet_frame(t, 20))
@@ -85,36 +106,31 @@ pub fn quitting(ctx: &egui::Context, t: &Tokens, session: &mut Session) {
             ui.set_width(400.0);
             ui.horizontal_top(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(16.0, 18.0), egui::Sense::hover());
-                let angle = ui.input(|i| i.time) as f32 * 6.0;
-                crate::icons::spinner(ui.painter(), r, t.text_weak, angle);
+                if failed.is_some() {
+                    crate::icons::warning(ui.painter(), r, t.error, true);
+                } else {
+                    let angle = ui.input(|i| i.time) as f32 * 6.0;
+                    crate::icons::spinner(ui.painter(), r, t.text_weak, angle);
+                }
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    heading(
-                        ui,
-                        t,
-                        tr("Typesetting before quitting…"),
-                        Some(&trf!(
-                            "TexCraft typesets “{name}” so that the PDF beside it has your latest changes.",
-                            name = name
-                        )),
-                    );
+                    heading(ui, t, title, Some(&description));
                 });
             });
             ui.add_space(16.0);
-            match menu::dialog_buttons(
-                ui,
-                t,
-                &[
-                    (tr("Don't Quit"), ButtonKind::Normal),
-                    (tr("Quit Now"), ButtonKind::Default),
-                ],
-            ) {
+            let mut buttons = vec![(tr("Don't Quit"), ButtonKind::Normal)];
+            if failed.is_some() {
+                buttons.push((tr("Retry Typesetting"), ButtonKind::Default));
+            }
+            match menu::dialog_buttons(ui, t, &buttons) {
                 Some(0) => run = Some("app.cancelQuit"),
-                Some(_) => run = Some("app.quitNow"),
+                Some(_) => run = Some("app.retryQuit"),
                 None => {}
             }
         });
-    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    if failed.is_none() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
     if let Some(id) = run {
         let _ = session.run(id, &serde_json::Value::Null);
     }
@@ -279,13 +295,22 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
         }
         Dialog::ConfirmClose { doc: idx, quit } => {
             let (idx, quit) = (*idx, *quit);
-            // Saved or dropped: when quitting, on to the next document (or to quitting).
+            // Quitting keeps saved tabs in the workspace so they reopen next time.
             let closed = |session: &mut Session| {
-                session.close(idx);
+                if !quit || session.docs.get(idx).is_some_and(|d| d.path.is_none()) {
+                    session.close(idx);
+                }
                 if quit {
                     let _ = session.run("app.quit", &serde_json::Value::Null);
                 }
             };
+            // Save As finished in a native panel. If it was cancelled the document is still
+            // dirty, and this prompt remains available with Save / Don't Save / Cancel.
+            if session.docs.get(idx).is_none_or(|d| !d.is_dirty()) {
+                closed(session);
+                *dialog = Dialog::None;
+                return;
+            }
             let name = session
                 .docs
                 .get(idx)
@@ -310,8 +335,28 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                     egui::Rect::from_min_size(egui::pos2(row, top), vec2(110.0, 28.0)),
                 ));
                 if menu::dialog_button(&mut left, t, tr("Don't Save"), ButtonKind::Normal, 100.0) {
-                    closed(session);
-                    close = true;
+                    // Reload a saved file instead of removing its tab during quit. This also
+                    // prevents the final full typeset from saving the discarded buffer.
+                    let saved = session.docs.get(idx).is_some_and(|d| d.path.is_some());
+                    let discard = if quit && saved {
+                        session.active = idx;
+                        session.run("file.revert", &serde_json::Value::Null)
+                    } else {
+                        Ok(())
+                    };
+                    match discard {
+                        Ok(()) => {
+                            closed(session);
+                            close = true;
+                        }
+                        Err(_) => {
+                            // The original file may have disappeared or become unreadable.
+                            // Don't Save must still allow quitting without recreating it.
+                            session.close(idx);
+                            let _ = session.run("app.quit", &serde_json::Value::Null);
+                            close = true;
+                        }
+                    }
                 }
                 match menu::dialog_buttons(
                     ui,
@@ -322,14 +367,14 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
                     ],
                 ) {
                     Some(0) => close = true,
-                    Some(_) => {
-                        if session.save(idx).is_ok()
-                            && session.docs.get(idx).is_some_and(|d| !d.is_dirty())
-                        {
+                    Some(_) => match session.save(idx) {
+                        Ok(()) if session.docs.get(idx).is_some_and(|d| !d.is_dirty()) => {
                             closed(session);
+                            close = true;
                         }
-                        close = true;
-                    }
+                        Ok(()) => {}
+                        Err(e) => session.set_status(e.to_string()),
+                    },
                     None => {}
                 }
             });

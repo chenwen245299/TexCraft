@@ -1,4 +1,4 @@
-//! Vector icons drawn with the painter (original artwork; no icon files). Each draws into `r`
+//! Original vector icons, drawn with the painter or from the app's SVG artwork. Each draws into `r`
 //! with colour `c`, on a nominal 16 pt grid scaled to the rect.
 
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
@@ -1566,49 +1566,15 @@ pub fn sparkles(p: &Painter, r: Rect, c: Color32, filled: bool) {
     }
 }
 
-/// The AI Assistant in the toolbar, drawn from the app icon (assets/icon/texcraft.svg): its
-/// page, tilted by 6°, with the folded corner and the sum (Σ), and in front of the page's
-/// lower corner the key, whose backslash has become a sparkle. One ink, like the other
-/// toolbar glyphs; `bg` (the capsule) shows through the key's sparkle and around the key.
-pub fn ai_texcraft(p: &Painter, c: Pos2, fg: Color32, bg: Color32) {
-    let (sin, cos) = (-6.0_f32).to_radians().sin_cos();
-    let pc = c + vec2(-2.3, -1.5);
-    let at = |x: f32, y: f32| pc + vec2(x * cos - y * sin, x * sin + y * cos);
-    // The page: half width, half height, the fold.
-    let (w, h, f) = (6.0, 7.7, 3.2);
-    let ink = Stroke::new(1.3, fg);
-    p.add(Shape::closed_line(
-        vec![
-            at(-w, -h),
-            at(w - f, -h),
-            at(w, -h + f),
-            at(w, h),
-            at(-w, h),
-        ],
-        ink,
-    ));
-    p.add(Shape::line(
-        vec![at(w - f, -h), at(w - f, -h + f), at(w, -h + f)],
-        Stroke::new(1.1, fg),
-    ));
-    // The sum, up and left on the page as on the icon.
-    let (sx, sy) = (-1.7, -1.8);
-    p.add(Shape::line(
-        vec![
-            at(sx + 2.4, sy - 3.0),
-            at(sx - 2.4, sy - 3.0),
-            at(sx + 0.7, sy),
-            at(sx - 2.4, sy + 3.0),
-            at(sx + 2.4, sy + 3.0),
-        ],
-        Stroke::new(1.25, fg),
-    ));
-    // The key over the page's corner, the sparkle cut out of it.
-    let key = Rect::from_center_size(c + vec2(4.7, 4.9), vec2(9.2, 9.2));
-    p.rect_filled(key.expand(1.4), 2.8, bg);
-    p.rect_filled(key, 1.9, fg);
-    let k = key.center();
-    fill_star(p, k, &sparkle_outline(k, 3.7, 0.3), bg);
+/// The existing full-colour app artwork; only the key's backslash becomes an AI sparkle.
+pub fn ai_texcraft(ui: &egui::Ui, r: Rect) {
+    let side = r.width().min(r.height());
+    egui::Image::new(egui::ImageSource::Bytes {
+        uri: "bytes://texcraft/ai-icon.svg".into(),
+        bytes: egui::load::Bytes::Static(include_bytes!("../../../assets/icon/texcraft-ai.svg")),
+    })
+    .fit_to_exact_size(vec2(side, side))
+    .paint_at(ui, Rect::from_center_size(r.center(), vec2(side, side)));
 }
 
 /// A clock with an arrow turning back (History).
@@ -1718,4 +1684,47 @@ pub fn database(p: &Painter, r: Rect, c: Color32) {
     p.line_segment([g(r, 13.0, 3.5), g(r, 13.0, 11.5)], w);
     p.add(Shape::line(arc(7.5, 0.0, pi), w));
     p.add(Shape::line(arc(11.5, 0.0, pi), w));
+}
+
+#[cfg(test)]
+mod ai_icon_tests {
+    /// At toolbar and larger sizes, the original artwork must remain pixel-identical outside
+    /// the key face. This also checks the SVG with the same renderer used by egui.
+    #[test]
+    fn ai_icon_only_changes_the_symbol_inside_the_original_key() {
+        use resvg::{tiny_skia, usvg};
+
+        for side in [32, 64, 256] {
+            let render = |source: &[u8]| {
+                let tree = usvg::Tree::from_data(source, &usvg::Options::default()).unwrap();
+                let mut image = tiny_skia::Pixmap::new(side, side).unwrap();
+                let scale = side as f32 / tree.size().width();
+                resvg::render(
+                    &tree,
+                    tiny_skia::Transform::from_scale(scale, scale),
+                    &mut image.as_mut(),
+                );
+                image
+            };
+            let original = render(include_bytes!("../../../assets/icon/texcraft.svg"));
+            let ai = render(include_bytes!("../../../assets/icon/texcraft-ai.svg"));
+            let mut changed = 0;
+            for (index, (before, after)) in original.pixels().iter().zip(ai.pixels()).enumerate() {
+                if before == after {
+                    continue;
+                }
+                changed += 1;
+                let x = (index % side as usize) as f32 * 1024.0 / side as f32;
+                let y = (index / side as usize) as f32 * 1024.0 / side as f32;
+                assert!(
+                    (600.0..810.0).contains(&x) && (610.0..810.0).contains(&y),
+                    "artwork changed outside the key at {side}px: ({x}, {y})"
+                );
+            }
+            assert!(
+                changed > 0,
+                "the AI symbol must replace the backslash at {side}px"
+            );
+        }
+    }
 }

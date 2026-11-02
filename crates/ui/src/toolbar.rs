@@ -496,16 +496,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     {
         run(session, "view.assistant");
     }
-    icons::ai_texcraft(
-        &p,
-        nav.center() + vec2(0.0, 0.25),
-        t.toolbar_fg,
-        if ai_open {
-            t.segment_selected
-        } else {
-            t.capsule_bg
-        },
-    );
+    icons::ai_texcraft(ui, nav.shrink(1.0).translate(vec2(0.0, 0.25)));
     let _ = Align::Center;
 }
 

@@ -86,6 +86,7 @@ fn typeset(args: &[String]) -> Result<Value, String> {
     } else {
         texcraft_typeset::start(
             texcraft_typeset::Request {
+                force: false,
                 root: root.clone(),
                 engine,
                 shell_escape: false,

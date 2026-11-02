@@ -29,6 +29,15 @@ A crate depends only on lower layers. Nothing below `ui` knows about egui.
   editor, flash rectangles in the PDF, open a panel…) that `Workbench::apply_effects` turns into UI
   state or platform `Request`s for the app (file panels, Finder, quit, native edit actions).
 
+The desktop app starts with `Session::empty` and restores the persisted workspace (project
+folder, saved tabs in order, active file and character selections; standalone PDFs too).
+Explicit launch paths take precedence. Legacy settings without a workspace reopen the most
+recent existing project once; an explicitly empty workspace never falls back to recents.
+Missing files do not block the remaining tabs. Untitled documents are created by New/template
+commands; edited unsaved documents must pass the save prompt before quitting. Quit prompts
+keep saved tabs, while closing the last tab clears the project/PDF and opens the welcome window.
+The welcome window remains open when a file panel is cancelled.
+
 ## Interface languages
 
 English is the source language. User-visible strings are written in English and wrapped in
@@ -98,11 +107,20 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
     Either way no pass can hold up all later ones.
 
 Full typesets (⌘T, and on opening a project) save edited files and run latexmk on the real files
-into `.texcraft/build/`, then copy the PDF beside the root. Live passes never touch that PDF, so in
-LIVE mode the engine (`full.rs`) remembers each project edited since its last full typeset and
-typesets it in full 5 minutes after the first such edit, at a 5 s pause in typing (at once after
-10 minutes), and before quitting (after the unsaved-changes prompt; a sheet offers Don't Quit /
-Quit Now). Projects nobody edits are never typeset in the background.
+into `.texcraft/build/`, then atomically copy a successful PDF beside the root. Live passes never
+touch that PDF. LIVE mode periodically refreshes edited projects: 5 minutes after the first edit,
+at a 5 s typing pause (at once after 10 minutes).
+
+Every normal exit waits for a forced full rebuild (`latexmk -g`) of each open project plus
+edited projects whose tabs were closed, in LIVE, AUTO and MANUAL modes. Unsaved buffers go
+through the save prompt first; edits received during a build return to that prompt. Both the
+compiler and publishing the PDF beside its root must succeed. Failure preserves the previous
+published PDF and keeps TexCraft open with Retry Typesetting / Don't Quit; a running build
+offers Don't Quit. There is no skip-build exit action. `crates/macos/src/quit.rs` intercepts
+AppKit's `applicationShouldTerminate:` (Dock / Apple-event Quit) before winit's unconditional
+will-terminate cleanup, forwarding it to the same root-window close gate as the red button,
+menu and shortcut commands. It keeps winit's delegate and ivars by adding a subclass without
+extra instance storage.
 
 ## Testing
 
