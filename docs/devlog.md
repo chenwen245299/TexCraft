@@ -1,5 +1,22 @@
 # TexCraft devlog
 
+## Release notes prepared for 0.6.1 (2026-11-02)
+
+- Wrote local `texcraft-v0.6.1.md` in the existing Chinese release format, covering the Finder
+  visibility fix for manual and exit builds and the one successful full rebuild needed to
+  replace a previously hidden PDF. Checked against the publication code and regression test.
+
+## Published PDFs stay visible in Finder (2026-11-02)
+
+- Full typesets now copy PDF bytes into a fresh staging file before atomic replacement.
+  `std::fs::copy` inherited macOS `UF_HIDDEN` and FinderInfo's invisible bit from cached output,
+  making even the final `main.pdf` appear faded in Finder. Old hidden staging/destination
+  files cannot carry those attributes into the next successful publication.
+- Added a macOS regression with hidden build, staging and published files; it failed with
+  flag `0x8000` before the fix and now verifies identical PDF bytes, no hidden flag/FinderInfo,
+  and staging cleanup. Engine/i18n: 102 tests passing, including real TeX and quit/publication
+  failure coverage; fmt and engine all-target Clippy pass. Existing user files were not changed.
+
 ## Release notes prepared for 0.6.0 (2026-11-02)
 
 - Wrote the local `texcraft-v0.6.0.md` tag-message file in the existing Chinese release format:

@@ -107,9 +107,11 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
     Either way no pass can hold up all later ones.
 
 Full typesets (⌘T, and on opening a project) save edited files and run latexmk on the real files
-into `.texcraft/build/`, then atomically copy a successful PDF beside the root. Live passes never
-touch that PDF. LIVE mode periodically refreshes edited projects: 5 minutes after the first edit,
-at a 5 s typing pause (at once after 10 minutes).
+into `.texcraft/build/`, then atomically publish a successful PDF beside the root. Publication
+writes only the PDF bytes into a fresh staging file, so macOS hidden flags and FinderInfo from
+the build or an old staging file cannot make the final PDF invisible in Finder. Live passes
+never touch that PDF. LIVE mode periodically refreshes edited projects: 5 minutes after the
+first edit, at a 5 s typing pause (at once after 10 minutes).
 
 Every normal exit waits for a forced full rebuild (`latexmk -g`) of each open project plus
 edited projects whose tabs were closed, in LIVE, AUTO and MANUAL modes. Unsaved buffers go

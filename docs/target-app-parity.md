@@ -85,7 +85,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 | Area | Status | Notes |
 |---|---|---|
-| Open file/folder, recent, templates, save, save as, revert | ✅ | recent documents list each project once, by its main file (a chapter, `.bib` or figure opened stands for its root); a full typeset writes `main.pdf` beside `main.tex` (intermediates stay in `.texcraft`) |
+| Open file/folder, recent, templates, save, save as, revert | ✅ | recent documents list each project once, by its main file (a chapter, `.bib` or figure opened stands for its root); a full typeset writes `main.pdf` beside `main.tex`, without inheriting macOS hidden flags or FinderInfo from cached output (intermediates stay in `.texcraft`) |
 | Reveal PDF, Export PDF | ✅ | |
 | Print, email, zip export, encodings, duplicate/rename/move | ❌ | |
 

@@ -1562,6 +1562,59 @@ fn a_successful_cached_build_republishes_an_older_pdf_beside_the_project() {
     assert_eq!(std::fs::read(published).unwrap(), b"current build PDF");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn publishing_a_pdf_does_not_inherit_finders_hidden_attributes() {
+    use std::os::macos::fs::MetadataExt;
+    use std::process::Command;
+
+    let (mut s, root) = edited_live_project("publish-visible");
+    let root = root.canonicalize().unwrap();
+    let pdf = texcraft_project::output_pdf(&root);
+    std::fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+    let published = texcraft_project::published_pdf(&root);
+    let part = published.with_file_name(".main.pdf.part");
+    // Both the cached TeX output and an old published/staging file may already be hidden.
+    // Finder supports both the BSD flag and the legacy invisible bit in FinderInfo.
+    for path in [&pdf, &published, &part] {
+        std::fs::write(path, b"PDF contents").unwrap();
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("hidden")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/xattr")
+                .args([
+                    "-wx",
+                    "com.apple.FinderInfo",
+                    "0000000000000000400000000000000000000000000000000000000000000000"
+                ])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_ne!(std::fs::metadata(path).unwrap().st_flags() & 0x8000, 0);
+    }
+    finish_with_pdf(&mut s, &root, &pdf, false);
+    assert_eq!(std::fs::read(&published).unwrap(), b"PDF contents");
+    assert_eq!(
+        std::fs::metadata(&published).unwrap().st_flags() & 0x8000,
+        0
+    );
+    let attrs = Command::new("/usr/bin/xattr")
+        .arg(&published)
+        .output()
+        .unwrap();
+    assert!(attrs.status.success());
+    assert!(!String::from_utf8_lossy(&attrs.stdout).contains("com.apple.FinderInfo"));
+    assert!(!part.exists());
+}
+
 #[test]
 fn quit_rebuilds_each_project_once_and_preserves_edits_received_during_the_build() {
     let (mut s, main) = edited_live_project("full-quit-roots");

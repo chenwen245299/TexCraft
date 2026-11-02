@@ -1108,7 +1108,21 @@ impl Session {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let part = dest.with_file_name(format!(".{name}.part"));
-        let copied = std::fs::copy(pdf, &part).and_then(|_| std::fs::rename(&part, &dest));
+        let copied = (|| -> std::io::Result<()> {
+            let mut source = std::fs::File::open(pdf)?;
+            // fs::copy clones macOS metadata too, including UF_HIDDEN and FinderInfo's
+            // invisible bit. Publish only PDF bytes into a fresh file; an old staging file
+            // may carry those attributes as well. Renaming then replaces an old hidden PDF.
+            match std::fs::remove_file(&part) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let mut staging = std::fs::File::create_new(&part)?;
+            std::io::copy(&mut source, &mut staging)?;
+            drop(staging);
+            std::fs::rename(&part, &dest)
+        })();
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&part);
             return Err(CommandError::Failed(trf!(
