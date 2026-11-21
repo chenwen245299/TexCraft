@@ -17,6 +17,19 @@ authenticate:
 
 Replies: `{"id": 1, "ok": true, "result": …}` or `{"id": 1, "ok": false, "error": "…"}`.
 
+One project occupies one window. `command.run` with `file.openRecent {path}` opens that file's
+owning project; `file.openPath {path}` also routes other projects to independent windows.
+The original window's tabs, PDF and AI state remain intact. `state.inspect` includes
+`ui.projectWindows` (`pid`, `path`, `template`) for windows it launched and `ai.project` for the folder
+its Assistant tools use. `ai.editor` reports the current project name, active file and root
+paths relative to the project, modified state, cursor, selection lines and `contentsIncluded`.
+`ui.processId` and `ui.executable` identify the inspected instance; use them to distinguish a
+development build from an installed app. Each AI message's `source` records its project folder,
+owning root and active file at send time. New/template requests launch independent windows
+when a project is open; `--new-template ID` is the platform's explicit child launch option.
+With a control token file, child windows allocate separate control
+ports, printed in the same app log, and accept that token file too.
+
 ## Methods
 
 | Method | Params | Result |

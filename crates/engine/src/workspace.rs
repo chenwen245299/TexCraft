@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CommandError, Effect, Selection, Session};
+use crate::{CommandError, Effect, OpenResult, Selection, Session};
 
 /// Documents and project to reopen after quitting. An explicitly empty workspace means the
 /// user closed their documents; it must not fall back to the recent-documents list.
@@ -66,7 +66,7 @@ impl Session {
         }
         for tab in &workspace.documents {
             match self.open_path(&tab.path) {
-                Ok(Some(i)) => {
+                Ok(OpenResult::Here(Some(i))) => {
                     if let Some(doc) = self.docs.get_mut(i) {
                         let len = doc.text.chars().count();
                         doc.selection = Selection {
@@ -75,7 +75,7 @@ impl Session {
                         };
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(e) => errors.push(e),
             }
         }

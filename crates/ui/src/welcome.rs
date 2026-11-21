@@ -661,7 +661,7 @@ fn recent_list(ui: &mut Ui, t: &Tokens, session: &mut Session, filter: &str) -> 
             .map(|m| trf!("Last Modified on {date}", date = crate::clock::date_time(m)))
             .unwrap_or_default();
         if list_row(ui, t, &title, &when, Some(&path.display().to_string())) {
-            match session.open_path(path) {
+            match session.run("file.openRecent", &serde_json::json!({"path": path})) {
                 Ok(_) => pick = Some(Pick::Done),
                 Err(e) => session.set_status(e.to_string()),
             }

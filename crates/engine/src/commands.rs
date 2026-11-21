@@ -528,6 +528,10 @@ static REGISTRY: &[CommandSpec] = &[
         Some(Shortcut::cmd("N")),
         always,
         |s, _| {
+            if !s.docs.is_empty() || s.project_dir.is_some() || s.pdf.path.is_some() {
+                s.effect(Effect::NewProjectWindow("blank".into()));
+                return Ok(());
+            }
             let blank = texcraft_project::templates::template("blank").map_or("", |t| t.source);
             s.new_untitled(blank.to_string());
             Ok(())
@@ -569,7 +573,11 @@ static REGISTRY: &[CommandSpec] = &[
                 Some(id) => {
                     let t = texcraft_project::templates::template(id)
                         .ok_or_else(|| CommandError::Params(format!("no template `{id}`")))?;
-                    s.new_untitled(t.source.to_string());
+                    if !s.docs.is_empty() || s.project_dir.is_some() || s.pdf.path.is_some() {
+                        s.effect(Effect::NewProjectWindow(id.to_string()));
+                    } else {
+                        s.new_untitled(t.source.to_string());
+                    }
                 }
                 None => s.effect(Effect::TemplateGallery),
             }
@@ -744,6 +752,20 @@ static REGISTRY: &[CommandSpec] = &[
             Ok(())
         },
         params = "{path?: string}"
+    ),
+    cmd!(
+        "file.openRecent",
+        "Open Recent",
+        None,
+        0,
+        None,
+        always,
+        |s, p| {
+            let path = std::path::Path::new(param_str(p, "path")?);
+            let entry = crate::opening::recent_entry(path, &|p| s.text_of(p));
+            s.open_path(&entry).map(|_| ())
+        },
+        params = "{path: string} — opens the owning project, in another window when needed"
     ),
     cmd!(
         "file.openPath",

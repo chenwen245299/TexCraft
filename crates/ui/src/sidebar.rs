@@ -1920,7 +1920,10 @@ fn text_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarS
             }
         });
     if let Some((path, offset, len)) = jump
-        && session.open_path(&path).is_ok()
+        && matches!(
+            session.open_path(&path),
+            Ok(texcraft_engine::OpenResult::Here(Some(_)))
+        )
         && let Some(d) = session.doc()
     {
         let a = texcraft_engine::edit::char_of(&d.text, offset);
@@ -2036,7 +2039,10 @@ fn replace_all(session: &mut Session, st: &mut SidebarState) {
     let files: Vec<PathBuf> = st.results.iter().map(|(p, _)| p.clone()).collect();
     let active = session.active;
     for path in files {
-        if session.open_path(&path).is_err() {
+        if !matches!(
+            session.open_path(&path),
+            Ok(texcraft_engine::OpenResult::Here(Some(_)))
+        ) {
             continue;
         }
         let Some(d) = session.doc() else { continue };

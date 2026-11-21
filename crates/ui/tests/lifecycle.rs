@@ -107,6 +107,37 @@ fn cancelling_an_open_panel_keeps_welcome_and_never_exposes_a_template() {
 }
 
 #[test]
+fn picking_another_recent_project_requests_a_window_and_keeps_the_original_tabs() {
+    let mut rig = Rig::new();
+    let base = std::env::temp_dir().join(format!("texcraft-ui-projects-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    std::fs::create_dir_all(base.join("b")).unwrap();
+    let original = base.join("a/original.tex");
+    let other = base.join("b/other.tex");
+    std::fs::write(&original, "\\documentclass{article}\nOriginal project.").unwrap();
+    std::fs::write(&other, "\\documentclass{article}\nOther project.").unwrap();
+    rig.session.open_path(&original).unwrap();
+    rig.session
+        .run("edit.insertText", &json!({"text": "Unsaved original"}))
+        .unwrap();
+    let original_text = rig.session.doc().unwrap().text.clone();
+    rig.session.set_recent(vec![other.clone()]);
+    rig.bench.welcome.inline = true;
+    rig.bench.welcome.show_window(false);
+    rig.click(&other.file_name().unwrap().to_string_lossy());
+    assert_eq!(rig.session.docs.len(), 1);
+    assert_eq!(rig.session.doc().unwrap().text, original_text);
+    assert!(rig.session.doc().unwrap().is_dirty());
+    assert!(
+        rig.bench
+            .requests
+            .contains(&Request::OpenProjectWindow(other.canonicalize().unwrap()))
+    );
+    assert!(!rig.bench.welcome.open);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn closing_last_tab_returns_to_welcome_and_closing_project_welcome_preserves_the_project() {
     let mut rig = Rig::new();
     let file = rig.saved_file("last-tab");
@@ -192,4 +223,41 @@ fn discarding_a_deleted_file_can_still_quit_without_recreating_it() {
     assert!(!file.exists());
     assert!(rig.session.docs.is_empty());
     assert!(rig.bench.requests.contains(&Request::Quit));
+}
+
+#[test]
+fn transferring_a_saved_tab_dismisses_its_prompt_without_closing_the_next_tab() {
+    let mut rig = Rig::new();
+    let base = std::env::temp_dir().join(format!("texcraft-transfer-ui-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    std::fs::create_dir_all(base.join("b")).unwrap();
+    let original = base.join("a/main.tex");
+    let chapter = base.join("a/chapter.tex");
+    let target = base.join("b/copied.tex");
+    std::fs::write(&original, "\\documentclass{article}").unwrap();
+    std::fs::write(&chapter, "% !TEX root = main.tex\nChapter").unwrap();
+    rig.session.open_path(&original).unwrap();
+    rig.session.open_path(&chapter).unwrap();
+    rig.session.active = 0;
+    rig.session
+        .run("edit.insertText", &json!({"text":"Unsaved root"}))
+        .unwrap();
+    rig.bench.dialog = Dialog::ConfirmClose {
+        doc: 0,
+        quit: false,
+    };
+    rig.session.save_as(0, target.clone()).unwrap();
+    rig.frame(Vec::new());
+    assert_eq!(rig.bench.dialog, Dialog::None);
+    assert_eq!(rig.session.docs.len(), 1);
+    assert_eq!(
+        rig.session.doc().unwrap().path,
+        Some(chapter.canonicalize().unwrap())
+    );
+    assert!(
+        rig.bench
+            .requests
+            .contains(&Request::OpenProjectWindow(target.canonicalize().unwrap()))
+    );
+    std::fs::remove_dir_all(base).unwrap();
 }

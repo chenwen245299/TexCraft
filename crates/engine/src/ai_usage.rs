@@ -317,16 +317,19 @@ impl Session {
         }
         let include = self.ai.config.include_document;
         include.hash(&mut h);
-        if include && let Some(d) = self.doc() {
+        if let Some(d) = self.doc() {
             (
                 self.active,
+                &d.path,
                 d.revision,
-                d.selection.start(),
-                d.selection.end(),
+                d.saved_revision,
+                d.selection.anchor,
+                d.selection.cursor,
             )
                 .hash(&mut h);
         }
         self.git_dir().hash(&mut h);
+        self.root_path().hash(&mut h);
         self.ai.messages.len().hash(&mut h);
         if let Some(m) = self.ai.messages.last() {
             (m.text.len(), m.pending, m.blocks.len(), m.error.is_some()).hash(&mut h);

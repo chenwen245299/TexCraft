@@ -29,14 +29,50 @@ A crate depends only on lower layers. Nothing below `ui` knows about egui.
   editor, flash rectangles in the PDF, open a panel…) that `Workbench::apply_effects` turns into UI
   state or platform `Request`s for the app (file panels, Finder, quit, native edit actions).
 
-The desktop app starts with `Session::empty` and restores the persisted workspace (project
-folder, saved tabs in order, active file and character selections; standalone PDFs too).
-Explicit launch paths take precedence. Legacy settings without a workspace reopen the most
-recent existing project once; an explicitly empty workspace never falls back to recents.
-Missing files do not block the remaining tabs. Untitled documents are created by New/template
+The desktop app starts with `Session::empty`. Ordinary launches show the welcome window for
+the user to choose a project; neither a persisted workspace nor legacy recent documents open
+automatically. Settings and the recent-documents list still load, and explicit launch paths
+open the selected files or folders directly. Untitled documents are created by New/template
 commands; edited unsaved documents must pass the save prompt before quitting. Quit prompts
-keep saved tabs, while closing the last tab clears the project/PDF and opens the welcome window.
-The welcome window remains open when a file panel is cancelled.
+keep saved tabs available for the final typeset, while closing the last tab clears the
+project/PDF and opens the welcome window. The welcome window remains open when a file panel
+is cancelled.
+
+Each project owns an independent native window. Open Recent resolves a file to its owning
+project; opening another root or folder queues `Effect::OpenProjectWindow` without changing
+the current session. Included chapters and shared assets remain tabs of their project.
+The desktop platform starts an independent app instance for the new window after flushing
+preferences. Its engine, PDF worker, menus and AI conversation are separate; closing either
+window leaves the other running. Controlled child windows use an automatically allocated
+port and the original token file, reporting their port in the inherited log. The parent
+reports their process IDs and launch paths/templates in `ui.projectWindows`. New/template
+commands also request independent windows when a project is already open. Cross-project
+Save As writes the destination before transferring that tab to a separate window; the UI
+retires its old save prompt before a reused tab index can close another document.
+
+The initial file's owning root determines its project folder, including when opening a chapter
+in a subfolder. The owning root stays fixed when shared chapters are selected. AI tools use
+the project folder; history is keyed by the owning root file, falling back to the folder for
+rootless projects. Thus independent roots in one folder have separate conversations. Legacy
+folder histories are eligible only when exactly one root can own them. A direct directory change
+synchronously stops an old AI request and resets its context before any tools can use the
+new directory.
+
+Each Assistant question captures the active editor tab afresh: project-relative file and root
+paths, unsaved state, caret and selection lines. That identity takes precedence over files
+mentioned in earlier turns. Document inclusion controls the current buffer and selected text;
+the file identity still accompanies a question when contents are excluded. The composer chip
+shows the active path, and `ai.editor` exposes the same metadata to agents. Requests already
+in flight retain the editor context captured when their question was sent.
+
+Messages persist their source project, root and file. Inserting an answer requires the same
+source file; legacy answers without provenance must be copied manually. AI actions and inline
+suggestions validate their original targets, including the file identity when a tab index is
+reused. Tool rounds capture their directory at request time. Git operations discard stale
+results/queued work when their directory changes. Renames remap tabs, navigation, roots and
+chat provenance together, retiring jobs whose paths moved. Closing the last tab clears editor,
+AI and diagnostic state synchronously. A late compiler result may publish its own output, but
+cannot replace a different project's PDF, issues, logs or status.
 
 ## Interface languages
 

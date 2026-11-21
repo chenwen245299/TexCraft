@@ -1634,7 +1634,8 @@ fn quit_rebuilds_each_project_once_and_preserves_edits_received_during_the_build
         "\\documentclass{article}\n\\begin{document}\nOther.\n\\end{document}\n",
     )
     .unwrap();
-    s.open_path(&other).unwrap();
+    // A previously edited project can still be due after its window's tabs are gone.
+    s.mark_stale(&other, Instant::now());
     s.settings.live_typeset = false;
     s.effects.clear();
     assert!(s.quit_requested());
@@ -1791,17 +1792,23 @@ fn an_opened_file_keeps_its_own_projects_pdf() {
     std::fs::create_dir_all(&b).unwrap();
     std::fs::write(b.join("main.tex"), doc).unwrap();
     std::fs::write(b.join("chapter.tex"), chapter).unwrap();
-    s.open_path(&b.join("main.tex")).unwrap();
-    let main_b = s.root_path().unwrap();
+    assert_eq!(
+        s.open_path(&b.join("main.tex")).unwrap(),
+        OpenResult::NewWindow
+    );
+    let mut other = session();
+    other.open_path(&b.join("main.tex")).unwrap();
+    let main_b = other.root_path().unwrap();
     let live_pdf = dir.join("live-b.pdf");
     std::fs::write(&live_pdf, b"%PDF-1.5").unwrap();
-    finish_with_pdf(&mut s, &main_b, &live_pdf, true);
-    s.open_path(&b.join("chapter.tex")).unwrap();
-    assert_eq!(s.pdf.path.as_deref(), Some(live_pdf.as_path()));
+    finish_with_pdf(&mut other, &main_b, &live_pdf, true);
+    other.open_path(&b.join("chapter.tex")).unwrap();
+    assert_eq!(other.pdf.path.as_deref(), Some(live_pdf.as_path()));
     let next_pdf = dir.join("live-b-2.pdf");
     std::fs::write(&next_pdf, b"%PDF-1.5").unwrap();
-    finish_with_pdf(&mut s, &main_b, &next_pdf, true);
-    assert_eq!(s.pdf.path.as_deref(), Some(next_pdf.as_path()));
+    finish_with_pdf(&mut other, &main_b, &next_pdf, true);
+    assert_eq!(other.pdf.path.as_deref(), Some(next_pdf.as_path()));
+    assert_eq!(s.pdf.path.as_deref(), Some(pdf.as_path()));
 }
 
 /// Ticks the way the UI does until no typeset runs, waits or is about to start (or a minute

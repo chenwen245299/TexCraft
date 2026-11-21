@@ -794,7 +794,12 @@ fn path_like(code: &str) -> bool {
 }
 
 /// Opens link `target`: a file of the project in the editor (at its line), or a web page.
-fn open_link(ctx: &egui::Context, session: &mut Session, target: &str) {
+fn open_link(
+    ctx: &egui::Context,
+    session: &mut Session,
+    target: &str,
+    source: Option<&std::path::Path>,
+) {
     if target.starts_with("https://") || target.starts_with("http://") {
         ctx.open_url(egui::OpenUrl::new_tab(target));
         return;
@@ -803,6 +808,10 @@ fn open_link(ctx: &egui::Context, session: &mut Session, target: &str) {
     let Some(root) = session.git_dir().and_then(|r| r.canonicalize().ok()) else {
         return;
     };
+    if source.is_some_and(|source| source != root) {
+        session.set_status(tr("This answer belongs to another project. Open that project before following its file links."));
+        return;
+    }
     let Some(file) = root
         .join(&path)
         .canonicalize()
@@ -927,9 +936,10 @@ fn tool_row(
     session: &mut Session,
     id: Id,
     used: &ToolUse,
-    x: f32,
-    text_w: f32,
+    metrics: (f32, f32),
+    source: Option<&std::path::Path>,
 ) {
+    let (x, text_w) = metrics;
     let w = ui.available_width();
     let label = match used.kind {
         ToolKind::Read => match used.lines {
@@ -983,7 +993,7 @@ fn tool_row(
                 Some((first, _)) => format!("{}#L{first}", used.target),
                 None => used.target.clone(),
             };
-            open_link(ui.ctx(), session, &target);
+            open_link(ui.ctx(), session, &target, source);
         }
     }
 }
@@ -1012,7 +1022,17 @@ fn answer(
     }
     // The project files the model looked at: a click opens a file that was read.
     for (k, used) in m.tools.iter().enumerate() {
-        tool_row(ui, t, session, tool_row_id(index, k), used, x, text_w);
+        tool_row(
+            ui,
+            t,
+            session,
+            tool_row_id(index, k),
+            used,
+            (x, text_w),
+            m.source
+                .as_ref()
+                .and_then(|source| source.project.as_deref()),
+        );
     }
     let root = session.git_dir();
     let is_file = |s: &str| root.as_ref().is_some_and(|r| r.join(s).is_file());
@@ -1042,7 +1062,14 @@ fn answer(
                 if let Some(l) = under {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
-                        open_link(ui.ctx(), session, &l.target);
+                        open_link(
+                            ui.ctx(),
+                            session,
+                            &l.target,
+                            m.source
+                                .as_ref()
+                                .and_then(|source| source.project.as_deref()),
+                        );
                     }
                 }
                 ui.painter().galley(at, g, t.text);
@@ -1318,15 +1345,9 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
         )
     };
     let include = session.ai.config.include_document;
-    let doc_name = session
-        .doc()
-        .map(texcraft_engine::Document::display_name)
-        .unwrap_or_default();
-    let chip_text = if include {
-        doc_name
-    } else {
-        tr("No document").into()
-    };
+    let chip_text = session
+        .ai_active_file()
+        .unwrap_or_else(|| tr("No document").into());
     let f = FontId::proportional(10.5);
     let tw = p
         .layout_no_wrap(chip_text.clone(), f.clone(), t.text_weak)
@@ -1344,11 +1365,11 @@ fn composer_box(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanel
     );
     let resp = ui
         .interact(chip_r, Id::new("ai-doc-chip"), Sense::click())
-        .on_hover_text(if include {
-            tr("The open document goes along with each question. Click to leave it out.")
+        .on_hover_text(format!("{chip_text}\n{}", if include {
+            tr("The current file's unsaved contents and selection go with each question. Click to exclude the contents.")
         } else {
-            tr("Questions go without the document. Click to include it.")
-        });
+            tr("The active file path is still shared. Contents are excluded. Click to include them.")
+        }));
     p.rect(
         chip_r,
         5.0,
@@ -1916,6 +1937,50 @@ fn context_popover(ui: &Ui, t: &Tokens, c: &ContextUsage, anchor: Rect) -> Rect 
 mod link_tests {
     use super::*;
 
+    #[test]
+    fn old_project_answer_links_cannot_resolve_against_the_current_projects_files() {
+        let base =
+            std::env::temp_dir().join(format!("texcraft-ai-link-context-{}", std::process::id()));
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(base.join(name)).unwrap();
+            std::fs::write(base.join(name).join("main.tex"), "\\documentclass{article}").unwrap();
+            std::fs::write(
+                base.join(name).join("chapter.tex"),
+                "% !TEX root = main.tex\nChapter",
+            )
+            .unwrap();
+        }
+        let base = base.canonicalize().unwrap();
+        let mut session = Session::empty(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.open_path(&base.join("a/main.tex")).unwrap();
+        let ctx = egui::Context::default();
+        open_link(&ctx, &mut session, "chapter.tex#L2", Some(&base.join("b")));
+        assert_eq!(session.docs.len(), 1);
+        assert!(
+            session
+                .status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("another project")
+        );
+        open_link(
+            &ctx,
+            &mut session,
+            "../b/chapter.tex",
+            Some(&base.join("a")),
+        );
+        assert_eq!(session.docs.len(), 1);
+        open_link(&ctx, &mut session, "chapter.tex#L2", Some(&base.join("a")));
+        assert_eq!(
+            session.doc().unwrap().path,
+            Some(base.join("a/chapter.tex"))
+        );
+        assert_eq!(session.doc().unwrap().caret_line(), 2);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// Answers' Markdown: bold, code and links; unclosed markers stay text.
     #[test]
     fn spans_find_links_code_and_bold() {
@@ -1994,6 +2059,7 @@ mod usage_row_tests {
         }];
         s.ai.config.normalize();
         let message = |role, text: &str| ChatMessage {
+            source: None,
             role,
             text: text.into(),
             blocks: Vec::new(),

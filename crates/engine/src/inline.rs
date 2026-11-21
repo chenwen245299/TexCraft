@@ -3,6 +3,7 @@
 //! at the caret; Tab inserts it, ⌘→ its next word, Esc dismisses it, typing what it says keeps
 //! the rest. Settings: `texcraft_ai::inline::InlineSettings` (in the AI configuration).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ use crate::{CommandError, Session, edit};
 pub struct Suggestion {
     /// The document it belongs to (index) and its revision.
     pub doc: usize,
+    /// File identity in addition to the index, which closing other tabs can reuse.
+    pub path: Option<PathBuf>,
     /// The document's revision when it was made.
     pub revision: u64,
     /// The caret (character index) it continues from.
@@ -28,6 +31,7 @@ pub struct Suggestion {
 /// A request on its way.
 struct Pending {
     doc: usize,
+    path: Option<PathBuf>,
     revision: u64,
     at: usize,
     before: String,
@@ -89,6 +93,7 @@ impl Session {
         let s = self.inline.suggestion.as_ref()?;
         let d = self.docs.get(s.doc)?;
         (s.doc == self.active
+            && d.typeset_path() == s.path.as_deref()
             && s.revision == d.revision
             && d.selection.is_empty()
             && d.selection.cursor == s.at)
@@ -109,7 +114,10 @@ impl Session {
             let d = self.docs.get(s.doc)?;
             let caret = d.selection.cursor;
             let n = caret.checked_sub(s.at).filter(|n| *n > 0)?;
-            if s.doc != self.active || !d.selection.is_empty() {
+            if s.doc != self.active
+                || d.typeset_path() != s.path.as_deref()
+                || !d.selection.is_empty()
+            {
                 return None;
             }
             let typed = d
@@ -118,6 +126,7 @@ impl Session {
             let rest = s.text.strip_prefix(typed)?;
             (!rest.is_empty() && n == typed.chars().count()).then(|| Suggestion {
                 doc: s.doc,
+                path: s.path.clone(),
                 revision: d.revision,
                 at: caret,
                 text: rest.to_string(),
@@ -171,6 +180,7 @@ impl Session {
         let done = rest.is_empty();
         self.inline.suggestion = (!done).then_some(Suggestion {
             doc: s.doc,
+            path: s.path,
             revision,
             at,
             text: rest,
@@ -197,6 +207,7 @@ impl Session {
     }
 
     fn start_inline_request(&mut self) -> Result<(), CommandError> {
+        self.ai_validate_context()?;
         let Some((provider, model)) = self
             .ai
             .config
@@ -246,6 +257,7 @@ impl Session {
         );
         self.inline.pending = Some(Pending {
             doc: self.active,
+            path: d.typeset_path().map(std::path::Path::to_path_buf),
             revision: d.revision,
             at,
             before,
@@ -298,13 +310,13 @@ impl Session {
                             &p.after,
                             self.ai.config.inline.max_lines,
                         );
-                        let current = self
-                            .docs
-                            .get(p.doc)
-                            .is_some_and(|d| d.revision == p.revision);
+                        let current = self.docs.get(p.doc).is_some_and(|d| {
+                            d.revision == p.revision && d.typeset_path() == p.path.as_deref()
+                        });
                         self.inline.suggestion =
                             (current && !text.is_empty()).then_some(Suggestion {
                                 doc: p.doc,
+                                path: p.path,
                                 revision: p.revision,
                                 at: p.at,
                                 text,
@@ -359,4 +371,33 @@ fn only_thought(config: &texcraft_ai::Config) -> String {
          answers without reasoning for suggestions.",
         model = model
     )
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn a_reused_tab_index_and_revision_cannot_accept_another_files_suggestion() {
+        let mut session = Session::empty(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.new_untitled("First".into());
+        let original = session.doc().unwrap();
+        let suggestion = Suggestion {
+            doc: 0,
+            path: original.typeset_path().map(PathBuf::from),
+            revision: original.revision,
+            at: original.selection.cursor,
+            text: " continuation".into(),
+        };
+        session.inline.suggestion = Some(suggestion.clone());
+        assert!(session.inline_suggestion().is_some());
+        session.close(0);
+        session.new_untitled("Other".into());
+        // Simulate a stale answer arriving after the tab slot has been reused.
+        session.inline.suggestion = Some(suggestion);
+        assert!(session.inline_suggestion().is_none());
+        assert!(session.inline_accept(Accept::All).is_err());
+        assert_eq!(session.doc().unwrap().text, "Other");
+    }
 }

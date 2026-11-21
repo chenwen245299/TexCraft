@@ -47,14 +47,30 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Thinking…", "正在思考…"),
     ("Remove", "移除"),
     ("Ask about your LaTeX…", "询问 LaTeX 相关问题…"),
-    ("No document", "不附带文稿"),
+    ("No document", "未打开文稿"),
     (
-        "The open document goes along with each question. Click to leave it out.",
-        "每个问题都会附带打开的文稿。点按以不再附带。",
+        "The active file does not belong to this project. Open it in its own project window before asking AI.",
+        "当前文件不属于此项目。请先在其独立项目窗口中打开，再向 AI 提问。",
     ),
     (
-        "Questions go without the document. Click to include it.",
-        "问题不会附带文稿。点按以附带。",
+        "No file context was saved for that answer. Copy its text to insert it manually.",
+        "这条回答未保存来源文件信息。请拷贝文本后手动插入。",
+    ),
+    (
+        "That answer belongs to another file. Open its file before inserting it.",
+        "这条回答属于另一个文件。请先打开对应文件再插入。",
+    ),
+    (
+        "This answer belongs to another project. Open that project before following its file links.",
+        "这条回答属于另一个项目。请先打开对应项目再跟随其中的文件链接。",
+    ),
+    (
+        "The current file's unsaved contents and selection go with each question. Click to exclude the contents.",
+        "每个问题都会附带当前文件尚未保存的内容和选区。点按以不再附带内容。",
+    ),
+    (
+        "The active file path is still shared. Contents are excluded. Click to include them.",
+        "仍会提供当前文件的路径，但不附带内容。点按以附带内容。",
     ),
     ("Stop", "停止"),
     ("Send (↩)", "发送（↩）"),

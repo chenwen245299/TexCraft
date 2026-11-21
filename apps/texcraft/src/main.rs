@@ -9,6 +9,7 @@
 mod control;
 #[cfg(target_os = "macos")]
 mod menu;
+mod project_windows;
 #[cfg(test)]
 mod tests;
 
@@ -33,7 +34,7 @@ struct Persisted {
     /// Bumped when defaults change in a way saved settings should pick up.
     #[serde(default)]
     version: u32,
-    /// None is the legacy format, which only had a recent-documents list.
+    /// Saved snapshot retained for compatibility, never opened implicitly at startup.
     #[serde(default)]
     workspace: Option<texcraft_engine::workspace::Workspace>,
 }
@@ -46,6 +47,7 @@ const PERSISTED_VERSION: u32 = 2;
 #[derive(Default)]
 struct Options {
     paths: Vec<PathBuf>,
+    template: Option<String>,
     control_port: Option<u16>,
     control_token_file: Option<PathBuf>,
     screenshot: Option<PathBuf>,
@@ -57,25 +59,21 @@ struct Options {
     commands: Vec<String>,
 }
 
-/// Explicit launch paths take precedence over session restoration. Older installs have no
-/// workspace yet: reopen their most recent existing project once, then save the new format.
-fn open_startup(
-    session: &mut Session,
-    opts: &Options,
-    saved: Option<&texcraft_engine::workspace::Workspace>,
-) {
-    let errors = if !opts.paths.is_empty() {
-        opts.paths
-            .iter()
-            .filter_map(|p| session.open_path(p).err())
-            .collect::<Vec<_>>()
-    } else if let Some(workspace) = saved {
-        session.restore_workspace(workspace)
-    } else if let Some(path) = session.recent.iter().find(|p| p.exists()).cloned() {
-        session.open_path(&path).err().into_iter().collect()
-    } else {
-        Vec::new()
-    };
+/// Only explicit launch paths open documents. Ordinary launches wait for the user to choose
+/// a project in the welcome window, including installs with a saved workspace or recents.
+fn open_startup(session: &mut Session, opts: &Options) {
+    if let Some(template) = opts
+        .template
+        .as_deref()
+        .and_then(texcraft_project::templates::template)
+    {
+        session.new_untitled(template.source.to_string());
+    }
+    let errors = opts
+        .paths
+        .iter()
+        .filter_map(|p| session.open_path(p).err())
+        .collect::<Vec<_>>();
     if !errors.is_empty() {
         session.set_status(
             errors
@@ -132,6 +130,13 @@ fn parse_args() -> Result<Options, String> {
                 );
             }
             "--run" => o.commands.push(value("--run")?),
+            "--new-template" => {
+                let template = value("--new-template")?;
+                if texcraft_project::templates::template(&template).is_none() {
+                    return Err(format!("unknown template {template}"));
+                }
+                o.template = Some(template);
+            }
             "--no-welcome" => o.welcome = false,
             "--write-icon" => {
                 // Used by scripts/bundle-macos.sh to make the .icns.
@@ -172,6 +177,8 @@ struct App {
     session: Session,
     bench: Workbench,
     control: Option<control::Server>,
+    control_token_file: Option<PathBuf>,
+    project_windows: Vec<project_windows::ProjectWindow>,
     deferred: Vec<Deferred>,
     native: Vec<NativeEdit>,
     /// The window title last sent (every viewport command costs a frame, so send changes only).
@@ -225,12 +232,10 @@ impl App {
             session.update.url = url;
         }
         let mut bench = Workbench::new(&ctx);
-        let mut workspace = None;
         if let Some(p) = cc
             .storage
             .and_then(|s| eframe::get_value::<Persisted>(s, STORAGE_KEY))
         {
-            workspace = p.workspace;
             if let Some(v) = p.view {
                 session.view = v;
             }
@@ -259,7 +264,7 @@ impl App {
         }
         // Before anything shows text: the menu bar, the welcome window, status messages.
         texcraft_i18n::set_language(session.lang());
-        open_startup(&mut session, &opts, workspace.as_ref());
+        open_startup(&mut session, &opts);
         if session.root_path().is_some() {
             // Typeset right away so the PDF appears (like opening a project in the target app).
             if let Err(e) = session.typeset() {
@@ -315,6 +320,8 @@ impl App {
         };
 
         Self {
+            control_token_file: opts.control_token_file,
+            project_windows: Vec::new(),
             native_quit_routing,
             session,
             bench,
@@ -358,7 +365,7 @@ impl App {
             return;
         }
         if let Some(p) = id.strip_prefix("recent:") {
-            if let Err(e) = self.session.open_path(std::path::Path::new(p)) {
+            if let Err(e) = self.session.run("file.openRecent", &json!({"path": p})) {
                 self.session.set_status(e.to_string());
             }
             return;
@@ -368,7 +375,7 @@ impl App {
         }
     }
 
-    fn handle_requests(&mut self, ctx: &egui::Context) {
+    fn handle_requests(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         for r in std::mem::take(&mut self.bench.requests) {
             match r {
                 Request::Open => {
@@ -380,9 +387,14 @@ impl App {
                         .add_filter(tr("All files"), &["*"])
                         .pick_files()
                     {
+                        let mut opened_here = false;
                         for p in paths {
                             match self.session.open_path(&p) {
-                                Ok(_) => self.bench.document_opened(ctx),
+                                Ok(result) if result.is_here() => {
+                                    self.bench.document_opened(ctx);
+                                    opened_here = true;
+                                }
+                                Ok(_) => continue,
                                 Err(e) => {
                                     self.bench.dialog = texcraft_ui::dialogs::Dialog::Alert {
                                         title: tr("Cannot open").into(),
@@ -392,21 +404,27 @@ impl App {
                             }
                         }
                         // No PDF for what was opened (another document's gave way): typeset it.
-                        if self.session.pdf.path.is_none() {
+                        if opened_here
+                            && self.session.pdf.path.is_none()
+                            && self.session.root_path().is_some()
+                        {
                             let _ = self.session.typeset();
                         }
                     }
                 }
                 Request::OpenFolder => {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        if let Err(e) = self.session.open_path(&dir) {
-                            self.session.set_status(e.to_string());
-                        } else {
-                            self.bench.document_opened(ctx);
-                            if self.session.root_path().is_some() && self.session.pdf.path.is_none()
-                            {
-                                let _ = self.session.typeset();
+                        match self.session.open_path(&dir) {
+                            Ok(result) if result.is_here() => {
+                                self.bench.document_opened(ctx);
+                                if self.session.root_path().is_some()
+                                    && self.session.pdf.path.is_none()
+                                {
+                                    let _ = self.session.typeset();
+                                }
                             }
+                            Ok(_) => {}
+                            Err(e) => self.session.set_status(e.to_string()),
                         }
                     }
                 }
@@ -453,6 +471,42 @@ impl App {
                 }
                 Request::Reveal(p) => reveal(&p),
                 Request::OpenExternally(p) => open_externally(&p),
+                Request::OpenProjectWindow(path) => {
+                    // The new instance reads the current preferences and recents, while its
+                    // explicit path starts a fresh project/AI session instead of restoring tabs.
+                    if let Some(storage) = frame.storage_mut() {
+                        eframe::App::save(self, storage);
+                        storage.flush();
+                    }
+                    match project_windows::ProjectWindow::open(
+                        path.clone(),
+                        self.control_token_file
+                            .as_deref()
+                            .filter(|_| self.control.is_some()),
+                    ) {
+                        Ok(window) => self.project_windows.push(window),
+                        Err(e) => self.session.set_status(texcraft_i18n::trf!(
+                            "cannot open {path}: {e}",
+                            path = path.display(),
+                            e = e
+                        )),
+                    }
+                }
+                Request::NewProjectWindow(template) => {
+                    if let Some(storage) = frame.storage_mut() {
+                        eframe::App::save(self, storage);
+                        storage.flush();
+                    }
+                    match project_windows::ProjectWindow::new(
+                        template,
+                        self.control_token_file
+                            .as_deref()
+                            .filter(|_| self.control.is_some()),
+                    ) {
+                        Ok(window) => self.project_windows.push(window),
+                        Err(error) => self.session.set_status(error.to_string()),
+                    }
+                }
                 Request::Native(n) => {
                     self.native.push(n);
                     ctx.request_repaint();
@@ -519,6 +573,11 @@ impl App {
                         "monitorSize": ctx.input(|i| i.viewport().monitor_size.map(|s| [s.x, s.y])),
                         "trafficLights": texcraft_macos::traffic_light_frames(frame),
                         "windows": texcraft_macos::windows(),
+                        "projectWindows": self.project_windows.iter().map(|w| json!({
+                            "pid": w.id(), "path": w.path, "template": w.template,
+                        })).collect::<Vec<_>>(),
+                        "processId": std::process::id(),
+                        "executable": std::env::current_exe().ok(),
                         "welcome": { "open": self.bench.welcome.open, "launch": self.bench.welcome.launch, "mainHidden": self.bench.main_hidden(), "glass": self.bench.welcome.glass() },
                         "modelPicker": self.bench.prefs.model_picker_info(),
                         "updateWindow": self.bench.update_window,
@@ -1074,7 +1133,9 @@ impl eframe::App for App {
         self.bench.ui(ui, &mut self.session);
         // A language chosen this frame (Settings, a menu, a command) shows from the next one.
         self.apply_language(&ctx);
-        self.handle_requests(&ctx);
+        self.handle_requests(&ctx, frame);
+        self.project_windows
+            .retain_mut(|window| window.is_running());
         self.handle_deferred(&ctx);
 
         // Window title: document name.

@@ -19,6 +19,8 @@ use crate::{CommandError, Effect, Session};
 
 /// A right-click action that ran: what it ran on and its answer (the editor's result card).
 pub struct ActionRun {
+    pub project: Option<PathBuf>,
+    pub root: Option<PathBuf>,
     /// The action's id.
     pub action: String,
     /// Its name, in the interface language.
@@ -167,6 +169,8 @@ impl Session {
     /// selects): a request of its own whose answer streams into [`ActionRun`]. A run already
     /// showing is dropped.
     pub fn ai_run_action(&mut self, id: &str) -> Result<(), CommandError> {
+        self.ai_follow_project();
+        self.ai_validate_context()?;
         let action = self
             .ai
             .config
@@ -223,6 +227,8 @@ impl Session {
         self.ai_action_dismiss();
         let job = texcraft_ai::start(&req, Arc::clone(&self.waker));
         self.ai.action = Some(ActionRun {
+            project: self.ai_project_root(),
+            root: self.project_root.clone(),
             action: action.id.clone(),
             label: action.label(),
             output: action.output,
@@ -294,6 +300,11 @@ impl Session {
             .action
             .as_ref()
             .ok_or_else(|| CommandError::Failed(tr("No AI action has run.").into()))?;
+        if run.project != self.ai_project_root() || run.root != self.project_root {
+            return Err(CommandError::Failed(
+                tr("The document of that text is no longer open.").into(),
+            ));
+        }
         if run.pending {
             return Err(CommandError::Failed(
                 tr("Wait for the answer first.").into(),
@@ -325,6 +336,7 @@ impl Session {
 
     /// Asks again (another answer to the same question).
     pub fn ai_action_retry(&mut self) -> Result<(), CommandError> {
+        self.ai_follow_project();
         let waker = Arc::clone(&self.waker);
         let run = self
             .ai
@@ -370,8 +382,14 @@ impl Session {
             ));
         }
         let run = self.ready_run()?;
+        let source = Some(crate::ai::MessageSource {
+            project: run.project.clone(),
+            file: run.doc.clone(),
+            root: run.root.clone(),
+        });
         let message =
             |role, text: String, model: Option<String>, provider: Option<String>| ChatMessage {
+                source: source.clone(),
                 role,
                 text,
                 blocks: Vec::new(),
@@ -600,6 +618,7 @@ mod tests {
         let mut s = session_with(doc, port);
         s.view.assistant = false;
         s.ai.messages.push(ChatMessage {
+            source: None,
             role: Role::User,
             text: "An earlier question".into(),
             blocks: Vec::new(),

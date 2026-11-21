@@ -44,6 +44,9 @@ pub enum Request {
     Open,
     /// Show the open panel (folders).
     OpenFolder,
+    /// Open a different project in its own native window.
+    OpenProjectWindow(PathBuf),
+    NewProjectWindow(String),
     /// Show the save panel for document `doc`.
     SaveAs(usize),
     /// Show the save panel for the PDF.
@@ -293,6 +296,22 @@ impl Workbench {
                 Effect::PdfChanged => {}
                 Effect::OpenDialog => self.requests.push(Request::Open),
                 Effect::OpenFolderDialog => self.requests.push(Request::OpenFolder),
+                Effect::OpenProjectWindow(path) => {
+                    self.requests.push(Request::OpenProjectWindow(path));
+                }
+                Effect::NewProjectWindow(template) => {
+                    self.requests.push(Request::NewProjectWindow(template))
+                }
+                Effect::DocumentTransferred { doc } => {
+                    if let Dialog::ConfirmClose { doc: pending, quit } = self.dialog
+                        && pending == doc
+                    {
+                        self.dialog = Dialog::None;
+                        if quit {
+                            self.requests.push(Request::Quit);
+                        }
+                    }
+                }
                 Effect::SaveAsDialog { doc } => self.requests.push(Request::SaveAs(doc)),
                 Effect::ExportPdfDialog => self.requests.push(Request::ExportPdf),
                 Effect::Reveal(p) => self.requests.push(Request::Reveal(p)),
@@ -997,6 +1016,7 @@ mod tests {
         session.ai.config.providers[i].models = vec!["m".into()];
         session.ai.config.normalize();
         let message = |role, text: &str, tools| ChatMessage {
+            source: None,
             role,
             text: text.into(),
             blocks: Vec::new(),
@@ -1345,7 +1365,7 @@ mod tests {
     fn main_window_comes_forward_for_documents_and_dialogs() {
         let ctx = Context::default();
         let mut bench = Workbench::new(&ctx);
-        let mut session = Session::new(std::sync::Arc::new(|| {}));
+        let mut session = Session::empty(std::sync::Arc::new(|| {}));
         // Launch: the welcome window up, the main window hidden behind it.
         bench.welcome.show_window(true);
         bench.main_hidden = true;

@@ -1,5 +1,96 @@
 # TexCraft devlog
 
+## Commit and release-note format clarified (2026-11-21)
+
+- Recorded in `AGENTS.md`: commit messages are exactly one sentence on one line, without a
+  body or bullets; release notes stay separate and may be detailed. Whitespace check passes.
+
+## Release notes prepared for 0.6.2 (2026-11-21)
+
+- Prepared local `texcraft-v0.6.2.md` in the existing Chinese release format, covering project
+  selection/windows, AI context and provenance, delayed results and the unframed toolbar icon.
+- Verified remote tags end at v0.6.1 and the release workflow takes its version and notes from
+  the annotated tag. Checked the notes against the implementation and validation records.
+  No commit, tag, push or release was performed.
+
+## Standalone TexCraft toolbar button (2026-11-21)
+
+- Removed the AI button's outer capsule, border, shadow and selected/hover circle. Kept the
+  TexCraft artwork, size, position, tooltip and Assistant toggle, with a pointer cursor.
+- Gates: fmt; 88 UI/i18n tests pass (1 measurement tool ignored); all-target Clippy with
+  warnings denied. Regression checks unframed idle/hover/open states and click toggling in
+  both languages/themes. Native English/light and Chinese/dark screenshots inspected;
+  real pointer clicks open and close the Assistant. Installed bundle was not replaced.
+
+## Project context and asynchronous-result audit (2026-11-21)
+
+- Follow-up exposed gaps in the earlier window-only verification: last-tab AI cleanup,
+  cross-project Save As, directory renames and late compiler diagnostics. Fixed these paths;
+  the earlier entry's broad “No open gaps” claim did not cover them. The first three new
+  regressions failed before their fixes; the late-diagnostics regression also reproduced red.
+- Window ownership now retains its initial root, including independent roots in one folder.
+  New/templates open separately; foreign Save As writes the destination before transferring
+  its tab and retires the matching save prompt. Renames update directories, roots, navigation,
+  recents and chat provenance together. Late compilation can publish only its original PDF,
+  without replacing another project's diagnostics, log, status or preview.
+- Every AI question carries fresh active-file/root/cursor/selection metadata, even with
+  contents excluded. The composer shows the relative file path. Messages, tool rounds, actions
+  and inline suggestions retain their source; wrong-file insertions and stale link targets are
+  rejected. Directory transitions retire AI/Git work before polling. Chat histories use the
+  owning root; legacy histories need an unambiguous owner and survive repeated renames.
+- Gates: fmt; all 414 workspace tests pass (1 measurement tool ignored); affected crates'
+  all-target Clippy with warnings denied. Real TeX regression covers closing A during a
+  compile, opening B, and A finishing without contaminating B. Native three-window validation
+  uses a delayed local fake AI server: A/B list only their own files, requests contain no
+  other-project conversation, a new template inherits no context, and B survives A closing.
+  English/zh-Hans/light/dark screenshots inspected, including same-name active-file chips.
+- Scope and evidence are in `docs/project-context-audit.md`. The installed app remains 0.5.0;
+  source/development builds were verified, without replacing the installed bundle or sending
+  project data to an external provider. Windows/Linux and real-provider behavior were not
+  exercised in this macOS audit.
+
+## Other projects open in independent windows (2026-11-21)
+
+- Open Recent now resolves the selected file's owning project. Opening another project/root
+  queues a new native window instead of appending its files to the current session. Each
+  window has its own engine, PDF and AI state; the original tabs and unsaved work stay intact.
+  Chapters, bibliography and shared inputs remain tabs of their project. Folder recents use
+  the same main-file detection as Open; empty nested projects keep their own folder entry.
+- Opening a chapter first sets the file tree and AI tools to its root's directory. Direct
+  directory changes reset AI context immediately and stop an old request before tools can
+  read another project. Control adds `file.openRecent`, `ai.project`, `ui.projectWindows`;
+  child control ports are allocated separately and use the same token file.
+- Gates: fmt; 185 engine/desktop/UI/i18n tests passing (1 measurement tool ignored); all-target
+  Clippy with warnings denied. Native two-window validation preserved an unsaved original,
+  checked real AI `list_files` rounds against different project directories and verified the
+  new window kept working after the original closed. English, zh-Hans and dark screenshots
+  inspected. Validation used a local fake model; no external AI requests. No open gaps.
+
+## Ordinary launches wait for project selection (2026-11-21)
+
+- Removed implicit workspace restoration and the legacy recent-project fallback at desktop
+  startup. Welcome keeps recent projects available to choose; explicit launch paths still open
+  directly. Settings and the saved-state format remain compatible.
+- Startup regressions cover legacy settings, empty/source/folder/PDF workspaces, explicit
+  files and invalid paths. The new regression failed before the fix. Gates: fmt; 90 desktop,
+  UI and i18n tests passing (1 measurement tool ignored); all-target Clippy with warnings denied.
+- An isolated native open → normal quit → relaunch confirmed welcome is the only visible
+  window, with no loaded project/PDF or typeset runs. Clicking its recent project enters the
+  editor. English, zh-Hans and dark welcome screenshots inspected. No open gaps for this change.
+
+## Local build artifacts cleared (2026-11-15)
+
+- Ran `cargo clean --target-dir ./target`: removed 165,911 generated files (Cargo reports
+  24.4 GiB logical size); local disk usage dropped by about 16.1 GiB, leaving a 6.7 MiB checkout.
+- Verified all 301 tracked files retained their pre-cleanup contents, including existing local
+  edits; formatting check passes. No Rust code changed, so tests/Clippy were not rebuilt.
+- The next build will regenerate the deleted build outputs and caches.
+
+## Release reply preference recorded (2026-11-02)
+
+- Added the user's required reply format to `AGENTS.md`: a separate commit-message block,
+  followed by only the tag and push-tag command lines. Verified the documentation diff.
+
 ## Release notes prepared for 0.6.1 (2026-11-02)
 
 - Wrote local `texcraft-v0.6.1.md` in the existing Chinese release format, covering the Finder

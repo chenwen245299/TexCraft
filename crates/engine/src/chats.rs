@@ -1,6 +1,7 @@
 //! Saved AI conversations, kept per project in TexCraft's own data folder, never in the project
 //! (a project sent to someone carries no chats). A project's conversations live in
-//! `chats/<name>-<hash>/`, the hash taken from the project folder's path; `project.json` there
+//! `chats/<name>-<hash>/`, keyed by the owning root file (or folder for rootless projects);
+//! `project.json` there
 //! records that path, so [`ChatStore::sweep`] can remove the conversations of a project that
 //! no longer exists. Conversations without a project folder go to `chats/_none/`.
 
@@ -32,6 +33,10 @@ pub struct ChatSummary {
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {
     path: PathBuf,
+    #[serde(default)]
+    aliases: Vec<(PathBuf, PathBuf)>,
+    #[serde(default)]
+    legacy: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,6 +49,8 @@ struct StoredImage {
 
 #[derive(Serialize, Deserialize)]
 struct StoredMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<crate::ai::MessageSource>,
     role: Role,
     text: String,
     #[serde(default)]
@@ -112,8 +119,8 @@ pub fn new_id() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xffff;
-    format!("{ms:x}{n:04x}")
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{ms:x}{:x}{n:08x}", std::process::id())
 }
 
 /// The title of a conversation: its first question's first line, shortened.
@@ -139,6 +146,124 @@ fn title(messages: &[ChatMessage]) -> String {
 }
 
 impl ChatStore {
+    fn project_file(&self, directory: &Path) -> Option<ProjectFile> {
+        std::fs::read_to_string(directory.join("project.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    }
+
+    fn history_dirs(&self, project: Option<&Path>) -> Vec<PathBuf> {
+        let primary = self.dir(project);
+        let mut directories = vec![primary.clone()];
+        if let Some(file) = self.project_file(&primary) {
+            for key in file.legacy {
+                if !key.is_empty()
+                    && key.chars().all(|character| {
+                        character.is_alphanumeric() || matches!(character, '-' | '_')
+                    })
+                {
+                    let path = self.root.join(key);
+                    if !directories.contains(&path) {
+                        directories.push(path);
+                    }
+                }
+            }
+        }
+        if let Some(legacy) = self.legacy_dir(project)
+            && !directories.contains(&legacy)
+        {
+            directories.push(legacy);
+        }
+        directories
+    }
+
+    /// Re-key a moved project; image-bearing conversation files stay in place.
+    pub(crate) fn relocate_project(
+        &self,
+        old: &Path,
+        new: &Path,
+        from: &Path,
+        to: &Path,
+    ) -> Result<(), String> {
+        let old_dir = self.dir(Some(old));
+        let new_dir = self.dir(Some(new));
+        let mut directories = self.history_dirs(Some(old));
+        if old != new && new_dir.exists() {
+            // The destination did not exist on disk before the rename. A cached history
+            // at that name belongs to a previously removed project; retain it separately.
+            let archive = self.root.join(format!("_retained-{}", new_id()));
+            std::fs::rename(&new_dir, archive).map_err(|error| error.to_string())?;
+        }
+        if old != new && old_dir.exists() && !new_dir.exists() {
+            std::fs::rename(&old_dir, &new_dir).map_err(|error| error.to_string())?;
+            directories.retain(|directory| *directory != old_dir);
+        }
+        if self.legacy_dir(Some(new)).is_some()
+            && let Some(parent) = old.parent()
+        {
+            let directory = self.dir(Some(parent));
+            if directory.exists() && !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        let mut legacy = Vec::new();
+        for directory in directories {
+            if directory.exists() && directory != new_dir {
+                if let Some(name) = directory.file_name().and_then(|name| name.to_str()) {
+                    legacy.push(name.to_string());
+                }
+                let mut file = self.project_file(&directory).unwrap_or(ProjectFile {
+                    path: new.to_path_buf(),
+                    aliases: Vec::new(),
+                    legacy: Vec::new(),
+                });
+                file.path = new.to_path_buf();
+                file.aliases.push((from.to_path_buf(), to.to_path_buf()));
+                write_atomic(
+                    &directory.join("project.json"),
+                    &serde_json::to_vec(&file).map_err(|error| error.to_string())?,
+                )?;
+            }
+        }
+        if !new_dir.exists() && legacy.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&new_dir).map_err(|error| error.to_string())?;
+        let mut file = self.project_file(&new_dir).unwrap_or(ProjectFile {
+            path: new.to_path_buf(),
+            aliases: Vec::new(),
+            legacy: Vec::new(),
+        });
+        file.path = new.to_path_buf();
+        file.aliases.push((from.to_path_buf(), to.to_path_buf()));
+        for key in legacy {
+            if !file.legacy.contains(&key) {
+                file.legacy.push(key);
+            }
+        }
+        write_atomic(
+            &new_dir.join("project.json"),
+            &serde_json::to_vec(&file).map_err(|error| error.to_string())?,
+        )
+    }
+    // Legacy histories were keyed by directory. They are eligible only when that directory
+    // has exactly one root, so two independent projects never inherit each other's history.
+    fn legacy_dir(&self, project: Option<&Path>) -> Option<PathBuf> {
+        let root = project.filter(|path| path.is_file())?;
+        let parent = root.parent()?;
+        let roots: Vec<_> = std::fs::read_dir(parent)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "tex"))
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .is_ok_and(|text| texcraft_syntax::is_root_document(&text))
+            })
+            .collect();
+        (roots.len() == 1 && roots.first().is_some_and(|path| path == root))
+            .then(|| self.dir(Some(parent)))
+    }
     /// Conversations kept under `root`.
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -163,11 +288,18 @@ impl ChatStore {
 
     /// `project`'s conversations, the latest first.
     pub fn list(&self, project: Option<&Path>) -> Vec<ChatSummary> {
-        let mut list: Vec<ChatSummary> =
-            std::fs::read_to_string(self.dir(project).join("index.json"))
+        let mut list: Vec<ChatSummary> = Vec::new();
+        for directory in self.history_dirs(project) {
+            let older: Vec<ChatSummary> = std::fs::read_to_string(directory.join("index.json"))
                 .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
+                .and_then(|text| serde_json::from_str(&text).ok())
                 .unwrap_or_default();
+            for chat in older {
+                if !list.iter().any(|current| current.id == chat.id) {
+                    list.push(chat);
+                }
+            }
+        }
         list.sort_by_key(|c| std::cmp::Reverse(c.updated));
         list
     }
@@ -177,7 +309,18 @@ impl ChatStore {
         if !valid_id(id) {
             return None;
         }
-        let text = std::fs::read_to_string(self.dir(project).join(format!("{id}.json"))).ok()?;
+        let (text, directory) = self
+            .history_dirs(project)
+            .into_iter()
+            .find_map(|directory| {
+                std::fs::read_to_string(directory.join(format!("{id}.json")))
+                    .ok()
+                    .map(|text| (text, directory))
+            })?;
+        let aliases = self
+            .project_file(&directory)
+            .map(|file| file.aliases)
+            .unwrap_or_default();
         let chat: StoredChat = serde_json::from_str(&text).ok()?;
         let usage = ChatUsage {
             runs: chat.runs,
@@ -186,22 +329,38 @@ impl ChatStore {
         let messages = chat
             .messages
             .into_iter()
-            .map(|m| ChatMessage {
-                role: m.role,
-                text: m.text,
-                blocks: Vec::new(),
-                model: m.model,
-                provider: m.provider,
-                pending: false,
-                thinking: false,
-                error: m.error,
-                note: m.note,
-                images: m
-                    .images
-                    .iter()
-                    .filter_map(|i| Image::from_base64(&i.name, &i.media_type, &i.data))
-                    .collect(),
-                tools: m.tools,
+            .map(|m| {
+                let mut source = m.source;
+                if let Some(source) = &mut source {
+                    for (from, to) in &aliases {
+                        for path in [&mut source.project, &mut source.file, &mut source.root]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Ok(rest) = path.strip_prefix(from) {
+                                *path = to.join(rest);
+                            }
+                        }
+                    }
+                }
+                ChatMessage {
+                    source,
+                    role: m.role,
+                    text: m.text,
+                    blocks: Vec::new(),
+                    model: m.model,
+                    provider: m.provider,
+                    pending: false,
+                    thinking: false,
+                    error: m.error,
+                    note: m.note,
+                    images: m
+                        .images
+                        .iter()
+                        .filter_map(|i| Image::from_base64(&i.name, &i.media_type, &i.data))
+                        .collect(),
+                    tools: m.tools,
+                }
             })
             .collect();
         Some((messages, usage))
@@ -221,9 +380,12 @@ impl ChatStore {
         let dir = self.dir(project);
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot save the conversation: {e}"))?;
         if let Some(path) = project {
-            let file = ProjectFile {
+            let mut file = self.project_file(&dir).unwrap_or(ProjectFile {
                 path: path.to_path_buf(),
-            };
+                aliases: Vec::new(),
+                legacy: Vec::new(),
+            });
+            file.path = path.to_path_buf();
             let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
             write_atomic(&dir.join("project.json"), &json)?;
         }
@@ -232,6 +394,7 @@ impl ChatStore {
                 .iter()
                 .filter(|m| !m.pending)
                 .map(|m| StoredMessage {
+                    source: m.source.clone(),
                     role: m.role,
                     text: m.text.clone(),
                     model: m.model.clone(),
@@ -273,6 +436,18 @@ impl ChatStore {
         }
         let dir = self.dir(project);
         let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        for legacy in self.history_dirs(project).into_iter().skip(1) {
+            let _ = std::fs::remove_file(legacy.join(format!("{id}.json")));
+            let mut older: Vec<ChatSummary> = std::fs::read_to_string(legacy.join("index.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            older.retain(|chat| chat.id != id);
+            write_atomic(
+                &legacy.join("index.json"),
+                &serde_json::to_vec_pretty(&older).map_err(|error| error.to_string())?,
+            )?;
+        }
         let mut list = self.list(project);
         list.retain(|c| c.id != id);
         let json = serde_json::to_vec_pretty(&list).map_err(|e| e.to_string())?;
@@ -294,7 +469,7 @@ impl ChatStore {
             else {
                 continue;
             };
-            if !file.path.is_dir() && std::fs::remove_dir_all(&dir).is_ok() {
+            if !file.path.exists() && std::fs::remove_dir_all(&dir).is_ok() {
                 removed += 1;
             }
         }
@@ -308,6 +483,7 @@ mod tests {
 
     fn message(role: Role, text: &str) -> ChatMessage {
         ChatMessage {
+            source: None,
             role,
             text: text.into(),
             blocks: Vec::new(),

@@ -179,6 +179,31 @@ impl Session {
         // Which open documents live at or under `path` (resolved before it moves).
         let from = real(path);
         let to_real = real(dir).join(name);
+        let old_identity = self
+            .project_root
+            .clone()
+            .or_else(|| self.project_dir.clone());
+        let moved_directory = self.project_dir.as_ref().and_then(|dir| {
+            real(dir)
+                .strip_prefix(&from)
+                .ok()
+                .map(|rest| to_real.join(rest))
+        });
+        let affects_output = moved_directory.is_some()
+            || self
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root.starts_with(&from))
+            || self
+                .pdf
+                .root
+                .as_ref()
+                .is_some_and(|root| root.starts_with(&from))
+            || self
+                .typeset
+                .root
+                .as_ref()
+                .is_some_and(|root| root.starts_with(&from));
         let followers: Vec<(usize, PathBuf)> = self
             .docs
             .iter()
@@ -204,13 +229,63 @@ impl Session {
                 });
             }
         }
-        for r in &mut self.recent {
-            if real(r) == from {
-                *r = to_real.clone();
+        let remap = |path: &mut PathBuf| {
+            if let Ok(rest) = path.strip_prefix(&from) {
+                *path = to_real.join(rest);
             }
+        };
+        for path in &mut self.recent {
+            remap(path);
+        }
+        for (path, _) in &mut self.history {
+            remap(path);
+        }
+        if let Some(root) = &mut self.typeset.root {
+            remap(root);
+        }
+        if let Some(root) = &mut self.project_root {
+            remap(root);
+        }
+        if let Some(root) = &mut self.typeset.unsettled {
+            remap(root);
+        }
+        for (root, _) in &mut self.typeset.stale {
+            remap(root);
+        }
+        self.inline_dismiss();
+        self.ai_stop();
+        self.ai_action_dismiss();
+        if affects_output {
+            if let Some(job) = self.typeset.job.take() {
+                job.cancel();
+            }
+            self.typeset.live_due = None;
+            self.typeset.queued = false;
+            self.typeset.queued_live = false;
+            self.typeset.last = None;
+            self.typeset.issues.clear();
+            self.typeset.console.clear();
+            self.clear_pdf();
+        }
+        if let Some(directory) = moved_directory {
+            self.set_project_dir(directory);
+        }
+        self.ai_follow_project();
+        let new_identity = self
+            .project_root
+            .clone()
+            .or_else(|| self.project_dir.clone());
+        if let (Some(store), Some(old), Some(new)) = (&self.ai.chats, old_identity, new_identity) {
+            if let Err(error) = store.relocate_project(&old, &new, &from, &to_real) {
+                self.set_status(error);
+            }
+            self.ai_refresh_history();
         }
         self.refresh_files();
         self.refresh_index(true);
+        if affects_output {
+            self.schedule_live();
+        }
         Ok(to)
     }
 

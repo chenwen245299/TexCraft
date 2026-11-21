@@ -29,6 +29,9 @@ pub mod git;
 pub mod index;
 pub mod inline;
 pub mod live;
+mod opening;
+#[cfg(test)]
+mod project_context_tests;
 pub mod sync;
 pub mod update;
 pub mod workspace;
@@ -37,6 +40,7 @@ pub use commands::{CommandSpec, Shortcut, registry};
 pub use edit::Selection;
 pub use full::QuitTypeset;
 pub use index::ProjectIndex;
+pub use opening::OpenResult;
 pub use update::{CURRENT_VERSION, UpdateState, UpdateStatus};
 
 /// An open text document.
@@ -494,6 +498,12 @@ pub enum Effect {
     OpenDialog,
     /// Ask for a folder to open as a project.
     OpenFolderDialog,
+    /// Open another project in an independent native window.
+    OpenProjectWindow(PathBuf),
+    /// Create a fresh project window from a template.
+    NewProjectWindow(String),
+    /// A Save As moved this tab into an independent project window; retire its save prompt.
+    DocumentTransferred { doc: usize },
     /// Ask where to save document `doc`.
     SaveAsDialog {
         /// Document index.
@@ -681,6 +691,8 @@ pub struct Session {
     pub active: usize,
     /// The project folder (file list root).
     pub project_dir: Option<PathBuf>,
+    /// Stable root of this window's project, independent of the active chapter or job.
+    project_root: Option<PathBuf>,
     /// The project's file tree (refreshed on open/save).
     pub file_tree: Vec<FileNode>,
     /// Typesetting settings.
@@ -773,6 +785,7 @@ impl Session {
             docs: Vec::new(),
             active: 0,
             project_dir: None,
+            project_root: None,
             file_tree: Vec::new(),
             settings: Settings::default(),
             view: View::default(),
@@ -871,45 +884,46 @@ impl Session {
         self.active
     }
 
-    /// Opens a file or folder. Returns the index of the document shown (if any).
-    pub fn open_path(&mut self, path: &Path) -> Result<Option<usize>, CommandError> {
+    /// Opens a file or folder, routing other projects to an independent window.
+    pub fn open_path(&mut self, path: &Path) -> Result<OpenResult, CommandError> {
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if self.needs_project_window(&path) {
+            // Validate before requesting a window; a missing/unreadable file leaves this
+            // project's editor, preview and Assistant untouched.
+            if !path.is_dir() {
+                std::fs::File::open(&path).map_err(|e| {
+                    CommandError::Failed(trf!(
+                        "cannot open {path}: {e}",
+                        path = path.display(),
+                        e = e
+                    ))
+                })?;
+                if !FileKind::of(&path).is_editable()
+                    && FileKind::of(&path) != FileKind::Pdf
+                    && path.extension().is_some()
+                {
+                    return Err(CommandError::Failed(trf!(
+                        "{path} is not a text file TexCraft can edit",
+                        path = path.display()
+                    )));
+                }
+            }
+            self.remember_recent(&path);
+            self.effect(Effect::OpenProjectWindow(path));
+            return Ok(OpenResult::NewWindow);
+        }
         if path.is_dir() {
             self.set_project_dir(path.clone());
-            // Open the main file: main.tex, else the first file with \documentclass.
-            let mut candidates: Vec<PathBuf> = std::fs::read_dir(&path)
-                .map(|rd| {
-                    rd.filter_map(Result::ok)
-                        .map(|e| e.path())
-                        .filter(|p| p.extension().is_some_and(|e| e == "tex"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            candidates.sort();
-            let main = candidates
-                .iter()
-                .find(|p| p.file_name().is_some_and(|n| n == "main.tex"))
-                .cloned()
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .find(|p| {
-                            std::fs::read_to_string(p)
-                                .is_ok_and(|t| texcraft_syntax::is_root_document(&t))
-                        })
-                        .cloned()
-                })
-                .or_else(|| candidates.first().cloned());
-            return match main {
-                Some(m) => self.open_file(&m).map(Some),
-                None => Ok(None),
+            return match opening::project_main(&path) {
+                Some(m) => self.open_file(&m).map(|i| OpenResult::Here(Some(i))),
+                None => Ok(OpenResult::Here(None)),
             };
         }
         if FileKind::of(&path) == FileKind::Pdf {
             self.show_pdf(path.clone());
-            return Ok(None);
+            return Ok(OpenResult::Here(None));
         }
-        self.open_file(&path).map(Some)
+        self.open_file(&path).map(|i| OpenResult::Here(Some(i)))
     }
 
     fn open_file(&mut self, path: &Path) -> Result<usize, CommandError> {
@@ -927,6 +941,7 @@ impl Session {
                 path = path.display()
             )));
         }
+        let previous_root = self.root_path();
         let bytes = std::fs::read(path).map_err(|e| {
             CommandError::Failed(trf!(
                 "cannot open {path}: {e}",
@@ -960,10 +975,23 @@ impl Session {
             self.docs.push(doc);
             self.active = self.docs.len() - 1;
         }
-        if self.project_dir.is_none()
-            && let Some(dir) = path.parent()
-        {
-            self.set_project_dir(dir.to_path_buf());
+        if self.project_root.is_none() {
+            let entry = texcraft_project::project_entry(path, &|p| self.text_of(p));
+            if self
+                .text_of(&entry)
+                .is_some_and(|text| texcraft_syntax::is_root_document(&text))
+            {
+                self.project_root = Some(entry);
+            }
+        }
+        if self.project_dir.is_none() {
+            let entry = texcraft_project::project_entry(path, &|p| self.text_of(p));
+            if let Some(dir) = entry.parent() {
+                self.set_project_dir(dir.to_path_buf());
+            }
+        }
+        if self.root_path() != previous_root {
+            self.clear_typeset_display();
         }
         self.remember_recent(path);
         // Show the matching PDF right away if one was typeset before. Another document's PDF
@@ -984,13 +1012,24 @@ impl Session {
         if self.pdf.path.is_none() {
             self.schedule_live();
         }
+        self.ai_follow_project();
         Ok(self.active)
     }
 
     /// Sets the project folder and reloads its file tree.
     pub fn set_project_dir(&mut self, dir: PathBuf) {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if self
+            .project_root
+            .as_ref()
+            .is_some_and(|root| !root.starts_with(&dir))
+        {
+            self.project_root = None;
+        }
         self.file_tree = texcraft_project::file_tree(&dir, 6);
         self.project_dir = Some(dir);
+        self.ai_follow_project();
+        self.git_follow_project();
     }
 
     /// Re-reads the project's file tree.
@@ -1018,12 +1057,33 @@ impl Session {
             ))
         })?;
         doc.saved_revision = doc.revision;
+        if self.project_root.is_none() && texcraft_syntax::is_root_document(&doc.text) {
+            self.project_root = Some(path.clone());
+        }
         self.git.stale = true;
         Ok(())
     }
 
     /// Saves document `idx` to `path` (Save As).
     pub fn save_as(&mut self, idx: usize, path: PathBuf) -> Result<(), CommandError> {
+        let foreign_project = self.docs.get(idx).is_some_and(|doc| {
+            let target = path
+                .canonicalize()
+                .ok()
+                .or_else(|| {
+                    path.parent()
+                        .and_then(|parent| parent.canonicalize().ok())
+                        .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+                })
+                .unwrap_or_else(|| path.clone());
+            self.project_dir.as_ref().is_some_and(|dir| {
+                let dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                !target.starts_with(&dir)
+                    || (doc.path.as_ref().is_some_and(|old| *old != target)
+                        && texcraft_syntax::is_root_document(&doc.text)
+                        && find_root(&target, &doc.text, &|p| self.text_of(p)) == target)
+            })
+        });
         let Some(doc) = self.docs.get_mut(idx) else {
             return Err(CommandError::Failed(tr("no such document").into()));
         };
@@ -1034,9 +1094,27 @@ impl Session {
                 e = e
             ))
         })?;
+        if foreign_project {
+            // The new file is already safely on disk. Move its editor to a fresh project
+            // window; never attach the destination to the source project's AI/file tree.
+            self.effect(Effect::DocumentTransferred { doc: idx });
+            self.close(idx);
+            let path = path.canonicalize().unwrap_or(path);
+            self.remember_recent(&path);
+            self.effect(Effect::OpenProjectWindow(path));
+            return Ok(());
+        }
+        self.inline_dismiss();
+        let Some(doc) = self.docs.get_mut(idx) else {
+            return Ok(());
+        };
+        let path = path.canonicalize().unwrap_or(path);
         doc.path = Some(path.clone());
         doc.scratch = None;
         doc.saved_revision = doc.revision;
+        if self.project_root.is_none() && texcraft_syntax::is_root_document(&doc.text) {
+            self.project_root = Some(path.clone());
+        }
         if self.project_dir.is_none() {
             if let Some(dir) = path.parent() {
                 self.set_project_dir(dir.to_path_buf());
@@ -1051,7 +1129,7 @@ impl Session {
     /// Puts `path`'s project at the top of the recent documents, by its entry point (the main
     /// file: see [`texcraft_project::project_entry`]), so a project is listed once.
     pub fn remember_recent(&mut self, path: &Path) {
-        let entry = texcraft_project::project_entry(path, &|p| self.text_of(p));
+        let entry = opening::recent_entry(path, &|p| self.text_of(p));
         self.recent.retain(|p| p != &entry);
         self.recent.insert(0, entry);
         self.recent.truncate(12);
@@ -1062,7 +1140,7 @@ impl Session {
     pub fn set_recent(&mut self, list: Vec<PathBuf>) {
         let mut out: Vec<PathBuf> = Vec::new();
         for p in list {
-            let entry = texcraft_project::project_entry(&p, &|q| std::fs::read_to_string(q).ok());
+            let entry = opening::recent_entry(&p, &|q| std::fs::read_to_string(q).ok());
             if !out.contains(&entry) {
                 out.push(entry);
             }
@@ -1076,20 +1154,30 @@ impl Session {
         if idx >= self.docs.len() {
             return;
         }
+        self.inline_dismiss();
         self.docs.remove(idx);
         if idx < self.active {
             self.active = self.active.saturating_sub(1);
         }
         if self.docs.is_empty() {
             self.project_dir = None;
+            self.project_root = None;
             self.file_tree.clear();
             self.index = ProjectIndex::default();
             self.typeset.live_due = None;
+            self.typeset.queued = false;
             self.typeset.queued_live = false;
+            self.typeset.unsettled = None;
+            self.clear_typeset_display();
+            if self.typeset.job.is_none() {
+                self.typeset.root = None;
+            }
             self.clear_pdf();
             self.effect(Effect::Welcome);
         }
         self.active = self.active.min(self.docs.len().saturating_sub(1));
+        self.ai_follow_project();
+        self.git_follow_project();
     }
 
     /// Publishes a successful full typeset beside its root, including an up-to-date build
@@ -1150,6 +1238,9 @@ impl Session {
         let path = doc.typeset_path()?.to_path_buf();
         if doc.path.is_none() {
             return Some(path);
+        }
+        if let Some(root) = &self.project_root {
+            return Some(root.clone());
         }
         if doc.is_bib() {
             // A .bib file belongs to the last root that was typeset.
@@ -1358,7 +1449,9 @@ impl Session {
             pretex: self.pretex_for(&plan),
             force: background && matches!(self.typeset.quit, QuitTypeset::Running(_)),
         };
-        self.typeset.console.clear();
+        if self.pdf_wanted(&root) || self.typeset.is_quitting() {
+            self.typeset.console.clear();
+        }
         // The PDF beside this root will be current again.
         let key = texcraft_project::normalize(&root);
         self.typeset.stale.retain(|(r, _)| *r != key);
@@ -1485,10 +1578,18 @@ impl Session {
         if let Some(job) = &self.typeset.job {
             while let Some(ev) = job.try_recv() {
                 match ev {
-                    JobEvent::Output(line) => {
+                    JobEvent::Output(line)
+                        if self
+                            .typeset
+                            .root
+                            .as_deref()
+                            .is_none_or(|root| self.pdf_wanted(root))
+                            || self.typeset.is_quitting() =>
+                    {
                         self.typeset.console.push_str(&line);
                         self.typeset.console.push('\n');
                     }
+                    JobEvent::Output(_) => {}
                     JobEvent::Finished(o) => finished = Some(o),
                 }
             }
@@ -1584,6 +1685,27 @@ impl Session {
 
     fn finish_typeset(&mut self, outcome: Outcome) {
         self.typeset.runs += 1;
+        let wanted = self
+            .typeset
+            .root
+            .as_deref()
+            .is_none_or(|root| self.pdf_wanted(root));
+        if !wanted && !self.typeset.is_quitting() {
+            // An old run may still publish its own PDF, but its diagnostics and status
+            // must never replace the project that has since entered this window.
+            self.typeset.job_revisions.clear();
+            if !outcome.live {
+                let failed = !outcome.success
+                    || outcome
+                        .pdf
+                        .as_deref()
+                        .is_some_and(|pdf| self.publish_pdf(pdf).is_err());
+                if failed && let Some(root) = self.typeset.root.clone() {
+                    self.mark_stale(&root, Instant::now());
+                }
+            }
+            return;
+        }
         self.typeset.finished_at = Some(std::time::SystemTime::now());
         self.typeset.issues = outcome.report.issues.clone();
         self.note_typeset(&outcome);
@@ -1719,6 +1841,16 @@ impl Session {
         self.effect(Effect::PdfChanged);
     }
 
+    fn clear_typeset_display(&mut self) {
+        self.typeset.last = None;
+        self.typeset.finished_at = None;
+        self.typeset.issues.clear();
+        self.typeset.console.clear();
+        self.typeset.last_live = None;
+        self.typeset.last_latency = None;
+        self.status = None;
+    }
+
     /// Whether `root`'s PDF belongs in the pane: an open document is that root, or the active
     /// one belongs to it.
     fn pdf_wanted(&self, root: &Path) -> bool {
@@ -1822,7 +1954,10 @@ impl Session {
         }) {
             i
         } else {
-            self.open_file(&norm)?
+            match self.open_path(&norm)? {
+                OpenResult::Here(Some(i)) => i,
+                _ => return Ok(()),
+            }
         };
         self.active = idx;
         if let Some(d) = self.docs.get_mut(idx) {
@@ -2017,6 +2152,8 @@ impl Session {
             "status": self.status.as_ref().map(|s| s.0.clone()),
             "toolchain": toolchain,
             "ai": {
+                "project": self.ai_project_root(),
+                "editor": self.ai_editor_context(),
                 "chatId": self.ai.chat_id,
                 "history": self.ai.history.iter().map(|c| serde_json::json!({
                     "id": c.id, "title": c.title, "updated": c.updated,
@@ -2037,7 +2174,7 @@ impl Session {
                 })).collect::<Vec<_>>(),
                 "messages": self.ai.messages.iter().map(|m| serde_json::json!({
                     "role": if m.role == texcraft_ai::Role::User { "user" } else { "assistant" },
-                    "text": m.text, "error": m.error, "pending": m.pending, "model": m.model,
+                    "text": m.text, "error": m.error, "pending": m.pending, "model": m.model, "source": m.source,
                     "images": m.images.len(),
                 })).collect::<Vec<_>>(),
                 // The row under the question box, and its context meter.

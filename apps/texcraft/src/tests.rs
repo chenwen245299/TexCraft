@@ -1,46 +1,123 @@
 use super::*;
 
 #[test]
-fn startup_migrates_legacy_recents_but_honours_an_explicitly_closed_workspace() {
-    let file = std::env::temp_dir().join(format!("texcraft-startup-{}.tex", std::process::id()));
-    std::fs::write(&file, "saved project").unwrap();
-    let legacy: Persisted = serde_json::from_value(json!({
-        "view": null, "settings": null, "recent": [file], "split": null, "version": 2
-    }))
-    .unwrap();
-    assert!(legacy.workspace.is_none());
+fn a_new_template_window_starts_locally_without_requesting_another_window() {
     let mut session = Session::empty(Arc::new(|| {}));
     session.settings.live_typeset = false;
-    session.set_recent(legacy.recent);
-    open_startup(&mut session, &Options::default(), legacy.workspace.as_ref());
-    assert_eq!(session.doc().unwrap().text, "saved project");
-    let mut closed = Session::empty(Arc::new(|| {}));
-    closed.set_recent(session.recent.clone());
-    open_startup(&mut closed, &Options::default(), Some(&Default::default()));
-    assert!(closed.docs.is_empty());
-    let explicit = Options {
-        paths: vec![file.clone()],
-        ..Default::default()
-    };
-    open_startup(&mut closed, &explicit, Some(&Default::default()));
-    assert_eq!(closed.docs.len(), 1);
-    std::fs::remove_file(file).unwrap();
+    open_startup(
+        &mut session,
+        &Options {
+            template: Some("blank".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(session.docs.len(), 1);
+    assert!(session.doc().unwrap().path.is_none());
+    assert!(session.project_dir.is_none());
+    assert!(
+        !session
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, texcraft_engine::Effect::NewProjectWindow(_)))
+    );
 }
 
 #[test]
-fn explicit_launch_path_overrides_saved_workspace_even_when_it_cannot_open() {
+fn independent_project_windows_get_only_the_selected_project_and_a_separate_control_port() {
+    let exe = std::path::Path::new("texcraft");
+    let path = std::path::Path::new("project with spaces/main.tex");
+    let token = std::path::Path::new("control.token");
+    let command = project_windows::command(exe, path, Some(token));
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(command.get_program(), exe.as_os_str());
+    assert_eq!(
+        args,
+        [
+            path.as_os_str(),
+            std::ffi::OsStr::new("--no-welcome"),
+            std::ffi::OsStr::new("--control"),
+            std::ffi::OsStr::new("0"),
+            std::ffi::OsStr::new("--control-token-file"),
+            token.as_os_str()
+        ]
+    );
+    let command = project_windows::command(exe, path, None);
+    assert_eq!(command.get_args().count(), 2);
+}
+
+#[test]
+fn startup_waits_for_a_project_choice_with_legacy_or_saved_workspaces() {
+    let dir = std::env::temp_dir().join(format!("texcraft-startup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.tex");
+    let pdf = dir.join("paper.pdf");
+    std::fs::write(&file, "saved project").unwrap();
+    std::fs::write(&pdf, b"%PDF-1.5").unwrap();
+    for workspace in [
+        Value::Null,
+        json!({}),
+        json!({
+            "project_dir": dir,
+            "documents": [{ "path": file }],
+            "active": file,
+            "root": file
+        }),
+        json!({ "project_dir": dir }),
+        json!({ "pdf": pdf }),
+    ] {
+        let mut data = json!({
+            "view": null, "settings": null, "recent": [file], "split": null,
+            "version": 2, "workspace": workspace
+        });
+        if workspace.is_null() {
+            data.as_object_mut().unwrap().remove("workspace");
+        }
+        let saved: Persisted = serde_json::from_value(data).unwrap();
+        let mut session = Session::empty(Arc::new(|| {}));
+        session.set_recent(saved.recent);
+        open_startup(&mut session, &Options::default());
+        assert!(session.docs.is_empty());
+        assert!(session.project_dir.is_none() && session.pdf.path.is_none());
+        assert!(session.root_path().is_none() && session.typeset.live_due.is_none());
+        assert_eq!(session.recent, vec![file.clone()]);
+        assert!(session.view.show_welcome);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn explicit_launch_paths_still_open_the_selected_files() {
+    let dir = std::env::temp_dir().join(format!("texcraft-launch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let files = [dir.join("main.tex"), dir.join("chapter.tex")];
+    for file in &files {
+        std::fs::write(file, "selected project").unwrap();
+    }
     let mut session = Session::empty(Arc::new(|| {}));
-    let saved = texcraft_engine::workspace::Workspace {
-        project_dir: Some(std::env::temp_dir()),
-        ..Default::default()
-    };
+    session.settings.live_typeset = false;
+    open_startup(
+        &mut session,
+        &Options {
+            paths: files.to_vec(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(session.docs.len(), 2);
+    assert_eq!(session.doc().unwrap().text, "selected project");
+    assert!(session.status.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn invalid_explicit_launch_path_reports_an_error_without_opening_a_recent_project() {
+    let mut session = Session::empty(Arc::new(|| {}));
+    session.set_recent(vec![std::env::temp_dir()]);
     open_startup(
         &mut session,
         &Options {
             paths: vec![PathBuf::from("/nonexistent/texcraft-launch.tex")],
             ..Default::default()
         },
-        Some(&saved),
     );
     assert!(session.docs.is_empty() && session.project_dir.is_none());
     assert!(session.status.is_some());

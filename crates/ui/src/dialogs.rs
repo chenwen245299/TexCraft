@@ -295,7 +295,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, session: &mut Session, dialog: &mut
         }
         Dialog::ConfirmClose { doc: idx, quit } => {
             let (idx, quit) = (*idx, *quit);
-            // Quitting keeps saved tabs in the workspace so they reopen next time.
+            // Quitting keeps saved tabs available for the final typeset.
             let closed = |session: &mut Session| {
                 if !quit || session.docs.get(idx).is_some_and(|d| d.path.is_none()) {
                     session.close(idx);

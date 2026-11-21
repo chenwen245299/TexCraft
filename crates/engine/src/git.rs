@@ -65,9 +65,23 @@ impl GitState {
 }
 
 impl Session {
+    /// Retire all project-specific results before polling jobs or issuing another operation.
+    pub(crate) fn git_follow_project(&mut self) {
+        if self.git.dir.is_some() && self.git.dir != self.git_dir() {
+            if let Some(Drafting::Asking { job, .. }) = self.git.drafting.take() {
+                job.cancel();
+            }
+            self.git = GitState {
+                available: self.git.available,
+                ..GitState::default()
+            };
+        }
+    }
+
     /// The folder Source Control works in: the project folder, else the root file's.
     pub fn git_dir(&self) -> Option<PathBuf> {
         self.project_dir.clone().or_else(|| {
+            self.doc().filter(|doc| doc.path.is_some())?;
             self.root_path()
                 .filter(|p| p.is_file())
                 .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -76,6 +90,7 @@ impl Session {
 
     /// Starts (or queues) a Source Control action.
     pub fn git_run(&mut self, op: Op) -> Result<(), CommandError> {
+        self.git_follow_project();
         let dir = self
             .git_dir()
             .ok_or_else(|| CommandError::Failed(tr("open a project folder first").into()))?;
@@ -256,6 +271,7 @@ impl Session {
 
     /// Collects the model's commit message. Returns when to look again.
     pub(crate) fn tick_git_message(&mut self) -> Option<Duration> {
+        self.git_follow_project();
         let Some(Drafting::Asking { job, .. }) = &self.git.drafting else {
             return None;
         };
@@ -313,6 +329,7 @@ impl Session {
 
     /// Polls the running action; re-reads the repository while the Git tab shows.
     pub(crate) fn tick_git(&mut self, now: Instant) -> Option<Duration> {
+        self.git_follow_project();
         if let Some(outcome) = self.git.job.as_ref().and_then(texcraft_git::Job::try_recv) {
             self.git.job = None;
             self.git.busy = None;
@@ -363,15 +380,6 @@ impl Session {
         let shown = self.view.sidebar && self.view.sidebar_tab == SidebarTab::Git;
         if !shown || self.git.job.is_some() || self.git.available == Some(false) {
             return self.git.job.is_some().then_some(Duration::from_millis(100));
-        }
-        // A different folder (another project was opened): start over.
-        if self.git.dir.is_some() && self.git.dir != self.git_dir() {
-            let message = std::mem::take(&mut self.git.message);
-            self.git = GitState {
-                message,
-                available: self.git.available,
-                ..GitState::default()
-            };
         }
         let due = self.git.stale
             || self

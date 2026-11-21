@@ -98,3 +98,16 @@ real; generated fixtures must not carry absolute local paths.
 - Keep every `Cargo.toml` valid at all times: the `crates/*` glob means one broken manifest
   breaks everyone's build.
 - If someone else's in-progress edit breaks the build, wait and retry; don't fix their files.
+
+## 6. Release reply format
+
+When giving the user a commit message and release commands:
+
+- Keep the commit message to exactly one sentence on one line, with no body or bullet points,
+  and put it in its own `text` code block.
+- Keep release notes separate from the commit message; they may be longer and more detailed.
+- Give exactly two command lines in a separate `bash` code block: create the annotated tag
+  using `git tag -a <version> --cleanup=verbatim -F <release-notes-file>`, then
+  `git push origin <version>`.
+- Do not add `cd`, `git add`, `git commit`, or branch-push commands unless the user explicitly
+  asks for them. The user handles committing separately.

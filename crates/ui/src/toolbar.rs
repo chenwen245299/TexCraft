@@ -391,7 +391,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             .request_repaint_after(std::time::Duration::from_millis(500));
     }
 
-    // ---- Right capsules: share | view mode | AI Assistant.
+    // ---- Right controls: share capsule | view-mode capsule | TexCraft icon.
     let nav_right = rect.right() - EDGE;
     let nav = Rect::from_min_max(
         pos2(nav_right - 34.5, cy - CAPSULE_H / 2.0),
@@ -405,7 +405,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
         pos2(view.left() - 9.0 - 34.5, nav.top()),
         pos2(view.left() - 9.0, nav.bottom()),
     );
-    for r in [share, view, nav] {
+    for r in [share, view] {
         p.add(capsule_shape(r, t));
     }
     let share_resp = hit(
@@ -478,21 +478,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             run(session, ids[i]);
         }
     }
-    // The AI Assistant panel on the right: shown, the capsule looks pressed.
-    let ai_open = session.view.assistant;
-    if ai_open {
-        p.rect_filled(nav.shrink(3.0), 15.0, t.segment_selected);
-    }
-    if hit(
-        ui,
-        t,
-        nav.shrink(3.0),
-        "tb-assistant",
-        tr("AI Assistant (⌥⌘7)"),
-        true,
-        15.0,
-    )
-    .clicked()
+    // The artwork itself is the Assistant button, with no surrounding capsule or tint.
+    if ui
+        .interact(nav, ui.id().with("tb-assistant"), Sense::click())
+        .on_hover_text(tr("AI Assistant (⌥⌘7)"))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
     {
         run(session, "view.assistant");
     }
@@ -585,6 +576,73 @@ pub fn height() -> f32 {
 mod tests {
     use super::*;
     use texcraft_i18n::Lang;
+
+    #[test]
+    fn texcraft_button_has_no_outer_chrome_and_still_toggles_the_assistant() {
+        fn surrounds_icon(shape: &egui::Shape, center: egui::Pos2) -> bool {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().any(|shape| surrounds_icon(shape, center))
+                }
+                egui::Shape::Rect(shape) => {
+                    shape.brush.is_none()
+                        && shape.rect.contains(center)
+                        && shape.rect.width() < 50.0
+                }
+                egui::Shape::Circle(shape) => shape.center.distance(center) < 2.0,
+                _ => false,
+            }
+        }
+        for lang in Lang::ALL {
+            let _scope = texcraft_i18n::scoped(lang);
+            for tokens in [Tokens::light(), Tokens::dark()] {
+                let ctx = egui::Context::default();
+                egui_extras::install_image_loaders(&ctx);
+                let mut session = Session::empty(std::sync::Arc::new(|| {}));
+                session.view.assistant = false;
+                let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1388.0, TOOLBAR_HEIGHT));
+                let center = pos2(rect.right() - EDGE - 34.5 / 2.0, rect.center().y);
+                let mut frame = |events| {
+                    let mut out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(rect),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| show(ui, &tokens, &mut session, rect, TRAFFIC_LIGHTS_WIDTH),
+                    );
+                    out.textures_delta.clear();
+                    assert!(
+                        !out.shapes
+                            .iter()
+                            .any(|shape| surrounds_icon(&shape.shape, center))
+                    );
+                    session.view.assistant
+                };
+                assert!(!frame(Vec::new()));
+                for expected in [true, false] {
+                    frame(vec![
+                        egui::Event::PointerMoved(center),
+                        egui::Event::PointerButton {
+                            pos: center,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                    assert_eq!(
+                        frame(vec![egui::Event::PointerButton {
+                            pos: center,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }]),
+                        expected
+                    );
+                }
+            }
+        }
+    }
 
     /// The status icon and the transient message tell the typeset summary from other status
     /// messages in either language.

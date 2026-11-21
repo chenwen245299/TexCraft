@@ -16,8 +16,19 @@ use crate::chats::{self, ChatStore, ChatSummary};
 use crate::{CommandError, Effect, Session, edit};
 
 /// One message of the conversation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessageSource {
+    pub project: Option<PathBuf>,
+    pub file: Option<PathBuf>,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+}
+
+/// One message of the conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
+    /// The question's original project and file; retained with saved conversations.
+    pub source: Option<MessageSource>,
     /// Who wrote it.
     pub role: Role,
     /// Its text (Markdown for answers).
@@ -43,8 +54,9 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    fn user(text: String, images: Vec<Image>) -> Self {
+    fn user(text: String, images: Vec<Image>, source: MessageSource) -> Self {
         Self {
+            source: Some(source),
             images,
             role: Role::User,
             text,
@@ -91,7 +103,7 @@ pub struct AiState {
     /// The project folder the conversation belongs to (canonical; `None`: none).
     chat_project: Option<PathBuf>,
     /// The folder last seen (`None`: not looked yet), to notice another project opening.
-    chat_seen: Option<Option<PathBuf>>,
+    chat_seen: Option<(Option<PathBuf>, Option<PathBuf>)>,
     /// What the conversation used (its answers' requests), saved with it.
     pub usage: ChatUsage,
     /// The last context measured, and what it depended on (see `Session::ai_context`).
@@ -100,6 +112,8 @@ pub struct AiState {
 
 /// An answer in rounds: the model calls tools, gets their answers and goes on.
 struct Round {
+    /// The directory this question was sent from; tool rounds never consult another project.
+    project: Option<PathBuf>,
     req: ChatRequest,
     /// Rounds of tool calls so far.
     n: u32,
@@ -116,9 +130,10 @@ struct Round {
 }
 
 impl Round {
-    fn new(req: ChatRequest, plain_system: String, run: usize) -> Self {
+    fn new(req: ChatRequest, plain_system: String, run: usize, project: Option<PathBuf>) -> Self {
         let estimate = texcraft_ai::usage::estimate(&req).total();
         Self {
+            project,
             req,
             n: 0,
             text: String::new(),
@@ -200,6 +215,87 @@ answer with LaTeX where it helps. If the open document is included below, refer 
 helpful and keep its packages and conventions.";
 
 impl Session {
+    pub fn ai_source(&self) -> MessageSource {
+        MessageSource {
+            project: self.ai_project_root(),
+            root: self.project_root.clone(),
+            file: self
+                .doc()
+                .and_then(|doc| doc.typeset_path())
+                .map(std::path::Path::to_path_buf),
+        }
+    }
+
+    /// Reject inconsistent/legacy mixed sessions before any document text can reach a model.
+    pub(crate) fn ai_validate_context(&self) -> Result<(), CommandError> {
+        let Some(path) = self.doc().and_then(|doc| doc.path.as_ref()) else {
+            return Ok(());
+        };
+        let Some(directory) = self.ai_project_root() else {
+            return Ok(());
+        };
+        let entry = texcraft_project::project_entry(path, &|path| self.text_of(path));
+        let included = self.project_root.as_ref().is_some_and(|root| {
+            let index = crate::index::build(root, &|path| self.text_of(path));
+            index.files.iter().any(|file| file.path == *path)
+                || index.assets.iter().any(|file| file.path == *path)
+        });
+        let different_root = self
+            .project_root
+            .as_ref()
+            .is_some_and(|root| *root != entry)
+            && self
+                .text_of(&entry)
+                .is_some_and(|text| texcraft_syntax::is_root_document(&text));
+        let same_root = self.project_root.as_ref() == Some(&entry);
+        if !included && !same_root && (!path.starts_with(directory) || different_root) {
+            return Err(CommandError::Failed(tr("The active file does not belong to this project. Open it in its own project window before asking AI.").into()));
+        }
+        Ok(())
+    }
+
+    fn ai_context_path(&self, path: &std::path::Path) -> String {
+        let path = texcraft_project::normalize(path);
+        self.ai_project_root()
+            .and_then(|root| {
+                path.strip_prefix(root)
+                    .ok()
+                    .map(std::path::Path::to_path_buf)
+            })
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The current tab's project-relative path, or its untitled name. Never a scratch path.
+    pub fn ai_active_file(&self) -> Option<String> {
+        self.doc().map(|doc| {
+            doc.path
+                .as_ref()
+                .map_or_else(|| doc.display_name(), |path| self.ai_context_path(path))
+        })
+    }
+
+    /// Editor identity captured afresh for each question, independent of content inclusion.
+    pub fn ai_editor_context(&self) -> serde_json::Value {
+        let doc = self.doc();
+        serde_json::json!({
+            "project": self.ai_project_root().and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned())),
+            "file": self.ai_active_file(),
+            "rootFile": doc.filter(|doc| doc.path.is_some()).and_then(|_| self.project_root.clone().or_else(|| self.root_path())).map(|path| self.ai_context_path(&path)),
+            "modified": doc.is_some_and(|doc| doc.is_dirty()),
+            "cursor": doc.map(|doc| serde_json::json!({
+                "line": doc.caret_line(),
+                "column": edit::column_of_char(&doc.text, doc.selection.cursor),
+            })),
+            "selection": doc.filter(|doc| !doc.selection.is_empty()).map(|doc| serde_json::json!({
+                "startLine": edit::line_of_char(&doc.text, doc.selection.start()),
+                "endLine": edit::line_of_char(&doc.text, doc.selection.end()),
+            })),
+            "contentsIncluded": doc.is_some() && self.ai.config.include_document,
+        })
+    }
+
     /// The model the Assistant talks to, with its name and capabilities.
     pub fn ai_model(&self) -> Option<&Model> {
         let (p, id) = self.ai.config.selection()?;
@@ -343,13 +439,19 @@ impl Session {
     /// The system prompt with the open document (and the selection) when that is enabled.
     fn ai_system(&self) -> String {
         let mut s = SYSTEM.to_string();
+        s.push_str(&format!(
+            "\n\nCurrent editor context for this question (authoritative; earlier turns may refer \
+             to other tabs). Use this file when the user says 'this file' or 'the current file':\n\
+             <editor_context>\n{}\n</editor_context>",
+            self.ai_editor_context()
+        ));
         if !self.ai.config.include_document {
             return s;
         }
         let Some(doc) = self.doc() else { return s };
         s.push_str(&format!(
             "\n\nThe open document is “{}” (each line prefixed with its number):\n<document>\n",
-            doc.display_name()
+            self.ai_active_file().unwrap_or_else(|| doc.display_name())
         ));
         for (i, line) in doc.text.lines().enumerate() {
             s.push_str(&format!("{:>4}  {line}\n", i + 1));
@@ -374,6 +476,8 @@ impl Session {
 
     /// Asks the chosen model `text` (the conversation so far goes along).
     pub fn ai_send(&mut self, text: &str) -> Result<(), CommandError> {
+        self.ai_follow_project();
+        self.ai_validate_context()?;
         let text = text.trim();
         if text.is_empty() && self.ai.draft_images.is_empty() {
             return Err(CommandError::Failed(tr("Type a question first.").into()));
@@ -395,9 +499,10 @@ impl Session {
                 model = label
             )));
         }
+        let source = self.ai_source();
         self.ai
             .messages
-            .push(ChatMessage::user(text.to_string(), images));
+            .push(ChatMessage::user(text.to_string(), images, source.clone()));
         let turns = self.ai_turns(&model);
         let provider_id = provider.id.clone();
         let (system, tools, plain_system) = self.ai_prompt();
@@ -412,6 +517,7 @@ impl Session {
             tools,
         };
         self.ai.messages.push(ChatMessage {
+            source: Some(source),
             images: Vec::new(),
             role: Role::Assistant,
             text: String::new(),
@@ -430,7 +536,7 @@ impl Session {
         });
         let run = self.ai.usage.runs.len().saturating_sub(1);
         self.ai.job = Some(texcraft_ai::start(&req, Arc::clone(&self.waker)));
-        self.ai.round = Some(Round::new(req, plain_system, run));
+        self.ai.round = Some(Round::new(req, plain_system, run, self.ai_project_root()));
         self.ai_save_chat();
         Ok(())
     }
@@ -453,6 +559,25 @@ impl Session {
     /// The conversation to send to `model`: answered questions only (failed or declined ones are
     /// left out), and the last question when it is not answered yet.
     pub(crate) fn ai_turns(&self, model: &str) -> Vec<Turn> {
+        let question = |message: &ChatMessage| match message
+            .source
+            .as_ref()
+            .and_then(|source| source.file.as_ref().map(|file| (source, file)))
+        {
+            Some((source, file)) => {
+                let file = if let Some(root) = &source.project {
+                    file.strip_prefix(root).unwrap_or(file)
+                } else {
+                    file.file_name().map(std::path::Path::new).unwrap_or(file)
+                };
+                format!(
+                    "Editor file for this question: {}\n\n{}",
+                    file.display(),
+                    message.text
+                )
+            }
+            None => message.text.clone(),
+        };
         let mut turns = Vec::new();
         let msgs = &self.ai.messages;
         let mut i = 0;
@@ -465,7 +590,7 @@ impl Session {
                     Some(a) if a.error.is_none() && !a.pending => {
                         turns.push(Turn {
                             role: Role::User,
-                            text: m.text.clone(),
+                            text: question(m),
                             blocks: Vec::new(),
                             images: m.images.clone(),
                             ..Default::default()
@@ -487,7 +612,7 @@ impl Session {
                     }
                     _ if last => turns.push(Turn {
                         role: Role::User,
-                        text: m.text.clone(),
+                        text: question(m),
                         blocks: Vec::new(),
                         images: m.images.clone(),
                         ..Default::default()
@@ -536,7 +661,11 @@ impl Session {
             }
             return;
         }
-        let root = self.ai_project_root();
+        let root = round.project.clone();
+        if root != self.ai_project_root() {
+            self.ai_stop();
+            return;
+        }
         let mut results = Vec::new();
         let mut uses = Vec::new();
         for call in &tool_calls {
@@ -624,33 +753,40 @@ impl Session {
     }
 
     /// Conversations belong to a project: when another one opens, the conversation is saved
-    /// and the Assistant starts afresh with that project's history (once an answer arriving
-    /// has finished).
+    /// and the Assistant starts afresh with that project's history. An old answer is stopped
+    /// before it can run tools against the new directory.
     pub(crate) fn ai_follow_project(&mut self) {
-        if self.ai.chats.is_none() || self.ai.job.is_some() {
-            return;
-        }
-        let seen = self.git_dir();
+        let seen = (self.git_dir(), self.project_root.clone());
         if self.ai.chat_seen.as_ref() == Some(&seen) {
             return;
         }
         let first = self.ai.chat_seen.is_none();
-        let project = seen.as_ref().and_then(|p| p.canonicalize().ok());
+        let project = seen
+            .1
+            .as_ref()
+            .or(seen.0.as_ref())
+            .and_then(|path| path.canonicalize().ok());
         self.ai.chat_seen = Some(seen);
         if !first && project == self.ai.chat_project {
             return;
         }
         if !first {
-            self.ai_save_chat();
+            self.ai_stop();
+            self.ai_action_dismiss();
+            self.inline_after_caret_move();
             self.ai.messages.clear();
             self.ai.usage = ChatUsage::default();
             self.ai.chat_id = None;
+            self.ai.draft.clear();
+            self.ai.draft_images.clear();
+            self.ai.notice = None;
+            self.ai.context_cache = None;
         }
         self.ai.chat_project = project;
         self.ai_refresh_history();
     }
 
-    fn ai_refresh_history(&mut self) {
+    pub(crate) fn ai_refresh_history(&mut self) {
         self.ai.history = self
             .ai
             .chats
@@ -682,6 +818,7 @@ impl Session {
 
     /// Starts a new conversation (the one shown stays in the history).
     pub fn ai_new_chat(&mut self) {
+        self.ai_follow_project();
         self.ai_stop();
         self.ai.messages.clear();
         self.ai.usage = ChatUsage::default();
@@ -690,6 +827,7 @@ impl Session {
 
     /// Shows saved conversation `id` of the current project.
     pub fn ai_open_chat(&mut self, id: &str) -> Result<(), CommandError> {
+        self.ai_follow_project();
         self.ai_stop();
         let (messages, usage) = self
             .ai
@@ -705,6 +843,7 @@ impl Session {
 
     /// Deletes saved conversation `id` (shown, the Assistant starts afresh).
     pub fn ai_delete_chat(&mut self, id: &str) -> Result<(), CommandError> {
+        self.ai_follow_project();
         if let Some(store) = &self.ai.chats {
             store
                 .delete(self.ai.chat_project.as_deref(), id)
@@ -896,9 +1035,18 @@ impl Session {
 
     /// Inserts answer `index`'s LaTeX at the caret (replacing the selection).
     pub fn ai_insert(&mut self, index: usize) -> Result<(), CommandError> {
+        self.ai_follow_project();
         let text = self
             .ai_snippet(index)
             .ok_or_else(|| CommandError::Failed(tr("nothing to insert").into()))?;
+        let source = self.ai.messages.get(index).and_then(|message| message.source.as_ref())
+            .ok_or_else(|| CommandError::Failed(tr("No file context was saved for that answer. Copy its text to insert it manually.").into()))?;
+        if *source != self.ai_source() {
+            return Err(CommandError::Failed(
+                tr("That answer belongs to another file. Open its file before inserting it.")
+                    .into(),
+            ));
+        }
         self.edit_active(|t, sel| edit::replace_selection(t, sel, &text))?;
         if let Some(line) = self.doc().map(|d| d.caret_line()) {
             self.effect(Effect::RevealLine {
@@ -907,5 +1055,115 @@ impl Session {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod editor_context_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    #[test]
+    fn successive_questions_follow_the_active_tab_even_when_file_names_match() {
+        let base = std::env::temp_dir().join(format!("texcraft-ai-editor-{}", std::process::id()));
+        for folder in ["sections", "appendix"] {
+            std::fs::create_dir_all(base.join(folder)).unwrap();
+            std::fs::write(
+                base.join(folder).join("notes.tex"),
+                "% !TEX root = ../main.tex\nSaved text.\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(base.join("main.tex"), "\\documentclass{article}\n\\begin{document}\n\\input{sections/notes}\n\\input{appendix/notes}\n\\end{document}\n").unwrap();
+        let mut session = Session::empty(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.update.enabled = false;
+        let answers = (0..3)
+            .map(|_| crate::ai_tools::tests::sse(json!({"content": "Verified."}), Some("stop")))
+            .collect();
+        let (port, server) = crate::ai_tools::tests::fake_model(answers);
+        let preset = texcraft_ai::PRESETS
+            .iter()
+            .find(|preset| preset.id == "ollama")
+            .unwrap();
+        let provider = session.ai.config.add(preset);
+        session.ai.config.providers[provider].base_url = format!("http://127.0.0.1:{port}/v1");
+        session.ai.config.providers[provider].models = vec!["local-model".into()];
+        session.ai.config.inline.enabled = false;
+        session.ai.config.normalize();
+
+        for (folder, marker) in [
+            ("sections", "UNSAVED_ACTIVE_A"),
+            ("appendix", "UNSAVED_ACTIVE_B"),
+        ] {
+            session
+                .open_path(&base.join(folder).join("notes.tex"))
+                .unwrap();
+            let text = format!("% !TEX root = ../main.tex\n中文 {marker}\n");
+            session.run("edit.setText", &json!({"text": text})).unwrap();
+            let start = "% !TEX root = ../main.tex\n".chars().count();
+            session
+                .run(
+                    "edit.select",
+                    &json!({"anchor": start, "cursor": start + 2}),
+                )
+                .unwrap();
+            let context = session.ai_editor_context();
+            assert_eq!(context["file"], format!("{folder}/notes.tex"));
+            assert_eq!(context["rootFile"], "main.tex");
+            assert_eq!(context["cursor"], json!({"line": 2, "column": 3}));
+            assert_eq!(context["selection"], json!({"startLine": 2, "endLine": 2}));
+            assert_eq!(context["modified"], true);
+            session
+                .run("ai.send", &json!({"text": "Which file am I editing?"}))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while session.ai.is_busy() && Instant::now() < deadline {
+                session.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!session.ai.is_busy());
+        }
+        // Excluding contents still identifies the active file, without sending its text.
+        session.active = 0;
+        session.run("ai.toggleDocument", &Value::Null).unwrap();
+        session
+            .run("ai.send", &json!({"text": "Which file now?"}))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.ai.is_busy() && Instant::now() < deadline {
+            session.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let requests: Vec<Value> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        let system = |index: usize| requests[index]["messages"][0]["content"].as_str().unwrap();
+        assert!(system(0).contains("sections/notes.tex") && system(0).contains("UNSAVED_ACTIVE_A"));
+        assert!(system(1).contains("appendix/notes.tex") && system(1).contains("UNSAVED_ACTIVE_B"));
+        assert!(!system(1).contains("UNSAVED_ACTIVE_A"));
+        assert!(system(1).contains("<selection>\n中文\n</selection>"));
+        assert!(system(2).contains("sections/notes.tex"));
+        assert!(!system(2).contains("<document>") && !system(2).contains("<selection>"));
+        assert!(!system(2).contains("UNSAVED_ACTIVE_A") && !system(2).contains("UNSAVED_ACTIVE_B"));
+        assert_eq!(session.ai_editor_context()["contentsIncluded"], false);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn an_empty_editor_or_untitled_document_never_exposes_a_scratch_file_as_the_active_file() {
+        let _language = texcraft_i18n::scoped(texcraft_i18n::Lang::En);
+        let mut session = Session::empty(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        assert_eq!(session.ai_editor_context()["file"], Value::Null);
+        assert_eq!(session.ai_editor_context()["contentsIncluded"], false);
+        session.new_untitled("Untitled text".into());
+        assert_eq!(session.ai_active_file().as_deref(), Some("Untitled"));
+        assert_eq!(session.ai_editor_context()["rootFile"], Value::Null);
+        assert!(!session.ai_system().contains("texcraft-"));
     }
 }
