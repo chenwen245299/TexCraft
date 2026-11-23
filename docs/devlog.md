@@ -1,5 +1,20 @@
 # TexCraft devlog
 
+## Release dependency audit repaired (2026-11-23)
+
+- Confirmed the v0.6.2 release stopped before platform builds because `async-executor 1.14.0`
+  was yanked. Updated only its lock entry to 1.14.1, the upstream use-after-free fix.
+- Fresh local audit also reported `url 2.5.8` under RUSTSEC-2026-0592 (nested blob origin
+  recursion/stack overflow). Updated to 2.5.9 and its required `form_urlencoded 1.2.3`.
+  Exactly three package versions/checksums changed; manifests, audit policy and workflows
+  remain unchanged.
+- Gates: CI's cargo-deny 0.20.2, `cargo deny --locked check`: advisories/bans/licenses/sources
+  all pass; fmt; 415 workspace tests pass (1 measurement tool ignored); workspace all-target
+  Clippy with warnings denied. No UI behavior changed, so no new screenshots were needed.
+- Prepared local `texcraft-v0.6.3.md`, including the unshipped v0.6.2 changes and these dependency
+  fixes. Remote tags end at v0.6.2; rerunning that tag checks its old lockfile. No commits,
+  tags, pushes or remote workflow runs were performed; platform builds await the new tag.
+
 ## Commit and release-note format clarified (2026-11-21)
 
 - Recorded in `AGENTS.md`: commit messages are exactly one sentence on one line, without a
