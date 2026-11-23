@@ -1738,6 +1738,15 @@ static REGISTRY: &[CommandSpec] = &[
     ),
     // ---------------------------------------------------------------- Typeset
     cmd!(
+        "typeset.refreshBibliography",
+        "Refresh Bibliography",
+        None,
+        0,
+        None,
+        can_typeset,
+        |s, _| s.refresh_bibliography()
+    ),
+    cmd!(
         "typeset.run",
         "Typeset",
         Typeset,
@@ -1745,9 +1754,9 @@ static REGISTRY: &[CommandSpec] = &[
         Some(Shortcut::cmd("T")),
         can_typeset,
         |s, _| {
-            // A full typeset writes the PDF in every mode; pressing again while one runs aborts
-            // it (a live-preview pass in progress gives way instead).
-            if s.typeset.is_full_running() {
+            // Pressing again aborts a foreground full run. A quiet bibliography refresh
+            // finishes first, then the explicit request runs visibly.
+            if s.typeset.is_full_running() && !s.typeset.bibliography_job {
                 s.stop_typeset();
                 return Ok(());
             }

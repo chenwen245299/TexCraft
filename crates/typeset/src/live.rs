@@ -82,8 +82,16 @@ pub fn prepare_mirror(
     req: &LiveRequest,
     root_override: impl FnOnce(&str) -> Option<String>,
 ) -> std::io::Result<(String, bool)> {
-    let live = req.live_dir();
-    std::fs::create_dir_all(&live)?;
+    prepare_mirror_in(req, &req.live_dir(), root_override)
+}
+
+/// A separate mirror for full bibliography runs, without live-preview font/format caches.
+pub(crate) fn prepare_mirror_in(
+    req: &LiveRequest,
+    live: &Path,
+    root_override: impl FnOnce(&str) -> Option<String>,
+) -> std::io::Result<(String, bool)> {
+    std::fs::create_dir_all(live)?;
     if let Some(temp) = live.parent() {
         texcraft_project::ignore_temp_folder(temp);
     }

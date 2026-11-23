@@ -20,16 +20,60 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use texcraft_i18n::tr;
 use texcraft_project::TypesetMode;
+use texcraft_typeset::LiveRequest;
 use texcraft_typeset::Outcome;
 
-use crate::{QuitTypeset, Session};
+use crate::{CommandError, QuitTypeset, Session};
 
 /// Passes over unchanged text after an edit, to settle the files passes read back (contents
 /// that grow by a page move the page numbers once more; latexmk allows a few runs too).
 pub const SETTLE_PASSES: u8 = 3;
 
 impl Session {
+    /// Snapshot used by a live pass or a full bibliography refresh. Both read current buffers
+    /// without saving them, and resolve other files from the owning project.
+    pub(crate) fn preview_request(&self, root: &Path) -> Result<LiveRequest, CommandError> {
+        let project_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
+        let root_rel = root
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| CommandError::Failed(tr("the root file has no name").into()))?;
+        let buffers: Vec<_> = self
+            .live_buffers(&project_dir)
+            .iter()
+            .filter_map(|(i, rel)| Some((rel.clone(), self.docs.get(*i)?.text.clone())))
+            .collect();
+        if !buffers.iter().any(|(p, _)| *p == root_rel) && !root.is_file() {
+            return Err(CommandError::Failed(
+                tr("the root file is not saved yet").into(),
+            ));
+        }
+        let plan = self.typeset_plan();
+        let mut dirs = Vec::new();
+        for file in &self.index.files {
+            if let Some(rel) = file
+                .path
+                .parent()
+                .and_then(|d| d.strip_prefix(&project_dir).ok())
+                && !rel.as_os_str().is_empty()
+                && !dirs.iter().any(|d| d == rel)
+            {
+                dirs.push(rel.to_path_buf());
+            }
+        }
+        Ok(LiveRequest {
+            project_dir,
+            root_rel,
+            buffers,
+            dirs,
+            engine: plan.engine,
+            shell_escape: self.settings.shell_escape,
+            cache_preamble: self.settings.cache_preamble,
+            pretex: self.pretex_for(&plan),
+        })
+    }
     /// The open documents a live pass of a root in `folder` typesets from their buffers:
     /// (index, path relative to `folder`).
     pub(crate) fn live_buffers(&self, folder: &Path) -> Vec<(usize, PathBuf)> {
@@ -120,6 +164,7 @@ impl Session {
             || self.typeset.queued
             || self.typeset.queued_live
             || self.typeset.live_due.is_some()
+            || self.typeset.bibliography_due.is_some()
             || self.typeset.quit != QuitTypeset::Idle
         {
             return;

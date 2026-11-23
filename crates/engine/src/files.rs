@@ -252,6 +252,9 @@ impl Session {
         for (root, _) in &mut self.typeset.stale {
             remap(root);
         }
+        if let Some((root, _)) = &mut self.typeset.bibliography_due {
+            remap(root);
+        }
         self.inline_dismiss();
         self.ai_stop();
         self.ai_action_dismiss();

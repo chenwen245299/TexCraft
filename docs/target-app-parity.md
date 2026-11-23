@@ -17,7 +17,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Editor selection | ✅ | neutral tint, full-width block for whole lines, syntax colours kept |
 | Source Control (not in the target) | ✅ | VS Code-like: branch, pull/push/fetch, message + Commit (⌘↩), staged/changes with stage/unstage/discard, diff sheet, recent commits |
 | AI inline suggestions (not in the target) | ✅ | grey suggestion at the caret after a typing pause (Tab / ⌘→ word / Esc / ⌥\ now), ✦ button in the editor header with a popover for pause, length, context before/after and model |
-| AI Assistant (not in the target) | ✅ | providers in Settings → AI (SoCLaaS at NUS, Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Kimi, Qwen Token Plan, MiMo, Zhipu GLM, MiniMax, StepFun, MoleAPI, Ollama, custom: Argus's list), sidebar tab before Search, Settings pane after Editor, keys encrypted at rest, streaming answers with Insert/Copy, provider/model logos (LobeHub, Apache-2.0) |
+| AI Assistant (not in the target) | ✅ | providers in Settings → AI (SoCLaaS at NUS, Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Kimi, Qwen Token Plan, MiMo, Zhipu GLM, MiniMax, StepFun, MoleAPI, Ollama, custom: Argus's list), sidebar tab before Search, Settings pane after Editor, keys encrypted at rest, streaming answers with Insert/Copy, provider/model logos (LobeHub, Apache-2.0); manual scrolling preserves history during generation, returning to the bottom resumes following |
 | Interface type | ✅ | system font in its Text optical size (`opsz` 17) and semibold weight, sizes measured on the target |
 | Scroll bars | ✅ | always-visible 11 pt thumbs, as the target shows them with a mouse attached |
 | Settings window | ✅ | separate window, pane toolbar (General, Sidebar, Editor with Editing Aids / Look & Feel, Document Viewer, Typesetting), description–control rows; only TexCraft's own options (no snippets hotkey, AI completion, cloud) |
@@ -34,7 +34,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Live typesetting on edit | 🟡 | external engine on mirrored buffers: ~0.23 s keystroke → PDF on the TikZ demo (pdfLaTeX with preamble, font-map and fast-environment caches); XeLaTeX ~0.35 s and LuaLaTeX ~0.45 s a pass (precompiled preamble, reduced font maps); the target's in-process engine is incremental |
 | ⌘T, ⇧⌘L, ⌘K, ⌘. | ✅ | |
 | Engines | 🟡 | pdfLaTeX, XeLaTeX, LuaLaTeX, Tectonic; no dvips/dvipdfmx/pLaTeX/ConTeXt/knitr/Markdown chains |
-| Bibliography auto-sense | ✅ | via latexmk on full typesets; live passes reuse the last `.bbl` |
+| Bibliography auto-sense | ✅ | via latexmk on full typesets; `.bib` edits and changed citation keys trigger a quiet full rebuild after an 800 ms pause, including unsaved buffers; live passes reuse the refreshed `.bbl` |
 | Typeset Configuration sheet | ✅ | target layout: Live vs External typesetter columns with Auto-Typeset, Auto-Sense, Summary/General/Bibliographies/Indices tabs; no R in LaTeX or Build Scripts tabs |
 | Auto-Sense engine | ✅ | fontspec/ctex/unicode-math or CJK text → XeLaTeX, luacode/luatexja → LuaLaTeX; magic comments win |
 | CJK text without setup | ✅ | Auto-Sense loads xeCJK after `\documentclass` (`latexmk -usepretex`, or ahead of `\input` in live passes) with system fonts (Songti SC + Hiragino Sans GB on macOS; Fandol fallback); the file is not edited. XeLaTeX live passes take ~0.95 s vs ~0.23 s for pdfLaTeX |
@@ -48,8 +48,9 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Syntax colours (sampled palette, light/dark) | ✅ | |
 | Line numbers, current line, error flags | ✅ | |
 | Soft wrap with hanging indent | ✅ | continuation rows shifted by two characters |
-| Autocomplete: commands, environments, `\ref`, `\cite`, files | ✅ | Tab/Return accept, Esc toggles; no placeholder tokens |
+| Autocomplete: commands, environments, `\ref`, `\cite`, files | ✅ | Tab/Return accept, Esc toggles; moving the caret (including within one line), changing selection or leaving the editor dismisses the popup; no placeholder tokens |
 | Auto-itemise, auto `\end`, auto-indent, comment toggle, indent | ✅ | |
+| Caret following after editor commands | ✅ | Return, indentation and completion keep the caret visible, including when adding lines below the viewport |
 | Find & replace bar, global search, Jump to | ✅ | |
 | Snippets menu (⌃⇧ + letter) | ✅ | fixed set, not user-editable yet |
 | √x symbol table | 🟡 | 10 categories |
@@ -64,6 +65,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Zoom −/%/+, page navigation, "Page N of M" | ✅ | |
 | Page modes | 🟡 | 3 of 6 |
 | SyncTeX ⌘-click both ways, flash | ✅ | |
+| PDF reading position after typesetting | ✅ | keeps the page, page offsets and zoom; following the editing position is opt-in, with old defaults migrated off |
 | Scroll lock | 🟡 | PDF follows the editor, not the reverse |
 | Dark-mode grading | 🟡 | whole page only |
 | Zoom percentage relative to fit width, edge-to-edge pages | ✅ | |

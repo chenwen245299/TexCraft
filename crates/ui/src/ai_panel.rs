@@ -26,8 +26,6 @@ pub struct AiPanelState {
     error: Option<String>,
     /// Focus the question box on the next frame.
     focus: bool,
-    /// Messages seen last frame (scroll to the bottom when it grows).
-    seen: usize,
     /// The context meter's popover is open.
     context_open: bool,
     /// When it closes, the pointer having left the meter and the popover (Argus waits 180 ms, so
@@ -260,11 +258,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
     // than running under it.
     let sc = &mut c.spacing_mut().scroll;
     sc.floating_allocated_width = sc.bar_width + sc.bar_outer_margin;
-    let grew = session.ai.messages.len() != st.seen || session.ai.is_busy();
-    st.seen = session.ai.messages.len();
     egui::ScrollArea::vertical()
         .id_salt("ai-scroll")
         .auto_shrink([false, false])
+        // Follow new content only while at the bottom. Scrolling away keeps the reader's
+        // position; reaching the bottom resumes following, including during streaming.
         .stick_to_bottom(true)
         .show(&mut c, |ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -284,9 +282,6 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
                 }
             }
             ui.add_space(12.0);
-            if grew {
-                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-            }
         });
 
     if let Some(e) = shown_error {
@@ -2289,5 +2284,162 @@ mod usage_row_tests {
         assert_eq!(cost_text(2.0), "2");
         assert_eq!(cost_text(0.00001), "<0.0001");
         assert_eq!(cost_text(0.0), "0.00");
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    /// Streaming follows the bottom until the reader scrolls away, keeps their place through
+    /// chunks/new messages/completion, and follows again when they return to the bottom.
+    #[test]
+    fn streaming_respects_the_readers_scroll_position() {
+        for lang in [texcraft_i18n::Lang::En, texcraft_i18n::Lang::ZhHans] {
+            let _lang = texcraft_i18n::scoped(lang);
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut session = Session::new(Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            // Keep an actual request busy locally; chunks are applied below without depending
+            // on network timing. No external provider or credentials are used.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let preset = texcraft_ai::PRESETS
+                .iter()
+                .find(|p| p.id == "ollama")
+                .unwrap();
+            let i = session.ai.config.add(preset);
+            session.ai.config.providers[i].base_url =
+                format!("http://{}/v1", listener.local_addr().unwrap());
+            session.ai.config.providers[i].models = vec!["scroll-test".into()];
+            session.ai.config.normalize();
+            session
+                .run("ai.send", &serde_json::json!({"text": "Question"}))
+                .unwrap();
+            assert!(session.ai.is_busy());
+            session.ai.messages.last_mut().unwrap().text = (1..=80)
+                .map(|n| format!("History paragraph {n}.\n\n"))
+                .collect();
+            let mut st = AiPanelState::default();
+            let mut time = 0.0;
+            let mut scroll_id = None;
+            let mut frame = |session: &mut Session, st: &mut AiPanelState, events| {
+                time += 1.0 / 60.0;
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(420.0, 480.0),
+                        )),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        // Matches the unscoped child UI that contains the conversation.
+                        let c = ui.new_child(egui::UiBuilder::new());
+                        scroll_id = Some(c.make_persistent_id(egui::IdSalt::new("ai-scroll")));
+                        show(ui, &Tokens::light(), session, st);
+                    },
+                );
+                out.textures_delta.clear();
+                egui::scroll_area::State::load(&ctx, scroll_id.unwrap())
+                    .unwrap()
+                    .offset
+                    .y
+            };
+            let wheel = |delta| {
+                vec![
+                    egui::Event::PointerMoved(pos2(200.0, 200.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, delta),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: Modifiers::NONE,
+                    },
+                ]
+            };
+            let mut bottom = 0.0;
+            for _ in 0..60 {
+                bottom = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(bottom > 1000.0);
+            session
+                .ai
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("Another streamed paragraph.\n\n");
+            let mut followed = bottom;
+            for _ in 0..10 {
+                followed = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(followed > bottom, "{lang:?}: followed streamed growth");
+            for _ in 0..10 {
+                frame(&mut session, &mut st, wheel(60.0));
+            }
+            let mut reading = 0.0;
+            for _ in 0..60 {
+                reading = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(
+                reading < followed - 300.0,
+                "{lang:?}: must allow scrolling up during generation"
+            );
+            for _ in 0..20 {
+                session
+                    .ai
+                    .messages
+                    .last_mut()
+                    .unwrap()
+                    .text
+                    .push_str("Still generating.\n\n");
+                let offset = frame(&mut session, &mut st, Vec::new());
+                assert!(
+                    (offset - reading).abs() < 1.0,
+                    "{lang:?}: chunk pulled reader down"
+                );
+            }
+            let another = session.ai.messages.last().unwrap().clone();
+            session.ai.messages.push(another);
+            for _ in 0..10 {
+                let offset = frame(&mut session, &mut st, Vec::new());
+                assert!(
+                    (offset - reading).abs() < 1.0,
+                    "{lang:?}: new message pulled reader down"
+                );
+            }
+            session.run("ai.stop", &serde_json::Value::Null).unwrap();
+            for _ in 0..10 {
+                let offset = frame(&mut session, &mut st, Vec::new());
+                assert!(
+                    (offset - reading).abs() < 1.0,
+                    "{lang:?}: completion pulled reader down"
+                );
+            }
+            for _ in 0..20 {
+                frame(&mut session, &mut st, wheel(-1000.0));
+            }
+            for _ in 0..60 {
+                bottom = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(bottom > followed);
+            session
+                .ai
+                .messages
+                .last_mut()
+                .unwrap()
+                .text
+                .push_str("Resumed following.\n\n");
+            let mut resumed = bottom;
+            for _ in 0..10 {
+                resumed = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(
+                resumed > bottom,
+                "{lang:?}: returning to bottom resumes following"
+            );
+        }
     }
 }

@@ -208,6 +208,45 @@ fn typesets_an_untitled_document_when_tex_is_installed() {
 }
 
 #[test]
+fn recompiling_does_not_override_pdf_reading_position_by_default() {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping PDF reading-position regression: no pdfLaTeX toolchain");
+        return;
+    }
+    let text = "\\documentclass{article}\n\\begin{document}\nFirst page anchor.\n\\newpage\nSecond page.\n\\newpage\nThird page.\n\\end{document}\n";
+    s.run("edit.setText", &json!({"text": text})).unwrap();
+    let caret = edit::char_of_line(text, 3);
+    s.run("edit.select", &json!({"anchor": caret})).unwrap();
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    s.effects.clear();
+    // The reader can be on page 3 while the source caret remains on page 1.
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    assert!(
+        !s.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ShowInPdf { .. })),
+        "a PDF refresh must not navigate back to the source caret"
+    );
+    // Explicit SyncTeX navigation still works, including the opt-in preference.
+    s.run("typeset.syncPdf", &Value::Null).unwrap();
+    assert!(s.effects.iter().any(|effect| matches!(effect, Effect::ShowInPdf { rects, .. } if rects.iter().any(|rect| rect.page == 1))));
+    s.effects.clear();
+    s.view.sync_after_typeset = true;
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(
+        s.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ShowInPdf { .. }))
+    );
+}
+
+#[test]
 fn chinese_text_switches_to_xelatex_and_live_previews() {
     let mut s = session();
     let text = "\\documentclass[11pt,a4paper]{article}\n\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\usepackage{hyperref}\n\\begin{document}\n\\section{Method}\n这是一个测试\n\\end{document}\n";
@@ -1334,6 +1373,267 @@ fn settle(s: &mut Session) {
         s.tick(Instant::now());
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn bibliography_edits_rebuild_references_quietly_from_unsaved_buffers() {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping bibliography rebuild: no pdfLaTeX toolchain");
+        return;
+    }
+    let dir = temp_dir("bibliography-refresh");
+    let main = dir.join("main.tex");
+    let bib = dir.join("refs.bib");
+    let source = "\\documentclass{article}\n\\begin{document}\nSee \\cite{old}.\n\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n";
+    let original = "@book{old, title={Original Title}, author={Example Author}, year={2020}}\n";
+    std::fs::write(&main, source).unwrap();
+    std::fs::write(&bib, original).unwrap();
+    s.open_path(&main).unwrap();
+    let main_index = s.active;
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    let build = texcraft_project::build_dir(&main);
+    assert!(
+        std::fs::read_to_string(build.join("main.bbl"))
+            .unwrap()
+            .contains("Original Title")
+    );
+    s.settings.save_before_typeset = false;
+    s.open_path(&bib).unwrap();
+    let bib_index = s.active;
+    let revised = "@book{old, title={Updated Title}, author={Example Author}, year={2020}}\n@book{new, title={New Reference}, author={Another Author}, year={2026}}\n";
+    s.run("edit.setText", &json!({"text": revised})).unwrap();
+    s.refresh_index(true);
+    assert!(s.index.bib.iter().any(|(entry, _)| entry.key == "new"));
+    // Switch tabs before the bibliography rebuild starts; it still belongs to this root.
+    s.active = main_index;
+    let status = s.status.as_ref().map(|(text, _)| text.clone());
+    let console = s.typeset.console.clone();
+    let sidebar = s.view.sidebar_tab;
+    s.effects.clear();
+    s.tick(Instant::now() + Duration::from_secs(2));
+    assert!(
+        s.typeset.is_full_running() && s.typeset.background,
+        "a .bib edit must schedule a background full typeset even in MANUAL mode"
+    );
+    settle(&mut s);
+    assert!(
+        s.typeset.last.as_ref().unwrap().success,
+        "{}",
+        s.typeset.last.as_ref().unwrap().console
+    );
+    assert!(
+        std::fs::read_to_string(build.join("main.bbl"))
+            .unwrap()
+            .contains("Updated Title")
+    );
+    // BibTeX omits uncited entries: adding a citation later must refresh the bibliography too.
+    let body = source.replace("\\cite{old}", "\\cite{old,new}");
+    s.run("edit.setText", &json!({"text": body})).unwrap();
+    s.index_built = Some(Instant::now());
+    assert!(
+        s.tick(Instant::now())
+            .is_some_and(|wait| wait <= Duration::from_millis(400)),
+        "the final edit requests another tick after the index throttle"
+    );
+    s.index_built = Instant::now().checked_sub(Duration::from_secs(1));
+    s.tick(Instant::now());
+    assert!(s.typeset.bibliography_due.is_some());
+    s.tick(Instant::now() + Duration::from_secs(2));
+    assert!(
+        s.typeset.is_full_running() && s.typeset.bibliography_job,
+        "a newly used citation also needs the bibliography tool"
+    );
+    settle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    let bbl = std::fs::read_to_string(build.join("main.bbl")).unwrap();
+    assert!(
+        bbl.contains("Updated Title") && bbl.contains("New Reference"),
+        "{bbl}"
+    );
+    let aux = std::fs::read_to_string(build.join("main.aux")).unwrap();
+    assert!(aux.contains("\\bibcite{new}"), "{aux}");
+    assert_eq!(std::fs::read_to_string(&main).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(&bib).unwrap(), original);
+    assert!(s.docs[main_index].is_dirty() && s.docs[bib_index].is_dirty());
+    assert_eq!(s.status.as_ref().map(|(text, _)| text.clone()), status);
+    assert_eq!(s.typeset.console, console);
+    assert_eq!(s.view.sidebar_tab, sidebar);
+    assert!(!s.effects.iter().any(|e| matches!(
+        e,
+        Effect::Alert { .. } | Effect::RevealLine { .. } | Effect::ShowInPdf { .. }
+    )));
+    // Ordinary prose edits and shifted citation line numbers must not cause full rebuilds.
+    s.run(
+        "edit.setText",
+        &json!({"text": body.replace("See", "\nSee")}),
+    )
+    .unwrap();
+    s.refresh_index(true);
+    assert!(s.typeset.bibliography_due.is_none());
+    // A temporarily incomplete .bib must quietly keep the last good preview and PDF.
+    let generation = s.pdf.generation;
+    let published = std::fs::read(texcraft_project::published_pdf(&main)).unwrap();
+    s.active = bib_index;
+    s.run(
+        "edit.setText",
+        &json!({"text": "@book{new, title={Unfinished"}),
+    )
+    .unwrap();
+    s.effects.clear();
+    s.tick(Instant::now() + Duration::from_secs(2));
+    settle(&mut s);
+    assert!(!s.typeset.last.as_ref().unwrap().success);
+    assert_eq!(s.pdf.generation, generation);
+    assert_eq!(
+        std::fs::read_to_string(build.join("main.bbl")).unwrap(),
+        bbl,
+        "a failed refresh must keep the good bibliography for subsequent live passes"
+    );
+    assert_eq!(
+        std::fs::read(texcraft_project::published_pdf(&main)).unwrap(),
+        published
+    );
+    assert_eq!(s.status.as_ref().map(|(text, _)| text.clone()), status);
+    assert_eq!(s.typeset.console, console);
+    assert_eq!(s.view.sidebar_tab, sidebar);
+    assert!(
+        !s.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Alert { .. } | Effect::PdfChanged))
+    );
+    s.tick(Instant::now() + Duration::from_secs(10));
+    assert!(
+        !s.typeset.is_running(),
+        "a failed snapshot is not retried every frame"
+    );
+}
+
+#[test]
+fn bibliography_refresh_coalesces_edits_and_preserves_followup_work_in_every_mode() {
+    for mode in ["live", "auto", "manual"] {
+        let mut s = session();
+        let dir = temp_dir(&format!("bibliography-queue-{mode}"));
+        let main = dir.join("main.tex");
+        let bib = dir.join("refs.bib");
+        std::fs::write(&main, "\\documentclass{article}\n\\bibliography{refs}\n").unwrap();
+        std::fs::write(&bib, "@book{old, title={Old}}\n").unwrap();
+        s.open_path(&main).unwrap();
+        s.open_path(&bib).unwrap();
+        s.run(&format!("typeset.mode.{mode}"), &Value::Null)
+            .unwrap();
+        s.toolchain = Toolchain::default();
+        s.run(
+            "edit.setText",
+            &json!({"text": "@book{first, title={First}}"}),
+        )
+        .unwrap();
+        let first_due = s.typeset.bibliography_due.clone().unwrap().1;
+        s.run(
+            "edit.setText",
+            &json!({"text": "@book{second, title={Second}}"}),
+        )
+        .unwrap();
+        let (root, due) = s.typeset.bibliography_due.clone().unwrap();
+        assert_eq!(root, std::fs::canonicalize(&main).unwrap());
+        assert!(due >= first_due);
+        assert!(
+            s.typeset.is_busy(),
+            "scheduled work is visible to typeset.wait"
+        );
+        s.tick_bibliography(due - Duration::from_millis(1));
+        assert!(!s.typeset.is_running());
+        s.tick_bibliography(due);
+        assert!(s.typeset.is_full_running() && s.typeset.bibliography_job && s.typeset.background);
+        assert_eq!(
+            s.typeset.job_revisions.last().unwrap().1,
+            s.doc().unwrap().revision
+        );
+        // An edit received while that snapshot runs needs one later run.
+        s.run(
+            "edit.setText",
+            &json!({"text": "@book{third, title={Third}}"}),
+        )
+        .unwrap();
+        let next_due = s.typeset.bibliography_due.clone().unwrap().1;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while s.typeset.runs == 0 && Instant::now() < deadline {
+            s.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(s.typeset.runs, 1);
+        s.tick_bibliography(next_due);
+        assert!(s.typeset.bibliography_job && s.typeset.is_full_running());
+        settle(&mut s);
+        assert_eq!(
+            s.typeset.runs, 2,
+            "{mode}: coalesced edits, retained follow-up"
+        );
+        assert!(s.typeset.bibliography_due.is_none());
+        assert!(
+            !s.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Alert { .. }))
+        );
+        // The unanimated Typeset button still requests a foreground run, rather than
+        // unexpectedly cancelling the invisible bibliography work.
+        s.run("typeset.refreshBibliography", &Value::Null).unwrap();
+        s.tick_bibliography(Instant::now() + Duration::from_secs(2));
+        s.run("typeset.run", &Value::Null).unwrap();
+        assert!(s.typeset.queued && s.typeset.bibliography_job);
+        settle(&mut s);
+        assert!(!s.typeset.background && !s.typeset.bibliography_job);
+        // Delayed work cannot enter another project after this one is closed.
+        s.run("typeset.refreshBibliography", &Value::Null).unwrap();
+        s.docs.clear();
+        s.tick_bibliography(Instant::now() + Duration::from_secs(2));
+        assert!(s.typeset.bibliography_due.is_none() && !s.typeset.is_running());
+    }
+}
+
+#[test]
+fn bibliography_refresh_runs_biber_when_available() {
+    let mut s = session();
+    let biber_ready = s.toolchain.bin_dirs.iter().any(|dir| {
+        let path = dir.join(if cfg!(windows) { "biber.exe" } else { "biber" });
+        path.is_file()
+            && std::process::Command::new(path)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+    });
+    let biblatex_ready = s.toolchain.kpsewhich().is_some_and(|path| {
+        std::process::Command::new(path)
+            .arg("biblatex.sty")
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+    });
+    if !s.toolchain.supports(Engine::PdfLatex) || !biber_ready || !biblatex_ready {
+        eprintln!("skipping bibliography refresh: no working pdfLaTeX/Biber/biblatex toolchain");
+        return;
+    }
+    let dir = temp_dir("bibliography-biber");
+    let main = dir.join("main.tex");
+    let bib = dir.join("refs.bib");
+    std::fs::write(&main, "\\documentclass{article}\n\\usepackage[backend=biber]{biblatex}\n\\addbibresource{refs.bib}\n\\begin{document}\nSee \\cite{new}.\\printbibliography\n\\end{document}\n").unwrap();
+    std::fs::write(
+        &bib,
+        "@book{old, title={Old}, author={Example Author}, year={2020}}\n",
+    )
+    .unwrap();
+    s.open_path(&main).unwrap();
+    s.open_path(&bib).unwrap();
+    s.run("edit.setText", &json!({"text": "@book{new, title={Biber Updated Reference}, author={Example Author}, year={2026}}"})).unwrap();
+    s.tick(Instant::now() + Duration::from_secs(2));
+    settle(&mut s);
+    let outcome = s.typeset.last.as_ref().unwrap();
+    assert!(outcome.success, "{}", outcome.console);
+    let bbl = std::fs::read_to_string(texcraft_project::build_dir(&main).join("main.bbl")).unwrap();
+    assert!(bbl.contains("Biber Updated Reference"), "{bbl}");
+    assert!(s.doc().unwrap().is_dirty());
+    assert!(!std::fs::read_to_string(bib).unwrap().contains("Updated"));
 }
 
 #[test]

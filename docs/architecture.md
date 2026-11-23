@@ -149,6 +149,22 @@ the build or an old staging file cannot make the final PDF invisible in Finder. 
 never touch that PDF. LIVE mode periodically refreshes edited projects: 5 minutes after the
 first edit, at a 5 s typing pause (at once after 10 minutes).
 
+Bibliography edits additionally request `typeset.refreshBibliography`: after an 800 ms pause,
+a quiet full toolchain run updates BibTeX/Biber output in every mode. It reads a separate
+mirror of current buffers, writes the normal build cache and refreshes the PDF without saving
+source files. Later live passes reuse the updated `.bbl`. Edits during a run queue another
+snapshot; foreground requests take priority. Failed snapshots preserve the good `.bbl`, PDF
+and SyncTeX files. Newly added or changed citation keys in the body request the same refresh,
+so entries first cited after a `.bib` rebuild also appear correctly. Ordinary text edits and
+citation line-number changes keep using fast live passes. This refresh does not animate the
+toolbar, change diagnostics/status, open the issues list or move either view. `typeset.wait`
+includes its debounce and queued work.
+
+PDF refreshes keep the reader's current page, horizontal/vertical offsets and zoom. Automatic
+scrolling to the source caret after typesetting is opt-in (`View::sync_after_typeset`, false
+by default); persisted-preferences version 3 disables the old enabled default on upgrade.
+Explicit SyncTeX navigation and the separate scroll-lock option still work as before.
+
 Every normal exit waits for a forced full rebuild (`latexmk -g`) of each open project plus
 edited projects whose tabs were closed, in LIVE, AUTO and MANUAL modes. Unsaved buffers go
 through the save prompt first; edits received during a build return to that prompt. Both the

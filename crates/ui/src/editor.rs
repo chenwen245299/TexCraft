@@ -1741,6 +1741,8 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     scroll
         .id_salt(("editor-scroll", doc_path.clone()))
         .auto_shrink([false, false])
+        // Follow session edits immediately; explicit line navigation keeps its animation.
+        .animated(!pushed || reveal.is_some())
         .show(ui, |ui| {
             let band_idx = ui.painter().add(egui::Shape::Noop);
             // Where inverse search landed, under the text and the selection.
@@ -2074,7 +2076,9 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                 }
                 view = Some(clip);
                 output_galley = Some((galley, gpos));
-                // Scroll to a revealed line.
+                // Explicit navigation centers its line. Session edits (Smart Return, indent,
+                // completion, etc.) move the cursor before TextEdit can notice a change, so
+                // reveal that caret ourselves, scrolling only as far as necessary.
                 if let Some((_, line)) = reveal {
                     let ci = edit::char_of_line(&doc.text, line);
                     let r = out
@@ -2082,6 +2086,8 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                         .pos_from_cursor(CCursor::new(ci))
                         .translate(gpos.to_vec2());
                     ui.scroll_to_rect(r.expand2(vec2(0.0, 40.0)), Some(Align::Center));
+                } else if pushed && let Some(caret) = caret_row_y {
+                    ui.scroll_to_rect(caret, None);
                 }
             });
         });
@@ -2108,11 +2114,14 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     }
     if changed {
         session.note_edit();
-        if auto_complete || st.completion.is_some() {
-            update_completion(session, st, false);
-        }
-    } else if st.completion.is_some() && (st.caret_moved || !has_focus) {
-        // The caret left the word.
+    }
+    if !ui.memory(|memory| memory.has_focus(id))
+        || (!changed && (selection_moved || pushed || reveal.is_some()))
+    {
+        // Same-line clicks, selections and command navigation count too. Re-evaluating the
+        // context here can reopen a different popup at the place the reader just clicked.
+        st.completion = None;
+    } else if changed && (auto_complete || st.completion.is_some()) {
         update_completion(session, st, false);
     }
     if cmd_clicked {
@@ -2471,6 +2480,198 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_closes_when_the_caret_moves_or_editor_loses_focus() {
+        for lang in [texcraft_i18n::Lang::En, texcraft_i18n::Lang::ZhHans] {
+            let _lang = texcraft_i18n::scoped(lang);
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut session = Session::new(Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            session.view.spellcheck = false;
+            let text = "Other text. \\cite{knuth} More text.";
+            session
+                .run("edit.setText", &serde_json::json!({"text": text}))
+                .unwrap();
+            session.index.bib =
+                texcraft_syntax::bib_entries("@book{knuth, title={The TeXbook}, year={1984}}")
+                    .into_iter()
+                    .map(|entry| (entry, PathBuf::from("refs.bib")))
+                    .collect();
+            let at = text.find("knuth").unwrap() + "knuth".len();
+            let mut st = EditorState::default();
+            let frame = |session: &mut Session, st: &mut EditorState, events| {
+                let mut out =
+                    ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 500.0))),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let mut editor = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 500.0))),
+                            );
+                            show(&mut editor, &Tokens::light(), session, st);
+                            let mut other = ui.new_child(egui::UiBuilder::new().max_rect(
+                                Rect::from_min_size(pos(700.0, 100.0), vec2(180.0, 50.0)),
+                            ));
+                            other.text_edit_singleline(&mut String::new());
+                        },
+                    );
+                out.textures_delta.clear();
+            };
+            let open = |session: &mut Session, st: &mut EditorState| {
+                session.doc_mut().unwrap().selection = Selection::caret(at);
+                st.focus = true;
+                st.push_selection = Some(session.active);
+                frame(session, st, Vec::new());
+                frame(session, st, Vec::new());
+                update_completion(session, st, true);
+                frame(session, st, Vec::new());
+                assert!(st.completion.is_some());
+            };
+            open(&mut session, &mut st);
+            // ArrowLeft stays on the same logical line and in the citation argument.
+            frame(
+                &mut session,
+                &mut st,
+                vec![egui::Event::Key {
+                    key: Key::ArrowLeft,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+            assert!(
+                st.completion.is_none(),
+                "{lang:?}: moving within a line dismisses completion"
+            );
+            // A real pointer click elsewhere in that same line also dismisses it.
+            open(&mut session, &mut st);
+            let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+            let click = ctx.read_response(id).unwrap().rect.min + vec2(3.0, 10.0);
+            let button = |pos, pressed| {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ]
+            };
+            frame(&mut session, &mut st, button(click, true));
+            frame(&mut session, &mut st, button(click, false));
+            assert!(
+                st.completion.is_none(),
+                "{lang:?}: click on another word dismisses completion"
+            );
+            open(&mut session, &mut st);
+            frame(&mut session, &mut st, button(pos(740.0, 110.0), true));
+            frame(&mut session, &mut st, button(pos(740.0, 110.0), false));
+            assert!(
+                st.completion.is_none(),
+                "{lang:?}: another field dismisses completion"
+            );
+            open(&mut session, &mut st);
+            session.doc_mut().unwrap().selection = Selection::caret(0);
+            st.push_selection = Some(session.active);
+            frame(&mut session, &mut st, Vec::new());
+            assert!(
+                st.completion.is_none(),
+                "{lang:?}: command navigation dismisses completion"
+            );
+        }
+    }
+
+    /// Smart Return edits the session before TextEdit runs. Its new caret still has to stay
+    /// visible as repeated Returns cross the bottom edge, with or without soft wrapping.
+    #[test]
+    fn smart_return_keeps_the_caret_visible() {
+        for wrap in [true, false] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut session = Session::new(Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            session.view.wrap_lines = wrap;
+            session.view.spellcheck = false;
+            session.view.auto_complete = false;
+            let text = "  Some text that wraps in a narrow editor. ".repeat(6);
+            session
+                .run("edit.setText", &serde_json::json!({"text": text}))
+                .unwrap();
+            let end = text.chars().count();
+            session
+                .run(
+                    "edit.select",
+                    &serde_json::json!({"anchor": end, "cursor": end}),
+                )
+                .unwrap();
+            let mut st = EditorState {
+                focus: true,
+                push_selection: Some(0),
+                reveal: Some((0, 1)),
+                ..Default::default()
+            };
+            let mut time = 0.0;
+            let mut frame = |session: &mut Session, st: &mut EditorState, events| {
+                time += 1.0 / 60.0;
+                let mut clip = Rect::NOTHING;
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(420.0, 240.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        clip = ui.clip_rect();
+                        text_area(ui, &Tokens::light(), session, st, 0);
+                    },
+                );
+                out.textures_delta.clear();
+                (st.caret_rect.unwrap(), clip)
+            };
+            for _ in 0..30 {
+                frame(&mut session, &mut st, Vec::new());
+            }
+            for n in 1..=35 {
+                frame(
+                    &mut session,
+                    &mut st,
+                    vec![egui::Event::Key {
+                        key: Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                );
+                // ScrollArea applies its offset to the next frame's layout.
+                let (caret, clip) = frame(&mut session, &mut st, Vec::new());
+                assert!(
+                    caret.top() >= clip.top() && caret.bottom() <= clip.bottom(),
+                    "wrap={wrap}, Return {n}: caret {caret:?} outside {clip:?}"
+                );
+                assert_eq!(
+                    session
+                        .doc()
+                        .unwrap()
+                        .text
+                        .bytes()
+                        .filter(|b| *b == b'\n')
+                        .count(),
+                    n
+                );
+                assert_eq!(session.doc().unwrap().selection.cursor, end + n * 3);
+            }
+        }
+    }
 
     /// Drag-selecting with the pointer held below the editor scrolls it (and the selection
     /// follows); above it, back up. The wheel scrolls during the drag too.

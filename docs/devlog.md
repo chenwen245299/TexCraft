@@ -1,5 +1,72 @@
 # TexCraft devlog
 
+## Release notes prepared for 0.6.4 (2026-11-23)
+
+- Prepared local `texcraft-v0.6.4.md` covering editor/AI scrolling, bibliography refresh,
+  completion dismissal and PDF reading-position preservation, in the existing release format.
+- Verified local and remote tags end at v0.6.3, pointing to the current committed HEAD.
+  The new fixes still need committing before tagging. Whitespace check passes; no new code
+  changed in this preparation, and no commit, tag or push was performed.
+
+## Recompiling preserves the PDF reading position (2026-11-23)
+
+- The old enabled `sync_after_typeset` default navigated back to the source caret after every
+  refresh, often page 1 while the reader was elsewhere. It is now opt-in. Preferences version
+  3 migrates old profiles off this default while retaining zoom/page layout; explicit choices
+  made after upgrading persist. Manual SyncTeX and scroll lock remain available.
+- A real three-page TeX regression reproduced the forced navigation before the fix and now
+  checks repeated full builds, manual synchronization and explicitly opting back in. Migration
+  covers legacy versions 0–2 and preserving later choices. Gates: fmt; 217 passing results in
+  desktop/engine/UI/i18n (1 measurement ignored; the Biber availability skip noted below still
+  applies); affected crates' all-target Clippy with warnings denied.
+- Isolated native six-page document: source caret on page 1, PDF on page 4 at 150% with both
+  scroll offsets moved. Two full rebuilds and a full → live-preview transition kept page 4,
+  scale and page rectangle exactly (0 pt drift). English/light and Chinese/dark screenshots
+  inspected. Installed app was not replaced; Windows/Linux remain unverified.
+
+## Bibliography refresh and completion dismissal repaired (2026-11-23)
+
+- `.bib` edits request `typeset.refreshBibliography`: an 800 ms debounce followed by a quiet
+  full toolchain run in every mode. It reads unsaved buffers from a separate mirror, updates
+  the normal `.bbl` cache and PDF, and does not save source files, animate gears, change
+  diagnostics/status, open issues or synchronize the views. Failed snapshots restore the good
+  bibliography/PDF/SyncTeX; edits during a run retain one follow-up, and manual builds queue
+  visibly. Pending roots follow renames and cannot enter a different project.
+- A later new citation also needs the bibliography tool: BibTeX omits entries not yet cited
+  when the `.bib` rebuild ran. Citation-key changes now request the same refresh; prose and
+  line-number changes do not. The engine honors the index throttle's next wake-up, and
+  `typeset.wait` includes index/debounce/queued work (`bibliography`, `bibliographyPending`).
+- Completion now closes on character/selection movement, command navigation or current
+  focus loss, including clicking another word on the same logical line. Typing still updates
+  candidates, and completion navigation/acceptance remains covered by existing checks.
+- Regressions reproduced both reported bugs and the later-citation gap before their fixes.
+  Gates: fmt; 235 passing test results across desktop/engine/typeset/UI/i18n (1 measurement
+  ignored); all-target Clippy with warnings denied. The conditional Biber oracle returns
+  early: this host's `biber --version` itself fails in its `lipo` launcher. Real BibTeX,
+  failure recovery, debounce/follow-up and all three modes were exercised.
+- Native validation: startup → unsaved `.bib` edit → later new citation produced exactly
+  3 full runs; PDF text includes the updated title/year and newly cited entry, while sources
+  remain unsaved. No dialog/status change; gear pixels stay identical during compilation.
+  English/light and Chinese/dark popup open → same-line click → closed screenshots inspected.
+  Installed app was not replaced; Biber and Windows/Linux remain unverified.
+
+## Editor caret and Assistant scrolling repaired (2026-11-23)
+
+- Smart Return, indent and completion update TextEdit's selection before it can detect a
+  cursor change. The editor now reveals that caret immediately, scrolling only enough to
+  keep it visible; explicit line navigation retains its centered animation.
+- Removed the Assistant's unconditional bottom-scroll request during generation and message
+  growth. Bottom following now yields to manual scrolling and resumes on reaching the bottom.
+- Both new regressions failed before their fixes. Coverage includes 35 consecutive Returns
+  with/without wrapping, streaming while reading history, new messages, stopping generation
+  and resuming bottom following in both languages. Gates: fmt; 90 UI/i18n tests pass
+  (1 measurement tool ignored); UI all-target Clippy with warnings denied.
+- Isolated native validation: 45 Returns kept the caret visible; dragging the Assistant
+  scrollbar preserved history while a local fake provider continued streaming (0 changed
+  content rows across two seconds), and dragging back down resumed following. English/light
+  and Chinese/dark screenshots inspected. Installed app was not replaced; Windows/Linux and
+  external providers were not exercised.
+
 ## Release dependency audit repaired (2026-11-23)
 
 - Confirmed the v0.6.2 release stopped before platform builds because `async-executor 1.14.0`

@@ -117,6 +117,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Description", "描述列表"),
     ("Matrix", "矩阵"),
     // Typeset
+    ("Refresh Bibliography", "更新参考文献"),
     ("Abort Typesetting", "中止排版"),
     ("Live Preview", "实时预览"),
     ("Auto-Typeset When Typing Pauses", "停止键入时自动排版"),

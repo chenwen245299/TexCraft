@@ -30,6 +30,13 @@ when a project is open; `--new-template ID` is the platform's explicit child lau
 With a control token file, child windows allocate separate control
 ports, printed in the same app log, and accept that token file too.
 
+`typeset.refreshBibliography` requests a quiet full rebuild of the current project's bibliography
+from unsaved buffers (also triggered automatically by `.bib` edits and changed citation keys,
+debounced for 800 ms).
+`state.inspect` → `typeset.bibliography` identifies this running full rebuild;
+`typeset.bibliographyPending` reports a waiting refresh. `typeset.wait` waits for both the
+debounce and compilation, including edits queued during an earlier run.
+
 ## Methods
 
 | Method | Params | Result |

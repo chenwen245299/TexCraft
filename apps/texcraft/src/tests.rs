@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn existing_preferences_keep_the_pdf_reading_position_after_upgrading() {
+    for version in 0..3 {
+        let mut view = View {
+            sync_after_typeset: true,
+            zoom: texcraft_engine::Zoom::Fixed(1.75),
+            page_mode: texcraft_engine::PageMode::TwoContinuous,
+            ..Default::default()
+        };
+        let mut settings = texcraft_project::Settings::default();
+        migrate_preferences(version, &mut view, &mut settings);
+        assert!(
+            !view.sync_after_typeset,
+            "legacy version {version} must stop forced jumps"
+        );
+        assert_eq!(view.zoom, texcraft_engine::Zoom::Fixed(1.75));
+        assert_eq!(view.page_mode, texcraft_engine::PageMode::TwoContinuous);
+    }
+    for opted_in in [false, true] {
+        let mut view = View {
+            sync_after_typeset: opted_in,
+            ..Default::default()
+        };
+        migrate_preferences(
+            PERSISTED_VERSION,
+            &mut view,
+            &mut texcraft_project::Settings::default(),
+        );
+        assert_eq!(
+            view.sync_after_typeset, opted_in,
+            "later explicit choices persist"
+        );
+    }
+}
+
+#[test]
 fn a_new_template_window_starts_locally_without_requesting_another_window() {
     let mut session = Session::empty(Arc::new(|| {}));
     session.settings.live_typeset = false;

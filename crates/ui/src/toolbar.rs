@@ -141,8 +141,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
     let x0 = rect.left() + left_inset;
 
     // ---- Lay out the left capsule.
-    // The gears turn for full typesets only: live-preview passes run all the time while typing.
-    let running = session.typeset.is_full_running();
+    // Quiet bibliography refreshes, like live passes, do not animate the toolbar.
+    let running = session.typeset.is_full_running() && !session.typeset.bibliography_job;
     let mode = session.settings.mode();
     let paused = session.live_paused && mode != TypesetMode::Manual;
     let auto_g = p.layout_no_wrap(mode.label().into(), font.clone(), Color32::PLACEHOLDER);

@@ -77,6 +77,9 @@ impl Session {
         if let Some(root) = self.root_path() {
             self.mark_stale(&root, now);
         }
+        if self.doc().is_some_and(|doc| doc.is_bib()) {
+            let _ = self.run("typeset.refreshBibliography", &serde_json::Value::Null);
+        }
     }
 
     /// Remembers that the PDF beside `root` is not current (since `at`, unless known earlier).
@@ -131,6 +134,7 @@ impl Session {
         }
         if self.settings.mode() != TypesetMode::Live
             || self.live_paused
+            || self.typeset.bibliography_due.is_some()
             || self.typeset.live_due.is_some()
             || self.typeset.queued_live
             || self.typeset.quit != QuitTypeset::Idle

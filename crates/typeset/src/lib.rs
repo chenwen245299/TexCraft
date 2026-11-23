@@ -449,6 +449,26 @@ fn kill_tree(_pid: u32) {}
 
 /// Starts typesetting `req` on a background thread. `wake` is called after each event.
 pub fn start(req: Request, tc: &Toolchain, wake: Arc<dyn Fn() + Send + Sync>) -> Job {
+    start_full(req, None, tc, wake)
+}
+
+/// Runs the complete toolchain over a snapshot of the open buffers without saving source
+/// files. Output (including the `.bbl` used by later live passes) goes to the normal build dir.
+pub fn start_buffered(
+    req: Request,
+    buffers: LiveRequest,
+    tc: &Toolchain,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> Job {
+    start_full(req, Some(buffers), tc, wake)
+}
+
+fn start_full(
+    req: Request,
+    buffers: Option<LiveRequest>,
+    tc: &Toolchain,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> Job {
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let pid = Arc::new(Mutex::new(None));
@@ -468,7 +488,7 @@ pub fn start(req: Request, tc: &Toolchain, wake: Arc<dyn Fn() + Send + Sync>) ->
             let tx = tx.clone();
             let wake = wake.clone();
             move || {
-                let outcome = run(&req, &tc, &tx, &wake, &cancel, &pid);
+                let outcome = run(&req, &tc, buffers.as_ref(), &tx, &wake, &cancel, &pid);
                 let _ = tx.send(JobEvent::Finished(Box::new(outcome)));
                 wake();
             }
@@ -486,6 +506,7 @@ pub fn start(req: Request, tc: &Toolchain, wake: Arc<dyn Fn() + Send + Sync>) ->
 fn run(
     req: &Request,
     tc: &Toolchain,
+    buffers: Option<&LiveRequest>,
     tx: &Sender<JobEvent>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     cancel: &AtomicBool,
@@ -494,6 +515,20 @@ fn run(
     let started = Instant::now();
     let start_time = SystemTime::now();
     let mut outcome = Outcome::default();
+    let work_dir = if let Some(buffers) = buffers {
+        let mirror = buffers.project_dir.join(".texcraft").join("bibliography");
+        if let Err(e) = live::prepare_mirror_in(buffers, &mirror, |_| None) {
+            outcome.error = Some(trf!("cannot prepare the live preview: {e}", e = e));
+            return outcome;
+        }
+        outcome.mirror = Some(Mirror {
+            live_dir: mirror.clone(),
+            project_dir: buffers.project_dir.clone(),
+        });
+        mirror
+    } else {
+        req.work_dir()
+    };
     let (prog, args) = match command_line(req, tc) {
         Ok(c) => c,
         Err(e) => {
@@ -513,12 +548,31 @@ fn run(
     if let Some(temp) = out_dir.parent() {
         texcraft_project::ignore_temp_folder(temp);
     }
+    // A half-written .bib can make BibTeX overwrite its .bbl before reporting failure.
+    // Preserve the last good bibliography and preview for later live passes as well.
+    let previous_outputs: Vec<_> = if buffers.is_some() {
+        ["bbl", "pdf", "synctex.gz", "synctex"]
+            .into_iter()
+            .filter_map(|ext| {
+                let path = out_dir.join(format!("{}.{ext}", req.stem()));
+                std::fs::read(&path).ok().map(|bytes| (path, bytes))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    let env = engine_env(tc, None);
+    let search = buffers.map(|buffers| {
+        let mut search = work_dir.as_os_str().to_os_string();
+        search.push(if cfg!(windows) { ";" } else { ":" });
+        search.push(live::search_path(&buffers.project_dir));
+        search
+    });
+    let env = engine_env(tc, search);
     run_process(
         &prog,
         &args,
-        &req.work_dir(),
+        &work_dir,
         &env,
         tx,
         wake,
@@ -548,7 +602,6 @@ fn run(
         }
     }
     let log = out_dir.join(format!("{stem}.log"));
-    let work_dir = req.work_dir();
     if log.is_file() {
         if let Ok(bytes) = std::fs::read(&log) {
             outcome.report = parse_log(&String::from_utf8_lossy(&bytes), &work_dir);
@@ -564,10 +617,22 @@ fn run(
         outcome.report.issues.append(&mut bib);
     }
     outcome.report.issues.sort_by_key(|i| i.severity);
+    if let Some(mirror) = &outcome.mirror {
+        for issue in &mut outcome.report.issues {
+            if let Some(file) = issue.file.take() {
+                issue.file = Some(mirror.to_project(&file));
+            }
+        }
+    }
     outcome.success = !outcome.cancelled
         && outcome.exit_code == Some(0)
         && outcome.pdf.is_some()
         && outcome.report.errors() == 0;
+    if !outcome.success {
+        for (path, bytes) in previous_outputs {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
     outcome
 }
 
@@ -593,7 +658,8 @@ fn engine_env(
     }
     if let Some(s) = search {
         env.push(("TEXINPUTS".into(), s.clone()));
-        env.push(("BIBINPUTS".into(), s));
+        env.push(("BIBINPUTS".into(), s.clone()));
+        env.push(("BSTINPUTS".into(), s));
     }
     env
 }

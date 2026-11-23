@@ -14,12 +14,13 @@ use texcraft_i18n::{Lang, tr, trf};
 use texcraft_log::{Issue, Severity};
 use texcraft_project::{Engine, FileKind, FileNode, Settings, Typesetter, find_root};
 use texcraft_synctex::{PdfRect, SyncTex};
-use texcraft_typeset::{Job, JobEvent, LiveRequest, Mirror, Outcome, Request, Toolchain};
+use texcraft_typeset::{Job, JobEvent, Mirror, Outcome, Request, Toolchain};
 
 pub mod ai;
 pub mod ai_actions;
 pub mod ai_tools;
 pub mod ai_usage;
+pub mod bibliography;
 pub mod chats;
 pub mod commands;
 pub mod edit;
@@ -419,7 +420,7 @@ impl Default for View {
             show_welcome: true,
             spellcheck: true,
             line_numbers: true,
-            sync_after_typeset: true,
+            sync_after_typeset: false,
             show_issues_after_error: true,
             auto_check_updates: true,
             auto_download_updates: true,
@@ -630,6 +631,10 @@ pub struct TypesetState {
     pub last_edit_at: Option<Instant>,
     /// The running (or last) full typeset was started by TexCraft, not by the user.
     pub background: bool,
+    /// A quiet full run updating bibliography data from unsaved buffers.
+    pub bibliography_job: bool,
+    /// Owning root and debounce deadline for the next bibliography refresh.
+    pub bibliography_due: Option<(PathBuf, Instant)>,
     /// The running live pass was stopped on purpose (it took too long, or TexCraft is quitting):
     /// it leaves no trace.
     pub live_dropped: bool,
@@ -656,8 +661,16 @@ impl TypesetState {
         self.job.is_some()
     }
 
-    /// A full typeset (not a live-preview pass) is in progress: the toolbar gears turn and
-    /// ⌘T aborts it.
+    /// A run is active or scheduled, including a debounced bibliography refresh.
+    pub fn is_busy(&self) -> bool {
+        self.is_running()
+            || self.live_due.is_some()
+            || self.queued
+            || self.queued_live
+            || self.bibliography_due.is_some()
+    }
+
+    /// A full toolchain run, including quiet bibliography work, is in progress.
     pub fn is_full_running(&self) -> bool {
         self.job.is_some() && !self.live_job
     }
@@ -1395,6 +1408,8 @@ impl Session {
         root: PathBuf,
         background: bool,
     ) -> Result<(), CommandError> {
+        // Capture citation changes before this run satisfies their pending refresh.
+        self.refresh_index(true);
         // Write what the engine will read: open buffers of this project (saved docs) and the
         // scratch file of an untitled document.
         let save_all = self.settings.save_before_typeset;
@@ -1458,6 +1473,16 @@ impl Session {
         self.typeset.root = Some(root);
         self.typeset.live_job = false;
         self.typeset.background = background;
+        self.typeset.bibliography_job = false;
+        if self
+            .typeset
+            .bibliography_due
+            .as_ref()
+            .is_some_and(|(r, _)| *r == key)
+            && self.docs.iter().all(|doc| !doc.is_dirty())
+        {
+            self.typeset.bibliography_due = None;
+        }
         self.typeset.job = Some(texcraft_typeset::start(
             req,
             &self.toolchain,
@@ -1485,42 +1510,7 @@ impl Session {
         let project_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
         let inputs = self.live_buffers(&project_dir);
         self.typeset.last_attempt = Some(self.live_stamp(&root, &inputs));
-        let root_rel = root
-            .file_name()
-            .map(PathBuf::from)
-            .ok_or_else(|| CommandError::Failed(tr("the root file has no name").into()))?;
-        let buffers: Vec<(PathBuf, String)> = inputs
-            .iter()
-            .filter_map(|(i, rel)| Some((rel.clone(), self.docs.get(*i)?.text.clone())))
-            .collect();
-        if !buffers.iter().any(|(p, _)| *p == root_rel) && !root.is_file() {
-            return Err(CommandError::Failed(
-                tr("the root file is not saved yet").into(),
-            ));
-        }
-        let plan = self.typeset_plan();
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        for f in &self.index.files {
-            if let Some(rel) = f
-                .path
-                .parent()
-                .and_then(|d| d.strip_prefix(&project_dir).ok())
-                && !rel.as_os_str().is_empty()
-                && !dirs.iter().any(|d| d == rel)
-            {
-                dirs.push(rel.to_path_buf());
-            }
-        }
-        let req = LiveRequest {
-            project_dir,
-            root_rel,
-            buffers,
-            dirs,
-            engine: plan.engine,
-            shell_escape: self.settings.shell_escape,
-            cache_preamble: self.settings.cache_preamble,
-            pretex: self.pretex_for(&plan),
-        };
+        let req = self.preview_request(&root)?;
         self.typeset.console.clear();
         self.typeset.root = Some(root);
         self.typeset.job_revisions = inputs
@@ -1538,6 +1528,7 @@ impl Session {
         self.typeset.job_edit_at = self.typeset.pending_edit_at.take();
         self.typeset.live_job = true;
         self.typeset.background = false;
+        self.typeset.bibliography_job = false;
         self.typeset.job = Some(texcraft_typeset::start_live(
             req,
             &self.toolchain,
@@ -1558,7 +1549,9 @@ impl Session {
     /// Advances background work: typeset output, finished runs, live typesetting. Call once
     /// per frame. Returns the time until it needs to be called again, if it is waiting.
     pub fn tick(&mut self, now: Instant) -> Option<Duration> {
+        let index_wait = self.update_index(false);
         [
+            index_wait,
             self.tick_updates(now),
             self.tick_typeset(now),
             self.tick_git(now),
@@ -1579,12 +1572,13 @@ impl Session {
             while let Some(ev) = job.try_recv() {
                 match ev {
                     JobEvent::Output(line)
-                        if self
-                            .typeset
-                            .root
-                            .as_deref()
-                            .is_none_or(|root| self.pdf_wanted(root))
-                            || self.typeset.is_quitting() =>
+                        if !self.typeset.bibliography_job
+                            && (self
+                                .typeset
+                                .root
+                                .as_deref()
+                                .is_none_or(|root| self.pdf_wanted(root))
+                                || self.typeset.is_quitting()) =>
                     {
                         self.typeset.console.push_str(&line);
                         self.typeset.console.push('\n');
@@ -1614,17 +1608,22 @@ impl Session {
                 if let Err(e) = self.typeset() {
                     self.set_status(e.to_string());
                 }
-            } else if self.typeset.queued_live {
+            } else if self.typeset.queued_live && self.typeset.bibliography_due.is_none() {
                 self.typeset.queued_live = false;
                 if let Err(e) = self.live_typeset() {
                     self.set_status(e.to_string());
                 }
             }
         }
+        let bibliography_wait = self.tick_bibliography(now);
         self.watch_live(now);
         // Live typesetting.
         let mut live_wait = None;
-        if let Some(due) = self.typeset.live_due {
+        if let Some(due) = self
+            .typeset
+            .live_due
+            .filter(|_| self.typeset.bibliography_due.is_none())
+        {
             if !self.settings.live_typeset || self.live_paused {
                 self.typeset.live_due = None;
             } else if now >= due {
@@ -1657,7 +1656,11 @@ impl Session {
         if self.typeset.is_running() {
             return Some(Duration::from_millis(100));
         }
-        live_wait.into_iter().chain(full_wait).min()
+        live_wait
+            .into_iter()
+            .chain(full_wait)
+            .chain(bibliography_wait)
+            .min()
     }
 
     /// A live pass that hangs, or runs far longer than usual, while newer edits wait is stopped:
@@ -1706,9 +1709,21 @@ impl Session {
             }
             return;
         }
-        self.typeset.finished_at = Some(std::time::SystemTime::now());
-        self.typeset.issues = outcome.report.issues.clone();
+        let quiet = self.typeset.bibliography_job && !self.typeset.is_quitting();
         self.note_typeset(&outcome);
+        if quiet && !outcome.success {
+            // An incomplete bibliography is normal while typing: keep the last good PDF,
+            // diagnostics and focus, and wait for another edit rather than retrying forever.
+            if let Some(root) = self.typeset.root.clone() {
+                self.mark_stale(&root, Instant::now());
+            }
+            self.typeset.last = Some(outcome);
+            return;
+        }
+        self.typeset.finished_at = Some(std::time::SystemTime::now());
+        if !quiet {
+            self.typeset.issues = outcome.report.issues.clone();
+        }
         let background = !outcome.live && self.typeset.background;
         let quitting = background && matches!(self.typeset.quit, QuitTypeset::Running(_));
         let mut publication_error = None;
@@ -1732,34 +1747,38 @@ impl Session {
         } else if outcome.live {
             self.typeset.last_live = Some(outcome.duration);
         } else {
-            let errors = outcome.report.errors();
-            let warnings = outcome.report.warnings();
-            let errors_text = if errors == 1 {
-                trf!("{n} error", n = errors)
-            } else {
-                trf!("{n} errors", n = errors)
-            };
-            let warnings_text = if warnings == 1 {
-                trf!("{n} warning", n = warnings)
-            } else {
-                trf!("{n} warnings", n = warnings)
-            };
-            self.set_status(trf!(
-                "Typeset in {seconds} s — {errors}, {warnings}",
-                seconds = format!("{:.1}", outcome.duration.as_secs_f32()),
-                errors = errors_text,
-                warnings = warnings_text
-            ));
-            if errors > 0 && self.view.show_issues_after_error && !outcome.live && !background {
-                self.view.sidebar = true;
-                self.view.sidebar_tab = SidebarTab::Results;
-                self.view.results_mode = ResultsMode::Issues;
+            if !quiet {
+                let errors = outcome.report.errors();
+                let warnings = outcome.report.warnings();
+                let errors_text = if errors == 1 {
+                    trf!("{n} error", n = errors)
+                } else {
+                    trf!("{n} errors", n = errors)
+                };
+                let warnings_text = if warnings == 1 {
+                    trf!("{n} warning", n = warnings)
+                } else {
+                    trf!("{n} warnings", n = warnings)
+                };
+                self.set_status(trf!(
+                    "Typeset in {seconds} s — {errors}, {warnings}",
+                    seconds = format!("{:.1}", outcome.duration.as_secs_f32()),
+                    errors = errors_text,
+                    warnings = warnings_text
+                ));
+                if errors > 0 && self.view.show_issues_after_error && !outcome.live && !background {
+                    self.view.sidebar = true;
+                    self.view.sidebar_tab = SidebarTab::Results;
+                    self.view.results_mode = ResultsMode::Issues;
+                }
             }
             if outcome.success
                 && let Some(pdf) = outcome.pdf.as_deref()
                 && let Err(e) = self.publish_pdf(pdf)
             {
-                self.set_status(e.to_string());
+                if !quiet {
+                    self.set_status(e.to_string());
+                }
                 publication_error = Some(e.to_string());
             }
         }
@@ -1811,7 +1830,7 @@ impl Session {
                 };
                 self.effect(Effect::PdfChanged);
             }
-            if self.view.sync_after_typeset {
+            if self.view.sync_after_typeset && !quiet {
                 self.forward_sync(false);
             }
         }
@@ -1998,6 +2017,12 @@ impl Session {
 
     /// Rebuilds the project index if documents changed (at most every 400 ms unless `force`).
     pub fn refresh_index(&mut self, force: bool) {
+        let _ = self.update_index(force);
+    }
+
+    /// Also returns the remaining throttle delay, so a last keystroke is indexed even if
+    /// the editor loses focus and there are no further input/repaint events.
+    fn update_index(&mut self, force: bool) -> Option<Duration> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let root = self.root_path();
@@ -2009,19 +2034,18 @@ impl Session {
         self.typeset.runs.hash(&mut h);
         let stamp = h.finish();
         if stamp == self.index_stamp {
-            return;
+            return None;
         }
         if !force
-            && self
-                .index_built
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(400))
+            && let Some(built) = self.index_built
+            && built.elapsed() < Duration::from_millis(400)
         {
-            return;
+            return Some(Duration::from_millis(400).saturating_sub(built.elapsed()));
         }
         let Some(root) = root else {
             self.index = ProjectIndex::default();
             self.index_stamp = stamp;
-            return;
+            return None;
         };
         let docs = &self.docs;
         let read = |p: &Path| -> Option<String> {
@@ -2033,9 +2057,28 @@ impl Session {
                 .map(|d| d.text.clone())
                 .or_else(|| std::fs::read_to_string(p).ok())
         };
-        self.index = index::build(&texcraft_project::normalize(&root), &read);
+        let next = index::build(&texcraft_project::normalize(&root), &read);
+        // A .bib rebuild only includes entries cited at that time. A key first cited later
+        // therefore needs another toolchain run; line/selection changes alone do not.
+        let citations_changed = self.index.root == next.root
+            && self.index.root.is_some()
+            && self
+                .index
+                .cites
+                .iter()
+                .map(|(key, _, _)| key)
+                .ne(next.cites.iter().map(|(key, _, _)| key))
+            && next
+                .assets
+                .iter()
+                .any(|asset| FileKind::of(&asset.path) == FileKind::Bib);
+        self.index = next;
         self.index_stamp = stamp;
         self.index_built = Some(Instant::now());
+        if citations_changed {
+            let _ = self.run("typeset.refreshBibliography", &serde_json::Value::Null);
+        }
+        None
     }
 
     /// Shows the sidebar on `tab` (hides it when that tab is already showing).
@@ -2132,6 +2175,8 @@ impl Session {
                 "fastEnv": self.typeset.last.as_ref().map(|o| o.fast_env),
                 "latencyMs": self.typeset.last_latency.map(|d| d.as_millis() as u64),
                 "background": self.typeset.is_full_running() && self.typeset.background,
+                "bibliography": self.typeset.is_full_running() && self.typeset.bibliography_job,
+                "bibliographyPending": self.typeset.bibliography_due.is_some(),
                 "staleProjects": self.typeset.stale.iter().map(|(r, _)| r).collect::<Vec<_>>(),
                 "quitting": self.typeset.is_quitting(),
                 "quitError": match &self.typeset.quit {

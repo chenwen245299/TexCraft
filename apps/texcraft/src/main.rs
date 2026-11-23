@@ -41,7 +41,20 @@ struct Persisted {
 
 /// Current [`Persisted::version`]. 1: live preview starts on the first keystroke (no delay).
 /// 2: the editor's default font size is 16 pt, as measured on the target.
-const PERSISTED_VERSION: u32 = 2;
+/// 3: recompiling preserves the PDF reading position instead of following the source caret.
+const PERSISTED_VERSION: u32 = 3;
+
+fn migrate_preferences(version: u32, view: &mut View, settings: &mut texcraft_project::Settings) {
+    if version < 1 {
+        settings.live_delay_ms = 0;
+    }
+    if version < 2 && (view.editor_font_size - 15.0).abs() < 0.1 {
+        view.editor_font_size = 16.0;
+    }
+    if version < 3 {
+        view.sync_after_typeset = false;
+    }
+}
 
 /// Command-line options.
 #[derive(Default)]
@@ -242,12 +255,7 @@ impl App {
             if let Some(s) = p.settings {
                 session.settings = s;
             }
-            if p.version < 1 {
-                session.settings.live_delay_ms = 0;
-            }
-            if p.version < 2 && (session.view.editor_font_size - 15.0).abs() < 0.1 {
-                session.view.editor_font_size = 16.0;
-            }
+            migrate_preferences(p.version, &mut session.view, &mut session.settings);
             session.set_recent(p.recent);
             if let Some(split) = p.split {
                 bench.split = split.clamp(0.2, 0.8);
@@ -886,9 +894,9 @@ impl App {
                     None => keep.push(Deferred::Screenshot { path, reply }),
                 },
                 Deferred::Typeset { until, reply } => {
-                    let busy = self.session.typeset.is_running()
-                        || self.session.typeset.live_due.is_some()
-                        || self.session.typeset.queued;
+                    // A final edit can still be waiting for the index's throttle delay.
+                    self.session.refresh_index(true);
+                    let busy = self.session.typeset.is_busy();
                     if !busy {
                         let _ = reply.send(Ok(self.session.inspect()["typeset"].clone()));
                     } else if Instant::now() > until {
@@ -916,7 +924,7 @@ impl App {
 
         // --screenshot: wait for the delay and for typesetting/rendering to settle, then save and quit.
         if let Some((path, at)) = self.screenshot_cli.clone() {
-            let busy = self.session.typeset.is_running() || self.session.typeset.live_due.is_some();
+            let busy = self.session.typeset.is_busy();
             if Instant::now() >= at && (!busy || self.started.elapsed() > Duration::from_secs(60)) {
                 if let Some(img) = &screenshot {
                     match save_png(img, &path) {
