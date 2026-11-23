@@ -157,3 +157,57 @@ fn invalid_explicit_launch_path_reports_an_error_without_opening_a_recent_projec
     assert!(session.docs.is_empty() && session.project_dir.is_none());
     assert!(session.status.is_some());
 }
+
+/// With the welcome window turned off, an ordinary launch reopens the most recent project that
+/// still exists (as other editors reopen the last workspace), never an empty window.
+#[test]
+fn without_the_welcome_window_the_last_project_reopens() {
+    let dir = std::env::temp_dir().join(format!("texcraft-reopen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.tex");
+    std::fs::write(
+        &file,
+        "\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n",
+    )
+    .unwrap();
+    let mut session = Session::empty(Arc::new(|| {}));
+    session.settings.live_typeset = false;
+    session.recent = vec![dir.join("gone.tex"), file.clone()];
+    reopen_last_project(&mut session);
+    assert_eq!(session.docs.len(), 1);
+    assert_eq!(
+        session.docs[0].path.as_deref(),
+        Some(file.canonicalize().unwrap().as_path())
+    );
+    // Nothing to reopen: nothing opens (the chooser shows instead).
+    let mut fresh = Session::empty(Arc::new(|| {}));
+    reopen_last_project(&mut fresh);
+    assert!(fresh.docs.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// When no window could start for a file (saved into another project, say), an empty window
+/// shows it itself; one with a project of its own leaves it (the user is told where it is).
+#[test]
+fn a_window_that_could_not_start_falls_back_to_an_empty_one() {
+    let dir = std::env::temp_dir().join(format!("texcraft-fallback-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    for p in ["a/main.tex", "b/main.tex"] {
+        std::fs::write(
+            dir.join(p),
+            "\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n",
+        )
+        .unwrap();
+    }
+    let mut empty = Session::empty(Arc::new(|| {}));
+    empty.settings.live_typeset = false;
+    assert!(open_in_empty_window(&mut empty, &dir.join("b/main.tex")));
+    assert_eq!(empty.docs.len(), 1);
+    let mut busy = Session::empty(Arc::new(|| {}));
+    busy.settings.live_typeset = false;
+    busy.open_path(&dir.join("a/main.tex")).unwrap();
+    assert!(!open_in_empty_window(&mut busy, &dir.join("b/main.tex")));
+    assert_eq!(busy.docs.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -164,7 +164,6 @@ impl Session {
             || self.typeset.queued
             || self.typeset.queued_live
             || self.typeset.live_due.is_some()
-            || self.typeset.bibliography_due.is_some()
             || self.typeset.quit != QuitTypeset::Idle
         {
             return;

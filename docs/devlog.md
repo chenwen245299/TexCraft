@@ -1,5 +1,153 @@
 # TexCraft devlog
 
+## Release notes prepared for 0.6.5 (2026-11-23)
+
+- Prepared local `texcraft-v0.6.5.md` from the changes since v0.6.4: AI chat storage and copy,
+  project windows and shared preferences, preview/quit fixes, UI polish and update coordination.
+- Verified local and remote tags end at v0.6.4. This preparation changes documentation only;
+  no code checks were rerun and no commit, tag or push was performed.
+
+## Remaining review findings fixed (2026-11-23)
+
+- Shared preferences: windows (processes) each wrote all of `app.ron` / `ai.json`, so the last
+  to save undid the others. Saves now merge three-way (`prefs::merge3`): this window's changes
+  since it last read the file win per field, the rest is the file's; windows poll every 0.7 s,
+  take other windows' preferences over and save their own soon after (as editors apply a
+  setting everywhere). Recents merge as lists; a window's layout stays its own.
+- The Assistant keeps its conversation (messages, draft, history entry, answer sources) when an
+  untitled document is saved into a folder or a rootless project gains its root.
+- Open Folder on the window's own folder whose main file is another root opens that project's
+  window; chapters reached through a symlinked folder stay tabs; a lone `.bib` borrows the last
+  root only from its own folder, and a closed window's root is forgotten when its job ends.
+- No window could start (cross-project Save As): an empty window opens the file, otherwise an
+  alert says where it is saved.
+- Quitting: a closed project's rebuild keeps this window's issues/log/status (failure still
+  named in the sheet). Quiet bibliography refresh: no "Typesetting…" in the PDF pane/results;
+  Abort Typesetting is off for it and a stop re-arms it.
+- Updates: the installer waits for every process running from the bundle (`pgrep` on its
+  escaped `Contents/MacOS` path; Windows: every `texcraft.exe`), a second one steps aside, and
+  only one window checks automatically (`windows/updates.lock`, taken over when it quits).
+- Welcome window off: a launch reopens the most recent existing project (else the chooser).
+  Removed the never-read workspace snapshot (`workspace.rs`, its tests, the saved field).
+- Tectonic gets `-Z search-path=<project>` in live and bibliography mirrors (it reads no
+  `TEXINPUTS`).
+- Tests for each (merge, layout, live take-over; carry on Save As and new root; own folder;
+  symlink; lone `.bib`; quit diagnostics; abort; installer waiting for another window and a
+  second installer; update lock; reopen; window fallback; Tectonic arguments). Gates: fmt;
+  engine 131+6, UI 70+7+3, desktop 16, typeset 21, update 5, macOS 3, i18n 7+6+1 pass;
+  all-target Clippy with warnings denied. Two dev windows sharing a home: line numbers off in
+  B reached A, wrap off in A reached B, B's hidden sidebar stayed B's; the saved file kept both.
+- Not verifiable here: Tectonic (not installed), a real bundle update with two windows open,
+  Windows. Read-only project folders still block quitting while open (the mandatory build).
+
+## One window per project (2026-11-23)
+
+- Every project window is its own process, and nothing stopped two of them showing one project
+  (Open Recent twice, a project another window had, a second launch), so two editors saved
+  over each other and two latexmk runs shared one build folder. Now a window holds an exclusive
+  `flock` on `windows/<project key hash>.lock` in the data folder while it shows the project
+  (released by the system when the process ends, crashes included). Opening a held project
+  from any window hands the path to the owner's inbox and activates it
+  (`NSRunningApplication activateWithOptions:`); the owner, woken by a watcher thread, opens it
+  and comes forward. A process started for a held project forwards its paths and exits before
+  it shows a window; a window just started for a project takes later requests for it too.
+- `texcraft_engine::project_key` (root file, else folder) is compared everywhere; a window
+  without a project (the welcome window) asks `Session::project_elsewhere` before opening one.
+- Tests: registry hold/forward/inbox in one process and against a lock held by another
+  process; engine keys from root, chapter and folder; an empty window routes a held project and
+  an owner keeps its own files. Gates: fmt; desktop 11, engine 124+6, macOS 3, UI 70+7+3 tests
+  pass; all-target Clippy with warnings denied. Two isolated dev instances sharing one home: a
+  second launch with A's chapter exited at once and A's window opened the chapter; window B
+  opening A spawned nothing and A came forward; after A was killed, B opening A started a new
+  window. Logout/shutdown handling left as is on purpose (build first, then quit).
+- Still open: windows of different projects share one preferences file (last writer wins).
+
+## Selectable Assistant text; sidebar scroll bars and log margin (2026-11-23)
+
+- Assistant messages were painted galleys: nothing could be selected. Questions, answer
+  paragraphs, code blocks and errors now go through egui's label selection
+  (`LabelSelectionState::label_text_selection`): a drag selects, also from one paragraph or
+  message into the next, and ⌘C (the Edit menu's Copy reaches egui as a Copy event) copies it.
+  Links in answers still open on a click (not on a drag).
+- Sidebar lists' overlay scroll bars covered the rows' text (issue messages ran under the
+  thumb). The sidebar body reserves the bar's strip while a list scrolls, in every tab.
+- The log's text touched the panel's edges: a custom TextEdit frame drops TextEdit's own
+  margin, so the frame now carries 10 pt sides (as the issue rows) and 6 pt above and below.
+- Tests: a drag from a question into an answer then Copy yields both texts; issue rows end
+  before the scroll bar (fails without the fix). Gates: fmt; UI 70+7+3 and i18n tests pass; UI
+  all-target Clippy with warnings denied. Isolated dev app (synthetic paper with 41 warnings,
+  synthetic conversation): issue messages elide before the thumb, the log has its margin, a
+  drag highlighted the question and both answer paragraphs.
+
+## Logic review of the recent commits; AI conversations in iCloud; copy on every message (2026-11-23)
+
+- Reviewed c3e6191, abe1d01, ef522bd and d1cac96 (three parallel read-only reviews, each
+  finding re-checked here). Fixed, each with a regression test that fails on the old code:
+  - Quitting during a quiet bibliography refresh let that refresh (of an outdated snapshot)
+    count as the exit build: it failed the quit. It is now stopped; so is one ⌘T meets.
+  - Only the exit's own typeset decides the exit (`quit_job`): a background full typeset
+    already running when the window closed no longer fails it. Don't Quit stops the exit's
+    typeset (a looping document kept it running for good).
+  - The exit rebuilt a root guessed per tab (`project_entry`): an included chapter in a
+    subfolder, or an unrelated `main.tex` beside a `.bib` tab. It now uses each tab's real
+    root (`Session::root_of`), whole documents only.
+  - A failed full typeset made its root due even if it was never edited (and so did an
+    untitled scratch file), so a project whose opening typeset failed blocked quitting even
+    after it was closed. Failure now restores only an earlier due state (`job_was_stale`).
+  - PDF publication stages per process (`.main.pdf.<pid>.part`) and syncs before the rename.
+  - Renaming the root file (or a rootless project folder) joined an empty rest and left a
+    trailing separator in the project root, recents and typeset roots; its conversations
+    moved where the Assistant never looked. `files::rebase` fixes every remap; a rename now
+    keeps the conversation shown, its draft and its answers' sources.
+  - Rename aliases rewrote conversations saved after the rename: a new file with the old name
+    sent its answers to the renamed file. Aliases carry a time and apply to older saves only.
+  - Closing every tab now clears Back/Forward (it reopened the closed project in a new window)
+    and the Assistant even in an untitled-only window; jumps another window took are not
+    recorded. A failed new-window spawn's message is translated.
+  - Editor: TextEdit's own caret-follow scroll is instant, so it can no longer drag the view
+    back over the caret after a Return in the next frame (explicit navigation still glides).
+  - Assistant: the reader's own new question and an opened conversation scroll to the bottom
+    even when they had scrolled up (streamed answers still respect their position).
+- AI data: conversations go to `iCloud Drive/TexCraft/AI Assistant/` when iCloud Drive is on
+  (moved there from the data folder at start), each in its own file; images are files in
+  `attachments/` named by SHA-256 (old inline base64 still reads); the list comes from the
+  files (another Mac's additions appear). Project folders are keyed by the path relative to
+  iCloud Drive or home, and message paths are stored that way, so another Mac with another
+  user name maps them back. Nothing is deleted at start any more (the sweep removed
+  conversations of moved projects or unmounted drives — and would have deleted other Macs'
+  over iCloud). API keys and `ai.json` stay local.
+- Copy under every message (questions right-aligned, failed answers too), "Copied" with a
+  tick for 1.5 s; `ai.copy` copies a failed answer's error.
+- Gates: fmt; engine 122+6, UI 68+7+3, desktop 9, i18n 7+6+1 tests pass; all-target Clippy
+  with warnings denied for engine/UI/desktop/i18n. Isolated dev app (fake home with an iCloud
+  folder, synthetic project and conversation): old chats moved to iCloud under the portable
+  key, the conversation and its image reopened, copy buttons in English and zh-Hans, a click
+  copied the question and showed 已复制.
+- Not fixed (reported): two windows can open the same project; all windows share one
+  preferences file (last writer wins); Dock/logout Quit answers NSTerminateCancel (it vetoes a
+  logout once); the updater ignores sibling windows; symlinked includes outside the project
+  open a new window; Open Folder on the window's own folder can add a second root; a project
+  identity change other than a rename (an untitled Save As, a file gaining `\documentclass`)
+  still starts the Assistant afresh; while quitting, a closed project's diagnostics replace the
+  window's.
+
+## Live preview no longer waits for the bibliography refresh (2026-11-23)
+
+- Regression from the bibliography refresh: while a refresh was due (800 ms after every new
+  citation key or `.bib` keystroke) live passes, queued passes and catch-ups were held back,
+  then cleared, and a running live pass was cancelled for the quiet full toolchain run. A
+  citation edit therefore reached the preview only after debounce + latexmk/BibTeX (~2 s on a
+  one-page test, several seconds on an acmart paper); a failed quiet run showed nothing until
+  the next keystroke, because it also claimed the live `last_attempt`.
+- Now the refresh is background work: it starts only when nothing runs and no live pass is due
+  or queued (after LIVE catch-up/settle passes). An edit during a quiet refresh of the same
+  project cancels it without trace (toolchain restores the good `.bbl`/PDF) and re-arms it for
+  the next pause; the live pass shows the edit right away. AUTO/MANUAL behaviour unchanged.
+- Isolated dev app on scratch documents: `\cite{new}` previewed in 91 ms with the refresh still
+  pending; typing during a refresh previewed in 57 ms, run count unchanged, refresh re-ran.
+  New engine test fails on the old code at the ordering assertion. Gates: fmt; engine 118 and
+  desktop 9 tests pass; engine all-target Clippy with warnings denied.
+
 ## Release notes prepared for 0.6.4 (2026-11-23)
 
 - Prepared local `texcraft-v0.6.4.md` covering editor/AI scrolling, bibliography refresh,

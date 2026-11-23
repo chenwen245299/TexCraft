@@ -137,7 +137,6 @@ fn history_and_answer_sources_follow_a_project_directory_rename() {
     session.ai_insert(1).unwrap();
     assert!(session.doc().unwrap().text.contains("Audited answer"));
     session.rename_file(&base.join("renamed"), "again").unwrap();
-    assert_eq!(session.ai.chats.as_ref().unwrap().sweep(), 0);
     session.ai_open_chat(&id).unwrap();
     assert_eq!(
         session.ai.messages[1].source.as_ref().unwrap().file,
@@ -163,7 +162,7 @@ fn renaming_into_a_previously_used_path_does_not_inherit_that_old_projects_histo
         )
         .unwrap();
     session.set_chat_store(base.join("chats"));
-    // set_chat_store sweeps removed projects; recreate a cached destination after the sweep.
+    // A cached destination from a previously removed project.
     store
         .save(
             Some(&base.join("renamed/main.tex")),
@@ -253,7 +252,6 @@ fn legacy_history_survives_repeated_project_directory_renames_and_cleanup() {
     session.set_chat_store(base.join("chats"));
     session.rename_file(&base.join("a"), "renamed").unwrap();
     session.rename_file(&base.join("renamed"), "again").unwrap();
-    assert_eq!(store.sweep(), 0);
     assert!(session.ai.history.iter().any(|chat| chat.id == "legacy"));
     session.ai_open_chat("legacy").unwrap();
     assert_eq!(
@@ -487,5 +485,220 @@ fn renaming_a_project_updates_its_directory_ai_root_paths_and_navigation_togethe
             .all(|path| path.starts_with(base.join("renamed")))
     );
     assert_eq!(session.history[0].0, base.join("renamed/chapter.tex"));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Regression: renaming the root file joined an empty rest onto the new name, so the project's
+/// root (and recents, stale roots, …) gained a trailing separator; its conversations moved to a
+/// folder the Assistant never looked in, and the next start deleted them. The conversation
+/// shown, its unsent draft and its answers' sources now carry on under the new name.
+#[test]
+fn renaming_the_root_file_keeps_the_conversation_and_its_history() {
+    let (mut session, base) = fixture("root-file-rename");
+    session.set_chat_store(base.join("chats"));
+    session.ai.messages = vec![
+        message(&session, texcraft_ai::Role::User, "Question about main"),
+        message(&session, texcraft_ai::Role::Assistant, "% Answer for main"),
+    ];
+    session.ai_save_chat();
+    let id = session.ai.chat_id.clone().unwrap();
+    session.ai.draft = "an unsent follow-up".into();
+    session
+        .rename_file(&base.join("a/main.tex"), "paper.tex")
+        .unwrap();
+    let paper = base.join("a/paper.tex");
+    assert_eq!(session.project_root.as_deref(), Some(paper.as_path()));
+    assert!(
+        session
+            .recent
+            .iter()
+            .all(|p| !p.to_string_lossy().ends_with('/'))
+    );
+    assert_eq!(session.ai.messages.len(), 2, "the conversation carries on");
+    assert_eq!(session.ai.draft, "an unsent follow-up");
+    assert_eq!(session.ai.chat_id.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        session.ai.messages[1]
+            .source
+            .as_ref()
+            .unwrap()
+            .root
+            .as_deref(),
+        Some(paper.as_path())
+    );
+    assert!(session.ai.history.iter().any(|chat| chat.id == id));
+    // The answer on screen still inserts into its (renamed) file.
+    session.ai_insert(1).unwrap();
+    assert!(session.doc().unwrap().text.contains("Answer for main"));
+    // Another window (or the next start) finds it, and nothing was deleted.
+    let mut other = Session::empty(Arc::new(|| {}));
+    other.settings.live_typeset = false;
+    other.update.enabled = false;
+    other.open_path(&paper).unwrap();
+    other.set_chat_store(base.join("chats"));
+    assert!(other.ai.history.iter().any(|chat| chat.id == id));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Regression: a rename's alias also rewrote conversations saved after it, so a question
+/// about a new file with the renamed file's old name came back pointing at the renamed file,
+/// and its answer could be inserted there.
+#[test]
+fn renames_do_not_rewrite_conversations_saved_after_them() {
+    let (mut session, base) = fixture("alias-after-rename");
+    session.set_chat_store(base.join("chats"));
+    let chapter = base.join("a/chapter.tex");
+    session.open_path(&chapter).unwrap();
+    // An earlier conversation: the project's history folder records the rename.
+    session.ai.messages = vec![message(&session, texcraft_ai::Role::User, "Earlier")];
+    session.ai_save_chat();
+    session.run("ai.clear", &Value::Null).unwrap();
+    session.rename_file(&chapter, "intro.tex").unwrap();
+    // A new file takes the old name, and the Assistant is asked about it.
+    std::fs::write(&chapter, "% !TEX root = main.tex\nNew chapter.\n").unwrap();
+    session.open_path(&chapter).unwrap();
+    session.ai.messages = vec![
+        message(&session, texcraft_ai::Role::User, "About the new chapter"),
+        message(
+            &session,
+            texcraft_ai::Role::Assistant,
+            "% NEW_CHAPTER_ANSWER",
+        ),
+    ];
+    session.ai_save_chat();
+    let id = session.ai.chat_id.clone().unwrap();
+    session.ai_open_chat(&id).unwrap();
+    assert_eq!(
+        session.ai.messages[1]
+            .source
+            .as_ref()
+            .unwrap()
+            .file
+            .as_deref(),
+        Some(chapter.as_path())
+    );
+    // With intro.tex active, the answer is refused rather than inserted into the wrong file.
+    session.open_path(&base.join("a/intro.tex")).unwrap();
+    assert!(session.ai_insert(1).is_err());
+    assert!(!session.doc().unwrap().text.contains("NEW_CHAPTER_ANSWER"));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Regression: Back after closing every tab reopened the closed project, in a window of its
+/// own; a jump that another window took was recorded in this one's history.
+#[test]
+fn closing_every_tab_forgets_the_jump_history() {
+    let (mut session, base) = fixture("history-close");
+    session.jump(&base.join("a/chapter.tex"), 1).unwrap();
+    assert!(!session.history.is_empty());
+    while !session.docs.is_empty() {
+        session.close(0);
+    }
+    assert!(session.history.is_empty());
+    session.ai.draft = "draft in an emptied window".into();
+    session.run("file.new", &Value::Null).ok();
+    // A jump into another project opens a window there and is not this window's to go back to.
+    let before = session.history.len();
+    session.effects.clear();
+    session.jump(&base.join("b/main.tex"), 1).unwrap();
+    if session
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::OpenProjectWindow(_)))
+    {
+        assert!(session.history.len() <= before + 1);
+        assert!(
+            session
+                .history
+                .iter()
+                .all(|(p, _)| !p.starts_with(base.join("b")))
+        );
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// An untitled document's conversation goes with it when it is saved into a folder (the same
+/// work, now a project), answers inserting into the saved file; so does a project's when it
+/// gains its root (a saved file now starts with `\documentclass`).
+#[test]
+fn saving_into_a_project_keeps_the_conversation() {
+    let base = std::env::temp_dir().join(format!(
+        "texcraft-context-audit-carry-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("paper")).unwrap();
+    let base = base.canonicalize().unwrap();
+    let mut session = Session::empty(Arc::new(|| {}));
+    session.settings.live_typeset = false;
+    session.update.enabled = false;
+    session.set_chat_store(base.join("chats"));
+    session.run("file.new", &Value::Null).unwrap();
+    session
+        .run(
+            "edit.setText",
+            &json!({"text": "\\documentclass{article}\nDraft.\n"}),
+        )
+        .unwrap();
+    session.ai_follow_project();
+    session.ai.messages = vec![
+        message(
+            &session,
+            texcraft_ai::Role::User,
+            "Question about the draft",
+        ),
+        message(&session, texcraft_ai::Role::Assistant, "% DRAFT_ANSWER"),
+    ];
+    session.ai_save_chat();
+    let id = session.ai.chat_id.clone().unwrap();
+    session.ai.draft = "a follow-up".into();
+    let saved = base.join("paper/main.tex");
+    session.save_as(session.active, saved.clone()).unwrap();
+    assert_eq!(session.ai.messages.len(), 2, "the conversation carries on");
+    assert_eq!(session.ai.draft, "a follow-up");
+    assert_eq!(session.ai.chat_id.as_deref(), Some(id.as_str()));
+    assert!(
+        session.ai.history.iter().any(|chat| chat.id == id),
+        "in the project's history"
+    );
+    assert_eq!(
+        session.ai.messages[1]
+            .source
+            .as_ref()
+            .unwrap()
+            .file
+            .as_deref(),
+        Some(saved.as_path())
+    );
+    session.ai_insert(1).unwrap();
+    assert!(session.doc().unwrap().text.contains("DRAFT_ANSWER"));
+
+    // A rootless project (notes only) whose file becomes a whole document.
+    let notes = base.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("notes.tex"), "Some notes.\n").unwrap();
+    let mut rootless = Session::empty(Arc::new(|| {}));
+    rootless.settings.live_typeset = false;
+    rootless.update.enabled = false;
+    rootless.set_chat_store(base.join("chats"));
+    rootless.open_path(&notes.join("notes.tex")).unwrap();
+    assert!(rootless.project_root.is_none());
+    rootless.ai.messages = vec![message(
+        &rootless,
+        texcraft_ai::Role::User,
+        "Notes question",
+    )];
+    rootless.ai_save_chat();
+    let notes_id = rootless.ai.chat_id.clone().unwrap();
+    rootless
+        .run(
+            "edit.setText",
+            &json!({"text": "\\documentclass{article}\nSome notes.\n"}),
+        )
+        .unwrap();
+    rootless.save(rootless.active).unwrap();
+    assert!(rootless.project_root.is_some());
+    assert_eq!(rootless.ai.messages.len(), 1);
+    assert!(rootless.ai.history.iter().any(|chat| chat.id == notes_id));
     std::fs::remove_dir_all(base).unwrap();
 }

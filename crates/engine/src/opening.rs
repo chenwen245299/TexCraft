@@ -26,6 +26,27 @@ pub(crate) fn project_main(dir: &Path) -> Option<PathBuf> {
         .cloned()
 }
 
+/// What every window compares to show each project in one window only: the root file `path`
+/// opens as, else (a file or folder without a root document) its folder. `None` if `path`
+/// does not exist.
+pub fn project_key(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let read = |p: &Path| std::fs::read_to_string(p).ok();
+    let entry = if path.is_dir() {
+        match project_main(&path) {
+            Some(main) => texcraft_project::project_entry(&main, &read),
+            None => return Some(path),
+        }
+    } else {
+        texcraft_project::project_entry(&path, &read)
+    };
+    if read(&entry).is_some_and(|text| texcraft_syntax::is_root_document(&text)) {
+        Some(std::fs::canonicalize(&entry).unwrap_or(entry))
+    } else {
+        entry.parent().map(Path::to_path_buf)
+    }
+}
+
 pub(crate) fn recent_entry(path: &Path, read: &dyn Fn(&Path) -> Option<String>) -> PathBuf {
     if path.is_dir() {
         project_main(path).unwrap_or_else(|| path.to_path_buf())
@@ -51,6 +72,26 @@ impl OpenResult {
 }
 
 impl Session {
+    /// The [`project_key`] of the project this window shows (`None`: none, or only untitled
+    /// documents).
+    pub fn window_key(&self) -> Option<PathBuf> {
+        self.project_root
+            .clone()
+            .or_else(|| self.project_dir.clone())
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+    }
+
+    /// A window without a project of its own still leaves `path` to the window that already
+    /// shows its project (the platform answers [`Session::project_elsewhere`]).
+    pub(crate) fn shown_elsewhere(&self, path: &Path) -> bool {
+        self.project_root.is_none()
+            && self.project_dir.is_none()
+            && self
+                .project_elsewhere
+                .as_ref()
+                .is_some_and(|elsewhere| project_key(path).is_some_and(|key| elsewhere(&key)))
+    }
+
     pub(crate) fn needs_project_window(&self, path: &Path) -> bool {
         let directory = self
             .project_dir
@@ -64,7 +105,15 @@ impl Session {
             return false;
         }
         if path.is_dir() {
-            return directory.as_deref() != Some(path);
+            if directory.as_deref() != Some(path) {
+                return true;
+            }
+            // This window's own folder, whose main project can be another root in it (the
+            // window shows `alternate.tex`, the folder opens `main.tex`): that one's window.
+            return self.project_root.as_ref().is_some_and(|own| {
+                let own = std::fs::canonicalize(own).unwrap_or_else(|_| own.clone());
+                project_key(path).is_some_and(|key| key != own)
+            });
         }
         if self.docs.iter().any(|d| d.path.as_deref() == Some(path)) {
             return false;
@@ -84,8 +133,11 @@ impl Session {
         // remain tabs of their owning project, including subfiles with a document class.
         if let Some(root) = &root {
             let project = index::build(root, &read);
-            if project.files.iter().any(|f| f.path == path)
-                || project.assets.iter().any(|f| f.path == path)
+            // `path` is canonical; the index's paths are as written (a symlinked folder of
+            // shared macros leads elsewhere).
+            let is_path = |p: &Path| p == path || std::fs::canonicalize(p).is_ok_and(|c| c == path);
+            if project.files.iter().any(|f| is_path(&f.path))
+                || project.assets.iter().any(|f| is_path(&f.path))
             {
                 return false;
             }
@@ -133,6 +185,143 @@ mod tests {
             std::fs::write(dir.join(format!("{name}_only.txt")), name).unwrap();
         }
         base.canonicalize().unwrap()
+    }
+
+    /// A window and a request to open its project agree on what the project is: its root file
+    /// from the root, a chapter, the folder or the PDF beside it; a folder without one is
+    /// itself the project.
+    #[test]
+    fn every_way_into_a_project_has_the_windows_key() {
+        let base = projects("keys");
+        let main = base.join("a/main.tex");
+        for path in [
+            main.clone(),
+            base.join("a/sections/chapter.tex"),
+            base.join("a"),
+        ] {
+            assert_eq!(
+                project_key(&path).as_deref(),
+                Some(main.as_path()),
+                "{path:?}"
+            );
+        }
+        let mut window = session();
+        window
+            .open_path(&base.join("a/sections/chapter.tex"))
+            .unwrap();
+        assert_eq!(window.window_key().as_deref(), Some(main.as_path()));
+        let loose = base.join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(loose.join("notes.txt"), "notes").unwrap();
+        assert_eq!(project_key(&loose).as_deref(), Some(loose.as_path()));
+        assert_eq!(project_key(&base.join("missing")), None);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A window without a project (the welcome window) leaves a project another window shows
+    /// to that window instead of opening it a second time; one with a project of its own keeps
+    /// its own files.
+    #[test]
+    fn a_project_shown_in_another_window_is_not_opened_again() {
+        let base = projects("elsewhere");
+        let a = base.join("a/main.tex");
+        let shown = a.clone();
+        let mut empty = session();
+        empty.project_elsewhere = Some(Arc::new(move |key: &Path| key == shown));
+        let result = empty
+            .open_path(&base.join("a/sections/chapter.tex"))
+            .unwrap();
+        assert_eq!(result, OpenResult::NewWindow);
+        assert!(empty.docs.is_empty() && empty.project_root.is_none());
+        assert_eq!(
+            empty.effects.back(),
+            Some(&Effect::OpenProjectWindow(
+                base.join("a/sections/chapter.tex")
+            ))
+        );
+        // Another project still opens here.
+        assert!(empty.open_path(&base.join("b/main.tex")).unwrap().is_here());
+        // The window that shows a project opens its files itself.
+        let mut owner = session();
+        owner.open_path(&a).unwrap();
+        let mine = a.clone();
+        owner.project_elsewhere = Some(Arc::new(move |key: &Path| key == mine));
+        assert!(
+            owner
+                .open_path(&base.join("a/sections/chapter.tex"))
+                .unwrap()
+                .is_here()
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Open Folder on this window's own folder, whose main project is another root than the
+    /// one this window shows, opens that project in its own window (not as a second root here).
+    #[test]
+    fn the_windows_own_folder_with_another_main_root_opens_elsewhere() {
+        let base = projects("own-folder");
+        let a = base.join("a");
+        std::fs::write(
+            a.join("alternate.tex"),
+            "\\documentclass{article}\n\\begin{document}\nAlt.\n\\end{document}\n",
+        )
+        .unwrap();
+        let mut window = session();
+        window.open_path(&a.join("alternate.tex")).unwrap();
+        assert_eq!(window.open_path(&a).unwrap(), OpenResult::NewWindow);
+        assert_eq!(window.docs.len(), 1);
+        assert_eq!(
+            window.effects.back(),
+            Some(&Effect::OpenProjectWindow(a.clone()))
+        );
+        // The window that shows the folder's main project opens it as before.
+        let mut main = session();
+        main.open_path(&a.join("main.tex")).unwrap();
+        assert!(main.open_path(&a).unwrap().is_here());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A chapter reached through a symlinked folder that points outside the project is still
+    /// one of its tabs (its real path differs from the path the document names).
+    #[test]
+    fn a_chapter_through_a_symlink_stays_a_tab_of_its_project() {
+        let base = projects("symlink");
+        let shared = base.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("macros.tex"), "\\newcommand{\\x}{x}\n").unwrap();
+        std::os::unix::fs::symlink(&shared, base.join("a/shared")).unwrap();
+        std::fs::write(
+            base.join("a/main.tex"),
+            "\\documentclass{article}\n\\input{shared/macros}\n\\begin{document}\n\\end{document}\n",
+        )
+        .unwrap();
+        let mut window = session();
+        window.open_path(&base.join("a/main.tex")).unwrap();
+        let result = window.open_path(&base.join("a/shared/macros.tex")).unwrap();
+        assert!(result.is_here(), "{:?}", window.effects);
+        assert_eq!(window.docs.len(), 2);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A `.bib` with no root of its own uses the last root typeset only if it is that root's;
+    /// once the window is empty, that root is forgotten.
+    #[test]
+    fn a_lone_bib_never_borrows_another_projects_root() {
+        let base = projects("bib-root");
+        let other = base.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("refs.bib"), "@book{a, title={A}}\n").unwrap();
+        let mut window = session();
+        window.typeset.root = Some(base.join("a/main.tex"));
+        window.open_path(&other.join("refs.bib")).unwrap();
+        assert_eq!(window.root_path(), None);
+        std::fs::write(base.join("a/refs.bib"), "@book{b, title={B}}\n").unwrap();
+        let mut own = session();
+        own.typeset.root = Some(base.join("a/main.tex"));
+        own.open_path(&base.join("a/refs.bib")).unwrap();
+        own.project_root = None;
+        assert_eq!(own.root_path(), Some(base.join("a/main.tex")));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

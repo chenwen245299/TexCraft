@@ -23,6 +23,7 @@ pub(super) const ENTRIES: super::Entries = &[
         "{path} 不是 TexCraft 可以编辑的文本文件",
     ),
     ("cannot open {path}: {e}", "无法打开 {path}：{e}"),
+    ("cannot open a new window: {e}", "无法打开新窗口：{e}"),
     ("no such document", "没有这个文稿"),
     ("cannot save {path}: {e}", "无法存储 {path}：{e}"),
     ("Cannot write {name}: {e}", "无法写入 {name}：{e}"),

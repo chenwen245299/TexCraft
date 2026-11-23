@@ -16,6 +16,11 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Bring All to Front", "前置全部窗口"),
     // File panels and alerts
     ("Cannot open", "无法打开"),
+    ("Cannot open a new window", "无法打开新窗口"),
+    (
+        "{path} is saved, but TexCraft could not open a window for it ({e}). Open it from File → Open Recent.",
+        "{path} 已保存，但 TexCraft 无法为它打开窗口（{e}）。可从“文件 → 打开最近使用”打开它。",
+    ),
     ("TeX documents", "TeX 文稿"),
     ("All files", "所有文件"),
     ("TeX document", "TeX 文稿"),

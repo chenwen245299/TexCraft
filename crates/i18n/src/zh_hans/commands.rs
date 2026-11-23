@@ -49,7 +49,7 @@ pub(super) const ENTRIES: super::Entries = &[
     ("Attach Image…", "附加图像…"),
     ("Remove Image", "移除图像"),
     ("New Conversation", "新对话"),
-    ("Copy Answer", "拷贝回答"),
+    ("Copy Message", "拷贝消息"),
     ("Choose Model", "选择模型"),
     ("Include the Open Document", "附带打开的文稿"),
     ("AI Suggestions While Typing", "键入时显示 AI 建议"),

@@ -529,13 +529,22 @@ fn run(
     } else {
         req.work_dir()
     };
-    let (prog, args) = match command_line(req, tc) {
+    let (prog, mut args) = match command_line(req, tc) {
         Ok(c) => c,
         Err(e) => {
             outcome.error = Some(e);
             return outcome;
         }
     };
+    // From the mirror folder Tectonic (which reads no TEXINPUTS) finds the project's files
+    // through its search path; the root file name stays last.
+    if let Some(buffers) = buffers
+        && req.engine == Engine::Tectonic
+    {
+        let root = args.pop();
+        args.extend(live::tectonic_search(&buffers.project_dir));
+        args.extend(root);
+    }
     let out_dir = req.out_dir();
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         outcome.error = Some(trf!(

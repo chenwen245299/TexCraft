@@ -2,11 +2,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a window just started may take to claim its project; until then requests for that
+/// project wait for it (in its inbox) instead of starting another window.
+const STARTING: Duration = Duration::from_secs(15);
 
 pub struct ProjectWindow {
     child: Child,
     pub path: Option<PathBuf>,
     pub template: Option<String>,
+    /// The project it was started for (`texcraft_engine::project_key`).
+    pub key: Option<PathBuf>,
+    started: Instant,
 }
 
 pub fn command(executable: &Path, path: &Path, token_file: Option<&Path>) -> Command {
@@ -28,8 +36,10 @@ impl ProjectWindow {
         let child = command(&std::env::current_exe()?, &path, token_file).spawn()?;
         Ok(Self {
             child,
+            key: texcraft_engine::project_key(&path),
             path: Some(path),
             template: None,
+            started: Instant::now(),
         })
     }
 
@@ -46,11 +56,18 @@ impl ProjectWindow {
             child,
             path: None,
             template: Some(template),
+            key: None,
+            started: Instant::now(),
         })
     }
 
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Started moments ago and still running: it may not hold its project yet.
+    pub fn starting(&mut self) -> bool {
+        self.started.elapsed() < STARTING && self.is_running()
     }
 
     pub fn is_running(&mut self) -> bool {

@@ -36,6 +36,10 @@ pub struct AiPanelState {
     context_dismissed: bool,
     /// Where the popover was drawn last frame.
     context_pop: Option<Rect>,
+    /// The conversation shown and how many questions it had last frame: another conversation,
+    /// or a question of the reader's own, brings the view to the bottom even when they had
+    /// scrolled up (answers arriving do not).
+    seen: Option<(Option<String>, usize)>,
 }
 
 /// The app icon (assets/icon/texcraft.svg) over the Assistant's empty states.
@@ -258,6 +262,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
     // than running under it.
     let sc = &mut c.spacing_mut().scroll;
     sc.floating_allocated_width = sc.bar_width + sc.bar_outer_margin;
+    let seen = (
+        session.ai.chat_id.clone(),
+        session
+            .ai
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count(),
+    );
+    let to_bottom = st.seen.as_ref().is_some_and(|before| *before != seen);
+    st.seen = Some(seen);
     egui::ScrollArea::vertical()
         .id_salt("ai-scroll")
         .auto_shrink([false, false])
@@ -276,12 +291,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut AiPanelStat
                 };
                 ui.add_space(10.0);
                 if m.role == Role::User {
-                    user_bubble(ui, t, &m.text, &m.images);
+                    user_bubble(ui, t, session, i, &m.text, &m.images);
                 } else {
                     answer(ui, t, session, i, &m);
                 }
             }
             ui.add_space(12.0);
+            if to_bottom {
+                // At the bottom, `stick_to_bottom` follows the answer from there.
+                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+            }
         });
 
     if let Some(e) = shown_error {
@@ -562,7 +581,14 @@ fn empty_conversation(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut A
     }
 }
 
-fn user_bubble(ui: &mut Ui, t: &Tokens, text: &str, images: &[texcraft_ai::Image]) {
+fn user_bubble(
+    ui: &mut Ui,
+    t: &Tokens,
+    session: &mut Session,
+    index: usize,
+    text: &str,
+    images: &[texcraft_ai::Image],
+) {
     let w = ui.available_width();
     // Its images over the bubble, right-aligned, wrapping.
     if !images.is_empty() {
@@ -593,7 +619,23 @@ fn user_bubble(ui: &mut Ui, t: &Tokens, text: &str, images: &[texcraft_ai::Image
     let bubble = Rect::from_min_size(pos2(row.right() - 10.0 - size.x, row.top()), size);
     ui.painter()
         .rect_filled(bubble, 10.0, t.accent.gamma_multiply(0.14));
-    ui.painter().galley(bubble.min + vec2(10.0, 7.0), g, t.text);
+    selectable_text(
+        ui,
+        Id::new(("ai-text", index)),
+        bubble.min + vec2(10.0, 7.0),
+        g,
+        t.text,
+    );
+    // Copy under the question, at the bubble's right edge (as under every answer).
+    let (r, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
+    let cw = copy_chip_width(ui);
+    let b = Rect::from_min_size(
+        pos2(bubble.right() + 4.0 - cw, r.top() + 1.0),
+        vec2(cw, 20.0),
+    );
+    if copy_chip(ui, t, b, Id::new(("ai-copy-msg", index))) {
+        let _ = session.run("ai.copy", &serde_json::json!({ "index": index }));
+    }
 }
 
 /// A piece of an answer.
@@ -891,6 +933,70 @@ fn inline(
     (ui.fonts_mut(|f| f.layout_job(job)), links)
 }
 
+/// Paints `g` at `at` as text the reader can select by dragging (also from one paragraph or
+/// message into the next) and copy with ⌘C. `id` must stay the same from frame to frame.
+fn selectable_text(
+    ui: &mut Ui,
+    id: Id,
+    at: egui::Pos2,
+    g: Arc<egui::Galley>,
+    color: Color32,
+) -> egui::Response {
+    let mut sense = Sense::click_and_drag();
+    sense -= Sense::FOCUSABLE;
+    let resp = ui.interact(Rect::from_min_size(at, g.size()), id, sense);
+    egui::text_selection::LabelSelectionState::label_text_selection(
+        ui,
+        &resp,
+        at,
+        g,
+        color,
+        Stroke::NONE,
+    );
+    resp
+}
+
+/// How long a copy button says "Copied" after a click (seconds).
+const COPIED_FOR: f64 = 1.5;
+
+/// Width of a message's copy button: room for the longer of its two labels.
+fn copy_chip_width(ui: &Ui) -> f32 {
+    let f = FontId::proportional(10.5);
+    let text_w = [tr("Copy"), tr("Copied")]
+        .into_iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.to_string(), f.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    (18.0 + text_w + 8.0).max(50.0)
+}
+
+/// A message's copy button: "Copy", and "Copied" with a tick for a moment after a click.
+fn copy_chip(ui: &mut Ui, t: &Tokens, r: Rect, id: Id) -> bool {
+    let now = ui.input(|i| i.time);
+    let copied_at = ui.ctx().data(|d| d.get_temp::<f64>(id));
+    let recent = copied_at.is_some_and(|at| now - at < COPIED_FOR);
+    let clicked = if recent {
+        chip(ui, t, r, id, tr("Copied"), icons::check_thin)
+    } else {
+        chip(ui, t, r, id, tr("Copy"), icons::copy)
+    };
+    if clicked {
+        ui.ctx().data_mut(|d| d.insert_temp(id, now));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(COPIED_FOR));
+    } else if let Some(at) = copied_at.filter(|_| recent) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(
+                (COPIED_FOR - (now - at)).max(0.0),
+            ));
+    }
+    clicked
+}
+
 /// A small icon-and-label button; returns whether it was clicked.
 fn chip(
     ui: &mut Ui,
@@ -1040,14 +1146,11 @@ fn answer(
                     FontId::proportional(12.0)
                 };
                 let (g, links) = inline(ui, t, &text, font, text_w, &is_file);
-                let sense = if links.is_empty() {
-                    Sense::hover()
-                } else {
-                    Sense::click()
-                };
-                let (r, resp) = ui.allocate_exact_size(vec2(w, g.size().y + 6.0), sense);
+                let (r, _) = ui.allocate_exact_size(vec2(w, g.size().y + 6.0), Sense::hover());
                 let at = pos2(r.left() + x, r.top() + 3.0);
-                // The link under the pointer: a hand, and a click opens it.
+                let resp =
+                    selectable_text(ui, Id::new(("ai-text", index, k)), at, g.clone(), t.text);
+                // The link under the pointer: a hand, and a click (not a drag) opens it.
                 let under = resp.hover_pos().and_then(|p| {
                     let i = g.cursor_from_pos(p - at).index.0;
                     links
@@ -1067,7 +1170,6 @@ fn answer(
                         );
                     }
                 }
-                ui.painter().galley(at, g, t.text);
             }
             Segment::Code { lang, body } => {
                 // Code keeps its lines: long ones scroll sideways inside the block.
@@ -1136,7 +1238,7 @@ fn answer(
                     .show(&mut c, |ui| {
                         let (r, _) =
                             ui.allocate_exact_size(g.size() + vec2(0.0, bar_room), Sense::hover());
-                        ui.painter().galley(r.min, g, t.text);
+                        selectable_text(ui, Id::new(("ai-code-text", index, k)), r.min, g, t.text);
                     });
             }
         }
@@ -1175,21 +1277,29 @@ fn answer(
         );
         ui.painter()
             .rect_filled(card, 6.0, t.error.gamma_multiply(0.10));
-        ui.painter().galley(card.min + vec2(8.0, 6.0), g, t.error);
+        selectable_text(
+            ui,
+            Id::new(("ai-error-text", index)),
+            card.min + vec2(8.0, 6.0),
+            g,
+            t.error,
+        );
+        // A failed answer can be copied too (its text so far, else the error).
+        let (r, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
+        let b = Rect::from_min_size(
+            pos2(r.left() + x - 4.0, r.top() + 1.0),
+            vec2(copy_chip_width(ui), 20.0),
+        );
+        if copy_chip(ui, t, b, Id::new(("ai-copy-msg", index))) {
+            let _ = session.run("ai.copy", &serde_json::json!({ "index": index }));
+        }
         return;
     }
     // Actions under a finished answer.
     let (r, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
     let cx = r.left() + x - 4.0;
-    let b = Rect::from_min_size(pos2(cx, r.top() + 1.0), vec2(50.0, 20.0));
-    if chip(
-        ui,
-        t,
-        b,
-        Id::new(("ai-copy-msg", index)),
-        tr("Copy"),
-        icons::copy,
-    ) {
+    let b = Rect::from_min_size(pos2(cx, r.top() + 1.0), vec2(copy_chip_width(ui), 20.0));
+    if copy_chip(ui, t, b, Id::new(("ai-copy-msg", index))) {
         let _ = session.run("ai.copy", &serde_json::json!({ "index": index }));
     }
     if let Some(model) = &m.model {
@@ -2291,6 +2401,95 @@ mod usage_row_tests {
 mod scroll_tests {
     use super::*;
 
+    /// Message text is selectable: a drag from a question into an answer selects across both,
+    /// and Copy (⌘C reaches egui as a Copy event) puts that text on the clipboard.
+    #[test]
+    fn dragging_selects_message_text_for_copying() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut session = Session::new(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        let preset = texcraft_ai::PRESETS
+            .iter()
+            .find(|p| p.id == "ollama")
+            .unwrap();
+        let i = session.ai.config.add(preset);
+        session.ai.config.providers[i].models = vec!["m".into()];
+        session.ai.config.normalize();
+        let message = |role, text: &str| texcraft_engine::ai::ChatMessage {
+            source: None,
+            role,
+            text: text.into(),
+            blocks: Vec::new(),
+            model: Some("m".into()),
+            provider: None,
+            pending: false,
+            thinking: false,
+            error: None,
+            note: None,
+            images: Vec::new(),
+            tools: Vec::new(),
+        };
+        session.ai.messages = vec![
+            message(Role::User, "Why does my heading run in?"),
+            message(
+                Role::Assistant,
+                "It is a display heading.\n\nUse \\paragraph for a run-in one.",
+            ),
+        ];
+        let mut st = AiPanelState::default();
+        let mut time = 0.0;
+        let mut frame = |session: &mut Session, st: &mut AiPanelState, events| {
+            time += 1.0 / 60.0;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(420.0, 480.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show(ui, &Tokens::light(), session, st),
+            );
+            out.textures_delta.clear();
+            out.platform_output
+        };
+        for _ in 0..3 {
+            frame(&mut session, &mut st, Vec::new());
+        }
+        let question = ctx.read_response(Id::new(("ai-text", 0))).unwrap().rect;
+        let second = ctx.read_response(Id::new(("ai-text", 1, 1))).unwrap().rect;
+        let from = question.left_top() + vec2(1.0, question.height() / 2.0);
+        let to = second.right_bottom() - vec2(1.0, second.height() / 2.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(
+            &mut session,
+            &mut st,
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        );
+        for step in 1..=5 {
+            let pos = from + (to - from) * (step as f32 / 5.0);
+            frame(&mut session, &mut st, vec![egui::Event::PointerMoved(pos)]);
+        }
+        frame(&mut session, &mut st, vec![button(to, false)]);
+        let out = frame(&mut session, &mut st, vec![egui::Event::Copy]);
+        let copied: String = out
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(copied.contains("Why does my heading"), "{copied:?}");
+        assert!(copied.contains("It is a display heading."), "{copied:?}");
+        assert!(copied.contains("for a run-in one"), "{copied:?}");
+    }
+
     /// Streaming follows the bottom until the reader scrolls away, keeps their place through
     /// chunks/new messages/completion, and follows again when they return to the bottom.
     #[test]
@@ -2439,6 +2638,39 @@ mod scroll_tests {
             assert!(
                 resumed > bottom,
                 "{lang:?}: returning to bottom resumes following"
+            );
+            // Scrolled up, the reader's own new question is brought into view…
+            for _ in 0..20 {
+                frame(&mut session, &mut st, wheel(60.0));
+            }
+            let mut up = 0.0;
+            for _ in 0..60 {
+                up = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(up < resumed - 300.0);
+            let mut question = session.ai.messages[0].clone();
+            question.text = "A new question".into();
+            session.ai.messages.push(question);
+            let mut shown = up;
+            for _ in 0..60 {
+                shown = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(shown > resumed, "{lang:?}: own question scrolled into view");
+            // …and so is the end of another conversation opened from the history.
+            for _ in 0..20 {
+                frame(&mut session, &mut st, wheel(60.0));
+            }
+            for _ in 0..60 {
+                up = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(up < shown - 300.0);
+            session.ai.chat_id = Some("another".into());
+            for _ in 0..60 {
+                shown = frame(&mut session, &mut st, Vec::new());
+            }
+            assert!(
+                shown > up + 300.0,
+                "{lang:?}: opened conversation shows its end"
             );
         }
     }

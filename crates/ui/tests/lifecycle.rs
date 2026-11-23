@@ -173,7 +173,10 @@ fn save_and_discard_during_quit_keep_saved_tabs_for_relaunch() {
         assert_eq!(rig.session.doc().unwrap().text, expected);
         assert!(!rig.session.doc().unwrap().is_dirty());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
-        assert_eq!(rig.session.workspace().documents.len(), 1);
+        assert_eq!(
+            rig.session.docs.iter().filter(|d| d.path.is_some()).count(),
+            1
+        );
         assert!(rig.bench.requests.contains(&Request::Quit));
         std::fs::remove_file(file).unwrap();
     }
@@ -204,7 +207,10 @@ fn untitled_save_as_waits_for_success_and_cancel_does_not_quit() {
     rig.session.save_as(0, file.clone()).unwrap();
     rig.frame(Vec::new());
     assert_eq!(rig.bench.dialog, Dialog::None);
-    assert_eq!(rig.session.workspace().documents.len(), 1);
+    assert_eq!(
+        rig.session.docs.iter().filter(|d| d.path.is_some()).count(),
+        1
+    );
     assert!(rig.bench.requests.contains(&Request::Quit));
     std::fs::remove_file(file).unwrap();
 }

@@ -83,10 +83,30 @@ impl Session {
     }
 
     /// Remembers that the PDF beside `root` is not current (since `at`, unless known earlier).
+    /// An untitled document's scratch file has no PDF beside it that anyone sees.
     pub(crate) fn mark_stale(&mut self, root: &Path, at: Instant) {
         let root = texcraft_project::normalize(root);
+        if self.docs.iter().any(|d| {
+            d.path.is_none()
+                && d.scratch
+                    .as_deref()
+                    .is_some_and(|s| texcraft_project::normalize(s) == root)
+        }) {
+            return;
+        }
         if !self.typeset.stale.iter().any(|(r, _)| *r == root) {
             self.typeset.stale.push((root, at));
+        }
+    }
+
+    /// The full typeset that just finished did not replace the PDF beside its root: if that
+    /// root was due (edited since), it still is. A root that was not (a project that failed to
+    /// typeset when it opened) does not become due: closing it must not hold up quitting.
+    pub(crate) fn still_stale(&mut self) {
+        if self.typeset.job_was_stale
+            && let Some(root) = self.typeset.root.clone()
+        {
+            self.mark_stale(&root, Instant::now());
         }
     }
 
@@ -122,7 +142,7 @@ impl Session {
                 .stale
                 .iter()
                 .map(|(r, _)| r.clone())
-                .filter(|r| r.is_file())
+                .filter(|r| self.exit_buildable(r))
                 .collect();
             if !pending.is_empty() {
                 self.typeset.quit = QuitTypeset::Running(pending);
@@ -180,24 +200,26 @@ impl Session {
             QuitTypeset::Failed { .. } => return true,
             QuitTypeset::Idle => {}
         }
+        let buildable = |root: &Path| self.exit_buildable(root);
         let mut roots: Vec<PathBuf> = self
             .typeset
             .stale
             .iter()
             .map(|(r, _)| r.clone())
-            .filter(|r| r.is_file())
+            .filter(|r| buildable(r))
             .collect();
+        // Each open file through the root it is typeset with (the window's project root for
+        // its chapters, wherever they are), never a guess per file that could pick a chapter or
+        // another project in the same folder.
         for doc in &self.docs {
-            let Some(path) = &doc.path else { continue };
-            let root = texcraft_project::project_entry(path, &|p| self.text_of(p));
-            if !root
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("tex") || e.eq_ignore_ascii_case("ltx"))
-            {
+            if doc.path.is_none() {
                 continue;
             }
+            let Some(root) = self.root_of(doc) else {
+                continue;
+            };
             let root = texcraft_project::normalize(&root);
-            if !roots.contains(&root) {
+            if buildable(&root) && !roots.contains(&root) {
                 roots.push(root);
             }
         }
@@ -214,13 +236,27 @@ impl Session {
             job.cancel();
             self.typeset.live_dropped = true;
         }
+        // So does a quiet bibliography refresh of the buffers: the forced rebuild of the saved
+        // files follows, and the refresh failing meanwhile must not count as that rebuild.
+        self.drop_bibliography_job(false);
         self.typeset.quit = QuitTypeset::Running(roots);
         true
     }
 
+    /// Whether quitting rebuilds `root`: a saved whole document. A file that is not one (a
+    /// chapter whose root is unknown) has no PDF of its own.
+    fn exit_buildable(&self, root: &Path) -> bool {
+        root.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tex") || e.eq_ignore_ascii_case("ltx"))
+            && root.is_file()
+            && self
+                .text_of(root)
+                .is_some_and(|text| texcraft_syntax::is_root_document(&text))
+    }
+
     /// Keep the window open when either the full rebuild or publishing failed.
     pub(crate) fn fail_quit(&mut self, root: PathBuf, message: String) {
-        self.mark_stale(&root, Instant::now());
+        // Whether the root is still due was settled with the typeset's outcome.
         self.set_status(message.clone());
         self.typeset.quit = QuitTypeset::Failed { root, message };
         self.typeset.queued = false;
@@ -236,11 +272,16 @@ impl Session {
         }
     }
 
-    /// Does not quit after all. A full typeset that is running finishes; the projects not yet
-    /// typeset stay due.
+    /// Does not quit after all. The full typeset the exit started stops (it may never end:
+    /// a document that loops); a root edited since its PDF was published stays due.
     pub fn cancel_quit(&mut self) {
         if self.typeset.is_quitting() {
             self.typeset.quit = QuitTypeset::Idle;
+            if self.typeset.quit_job
+                && let Some(job) = &self.typeset.job
+            {
+                job.cancel();
+            }
         }
     }
 }

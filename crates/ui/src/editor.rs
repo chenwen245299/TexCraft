@@ -1738,12 +1738,18 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
     } else {
         egui::ScrollArea::both()
     };
+    // Explicit line navigation glides; following the caret does not.
+    let navigation = ui.style().scroll_animation;
     scroll
         .id_salt(("editor-scroll", doc_path.clone()))
         .auto_shrink([false, false])
         // Follow session edits immediately; explicit line navigation keeps its animation.
         .animated(!pushed || reveal.is_some())
         .show(ui, |ui| {
+            // TextEdit keeps its caret in view as text wraps or the caret moves: at once, like
+            // other editors. Animated, that scroll was still under way when a Return the
+            // session handles scrolled further, and dragged the view back over the new caret.
+            ui.style_mut().scroll_animation = egui::style::ScrollAnimation::none();
             let band_idx = ui.painter().add(egui::Shape::Noop);
             // Where inverse search landed, under the text and the selection.
             let flash_idx = ui.painter().add(egui::Shape::Noop);
@@ -2085,7 +2091,11 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                         .galley
                         .pos_from_cursor(CCursor::new(ci))
                         .translate(gpos.to_vec2());
-                    ui.scroll_to_rect(r.expand2(vec2(0.0, 40.0)), Some(Align::Center));
+                    ui.scroll_to_rect_animation(
+                        r.expand2(vec2(0.0, 40.0)),
+                        Some(Align::Center),
+                        navigation,
+                    );
                 } else if pushed && let Some(caret) = caret_row_y {
                     ui.scroll_to_rect(caret, None);
                 }
@@ -2670,6 +2680,85 @@ mod tests {
                 );
                 assert_eq!(session.doc().unwrap().selection.cursor, end + n * 3);
             }
+        }
+    }
+
+    /// Regression: typing that wrapped onto a new row at the bottom edge started TextEdit's
+    /// scroll animation; a Return in the next frame jumped further, and the animation then
+    /// dragged the view back to its own target, leaving the new caret below the edge.
+    #[test]
+    fn return_right_after_a_wrapping_keystroke_keeps_the_caret_visible() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut session = Session::new(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.view.wrap_lines = true;
+        session.view.spellcheck = false;
+        session.view.auto_complete = false;
+        let text = "Some text that wraps in a narrow editor. ".repeat(10);
+        session
+            .run("edit.setText", &serde_json::json!({"text": text}))
+            .unwrap();
+        let end = text.chars().count();
+        session
+            .run(
+                "edit.select",
+                &serde_json::json!({"anchor": end, "cursor": end}),
+            )
+            .unwrap();
+        let mut st = EditorState {
+            focus: true,
+            push_selection: Some(0),
+            reveal: Some((0, 1)),
+            ..Default::default()
+        };
+        let mut time = 0.0;
+        let mut frame = |session: &mut Session, st: &mut EditorState, events| {
+            time += 1.0 / 60.0;
+            let mut clip = Rect::NOTHING;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(420.0, 240.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    clip = ui.clip_rect();
+                    text_area(ui, &Tokens::light(), session, st, 0);
+                },
+            );
+            out.textures_delta.clear();
+            (st.caret_rect.unwrap(), clip)
+        };
+        for _ in 0..30 {
+            frame(&mut session, &mut st, Vec::new());
+        }
+        let enter = || egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for n in 1..=8 {
+            frame(
+                &mut session,
+                &mut st,
+                vec![egui::Event::Text(
+                    "and a few more words that wrap onto another row".into(),
+                )],
+            );
+            frame(&mut session, &mut st, vec![enter()]);
+            let mut last = None;
+            for _ in 0..30 {
+                last = Some(frame(&mut session, &mut st, Vec::new()));
+            }
+            let (caret, clip) = last.unwrap();
+            assert!(
+                caret.top() >= clip.top() && caret.bottom() <= clip.bottom(),
+                "round {n}: caret {caret:?} outside {clip:?}"
+            );
         }
     }
 

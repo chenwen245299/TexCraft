@@ -1,7 +1,7 @@
 //! The AI Assistant (the sidebar's sparkles tab): a conversation with a model from the
 //! providers configured in Settings → AI, optionally about the open document.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,6 +14,11 @@ use crate::ai_tools::{self, ToolUse};
 use crate::ai_usage::{ChatUsage, ContextUsage, PromptSample, RunUsage};
 use crate::chats::{self, ChatStore, ChatSummary};
 use crate::{CommandError, Effect, Session, edit};
+
+/// When `path` last changed.
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
 
 /// One message of the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,6 +84,11 @@ pub struct AiState {
     pub config: Config,
     /// Where the configuration is kept (`None`: not saved, as in tests).
     pub config_path: Option<PathBuf>,
+    /// The configuration as this window last read or wrote it: what it changed since then is
+    /// its own ([`crate::prefs::merge3`]); the rest follows the file (other windows).
+    pub config_base: Option<serde_json::Value>,
+    /// When the file was last read or written here.
+    pub config_seen: Option<std::time::SystemTime>,
     /// The encrypted API keys (next to the configuration).
     pub keys: Option<KeyStore>,
     /// The conversation.
@@ -104,10 +114,21 @@ pub struct AiState {
     chat_project: Option<PathBuf>,
     /// The folder last seen (`None`: not looked yet), to notice another project opening.
     chat_seen: Option<(Option<PathBuf>, Option<PathBuf>)>,
+    /// The next change of project is the same work under a new name (a document saved into a
+    /// folder, a project that gained its root): the conversation goes along.
+    carry: Option<Carry>,
     /// What the conversation used (its answers' requests), saved with it.
     pub usage: ChatUsage,
     /// The last context measured, and what it depended on (see `Session::ai_context`).
     pub(crate) context_cache: Option<(u64, Option<ContextUsage>)>,
+}
+
+/// What a carried conversation's sources pointed at before the change (see `AiState::carry`).
+struct Carry {
+    project: Option<PathBuf>,
+    root: Option<PathBuf>,
+    /// The saved document's old file (an untitled one's scratch file) and its new one.
+    file: Option<(PathBuf, PathBuf)>,
 }
 
 /// An answer in rounds: the model calls tools, gets their answers and goes on.
@@ -377,7 +398,43 @@ impl Session {
             keys.mark(&mut self.ai.config);
             self.ai.keys = Some(keys);
         }
+        self.ai.config_base = serde_json::to_value(&self.ai.config).ok();
+        self.ai.config_seen = modified(&path);
         self.ai.config_path = Some(path);
+    }
+
+    /// The AI configuration as the file holds it now, merged with this window's own changes
+    /// (`None`: the file cannot be read; this window's then stands).
+    fn ai_config_merged(&self) -> Option<(Config, serde_json::Value)> {
+        let path = self.ai.config_path.as_ref()?;
+        let disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let ours = serde_json::to_value(&self.ai.config).ok()?;
+        let base = self.ai.config_base.as_ref().unwrap_or(&ours);
+        let merged = crate::prefs::merge3(base, &ours, &disk);
+        let mut config: Config = serde_json::from_value(merged).ok()?;
+        config.normalize();
+        if let Some(keys) = &self.ai.keys {
+            keys.mark(&mut config);
+        }
+        Some((config, disk))
+    }
+
+    /// Another window changed the AI configuration: take its changes over (this window's own
+    /// unsaved changes stay). Cheap when nothing changed (one file date).
+    pub fn ai_follow_config_file(&mut self) {
+        let Some(path) = self.ai.config_path.clone() else {
+            return;
+        };
+        let seen = modified(&path);
+        if seen.is_none() || seen == self.ai.config_seen {
+            return;
+        }
+        if let Some((config, disk)) = self.ai_config_merged() {
+            self.ai.config = config;
+            self.ai.config_base = Some(disk);
+            self.ai.config_seen = seen;
+        }
     }
 
     /// Stores the API key of provider `id` (encrypted; it cannot be read back from the app).
@@ -426,14 +483,20 @@ impl Session {
     /// Saves the AI configuration (after edits in Settings).
     pub fn save_ai_config(&mut self) -> Result<(), CommandError> {
         self.ai.config.normalize();
-        match &self.ai.config_path {
-            Some(p) => self
-                .ai
-                .config
-                .save(p)
-                .map_err(|e| CommandError::Failed(e.0)),
-            None => Ok(()),
+        // Other windows' changes since this one last read the file stay.
+        if let Some((config, _)) = self.ai_config_merged() {
+            self.ai.config = config;
         }
+        let Some(p) = self.ai.config_path.clone() else {
+            return Ok(());
+        };
+        self.ai
+            .config
+            .save(&p)
+            .map_err(|e| CommandError::Failed(e.0))?;
+        self.ai.config_base = serde_json::to_value(&self.ai.config).ok();
+        self.ai.config_seen = modified(&p);
+        Ok(())
     }
 
     /// The system prompt with the open document (and the selection) when that is enabled.
@@ -742,11 +805,14 @@ impl Session {
         Ok((provider, model, api_key))
     }
 
-    /// Keeps conversations in `root` (TexCraft's data folder's `chats`, never the project), and
-    /// removes those of projects that no longer exist.
+    /// Keeps conversations in `root` (never the project).
     pub fn set_chat_store(&mut self, root: PathBuf) {
-        let store = ChatStore::new(root);
-        store.sweep();
+        self.set_chats(ChatStore::new(root));
+    }
+
+    /// Keeps conversations in `store` (the app's: [`ChatStore::locate`]). Those of projects
+    /// missing here stay: the project may be on another Mac or a drive not connected now.
+    pub fn set_chats(&mut self, store: ChatStore) {
         self.ai.chats = Some(store);
         self.ai.chat_seen = None;
         self.ai_follow_project();
@@ -756,6 +822,7 @@ impl Session {
     /// and the Assistant starts afresh with that project's history. An old answer is stopped
     /// before it can run tools against the new directory.
     pub(crate) fn ai_follow_project(&mut self) {
+        let carry = self.ai.carry.take();
         let seen = (self.git_dir(), self.project_root.clone());
         if self.ai.chat_seen.as_ref() == Some(&seen) {
             return;
@@ -771,19 +838,98 @@ impl Session {
             return;
         }
         if !first {
-            self.ai_stop();
-            self.ai_action_dismiss();
-            self.inline_after_caret_move();
-            self.ai.messages.clear();
-            self.ai.usage = ChatUsage::default();
-            self.ai.chat_id = None;
-            self.ai.draft.clear();
-            self.ai.draft_images.clear();
-            self.ai.notice = None;
-            self.ai.context_cache = None;
+            match carry {
+                Some(carry) => self.ai_carry_conversation(&carry, project.as_deref()),
+                None => self.ai_start_afresh(),
+            }
         }
         self.ai.chat_project = project;
         self.ai_refresh_history();
+    }
+
+    /// The project's identity is about to change, but the work is the same: an untitled
+    /// document saved into a folder (`file`: its scratch file and new path), or a project that
+    /// just gained its root. The conversation shown, its draft and its history entry go along,
+    /// as an editor keeps a document's chat when the document is saved.
+    pub(crate) fn ai_carry_next(&mut self, file: Option<(PathBuf, PathBuf)>) {
+        let source = self.ai_source();
+        self.ai.carry = Some(Carry {
+            project: source.project,
+            root: source.root,
+            file,
+        });
+    }
+
+    /// Moves the conversation shown to project `to`: its answers' sources follow the change,
+    /// and its saved file moves to that project's history.
+    fn ai_carry_conversation(&mut self, carry: &Carry, to: Option<&Path>) {
+        let now = self.ai_source();
+        for m in &mut self.ai.messages {
+            let Some(source) = &mut m.source else {
+                continue;
+            };
+            if source.project == carry.project {
+                source.project.clone_from(&now.project);
+            }
+            if source.root == carry.root {
+                source.root.clone_from(&now.root);
+            }
+            if let Some((from, into)) = &carry.file
+                && source.file.as_deref() == Some(from.as_path())
+            {
+                source.file = Some(into.clone());
+            }
+        }
+        let from = self.ai.chat_project.clone();
+        if let (Some(store), Some(id)) = (&self.ai.chats, &self.ai.chat_id)
+            && from.as_deref() != to
+            && store
+                .save(to, id, &self.ai.messages, &self.ai.usage)
+                .is_ok()
+        {
+            let _ = store.delete(from.as_deref(), id);
+        }
+    }
+
+    /// Empties the Assistant: no conversation, draft or attachments (the conversation shown is
+    /// already saved).
+    pub(crate) fn ai_start_afresh(&mut self) {
+        self.ai_stop();
+        self.ai_action_dismiss();
+        self.inline_after_caret_move();
+        self.ai.messages.clear();
+        self.ai.usage = ChatUsage::default();
+        self.ai.chat_id = None;
+        self.ai.draft.clear();
+        self.ai.draft_images.clear();
+        self.ai.notice = None;
+        self.ai.context_cache = None;
+    }
+
+    /// `from` was renamed to `to`. The answers shown follow their files, and when the
+    /// conversation's project is what moved, it carries on (with its draft) under the new name
+    /// instead of starting afresh: it is the same project.
+    pub(crate) fn ai_follow_rename(&mut self, from: &Path, to: &Path) {
+        for m in &mut self.ai.messages {
+            if let Some(source) = &mut m.source {
+                for path in [&mut source.project, &mut source.file, &mut source.root]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(moved) = crate::files::rebase(path, from, to) {
+                        *path = moved;
+                    }
+                }
+            }
+        }
+        if let Some(moved) = self
+            .ai
+            .chat_project
+            .as_deref()
+            .and_then(|project| crate::files::rebase(project, from, to))
+        {
+            self.ai.chat_project = Some(moved);
+        }
     }
 
     pub(crate) fn ai_refresh_history(&mut self) {

@@ -735,6 +735,7 @@ pub fn live_command(
             if req.shell_escape {
                 args.extend(["-Z".to_string(), "shell-escape".to_string()]);
             }
+            args.extend(tectonic_search(&req.project_dir));
             args.push(root);
             return Ok((prog, args));
         }
@@ -764,6 +765,15 @@ pub fn live_command(
         _ => args.push(root),
     }
     Ok((prog, args))
+}
+
+/// Tectonic reads no `TEXINPUTS`: run in a mirror folder of the open buffers, it finds the
+/// project's other files (chapters not open, figures, `.bib`) through its own search path.
+pub fn tectonic_search(project_dir: &Path) -> [String; 2] {
+    [
+        "-Z".to_string(),
+        format!("search-path={}", project_dir.display()),
+    ]
 }
 
 /// `TEXINPUTS`-style search path: the live folder first, then the project, then the defaults.
@@ -1070,6 +1080,22 @@ mod tests {
             cache_preamble: true,
             pretex: None,
         }
+    }
+
+    /// Tectonic in the mirror folder still finds the project's other files.
+    #[test]
+    fn tectonic_live_passes_search_the_project() {
+        let dir = Path::new("/proj");
+        let tc = crate::Toolchain {
+            tectonic: Some("/bin/tectonic".into()),
+            ..crate::Toolchain::default()
+        };
+        let mut request = req(dir);
+        request.engine = Engine::Tectonic;
+        let (_, args) = live_command(&request, &tc, None, false).unwrap();
+        let at = args.iter().position(|a| a == "search-path=/proj").unwrap();
+        assert_eq!(args.get(at - 1).map(String::as_str), Some("-Z"));
+        assert_eq!(args.last().map(String::as_str), Some("main.tex"));
     }
 
     #[test]

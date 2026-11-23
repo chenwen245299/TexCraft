@@ -287,6 +287,20 @@ pub fn preferred_languages() -> Vec<String> {
     }
 }
 
+/// Brings the app process `pid` (another TexCraft project window) to the front. An app may
+/// activate another only while it is active itself: call it in answer to the user.
+pub fn activate_process(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        imp::activate_process(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Moves `path` (a file or folder) to the Trash, where Finder can put it back.
 pub fn trash(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -409,6 +423,25 @@ mod imp {
             win.performClose(None);
         }
         true
+    }
+
+    pub fn activate_process(pid: u32) -> bool {
+        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: Class method looking up a running application by process id; it returns nil
+        // (None) for a process that has gone or is not an application.
+        let Some(app) =
+            (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
+        else {
+            return false;
+        };
+        // SAFETY: A live NSRunningApplication from the lookup above; activating another app is
+        // allowed from the active app, and otherwise only returns NO.
+        unsafe {
+            app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
+        }
     }
 
     pub fn system_dark() -> Option<bool> {

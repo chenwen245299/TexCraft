@@ -845,7 +845,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
 fn empty_state(ui: &mut Ui, t: &Tokens, session: &Session, view: &PdfView, body: Rect) {
     let p = ui.painter();
     let c = body.center();
-    if session.typeset.is_running() {
+    if session.typeset.shows_progress() {
         let angle = ui.input(|i| i.time) as f32 * 5.0;
         icons::spinner(
             p,

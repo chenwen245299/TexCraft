@@ -185,6 +185,10 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarStat
     );
     child.set_clip_rect(body);
     child.spacing_mut().item_spacing = vec2(0.0, 0.0);
+    // Every list's overlay scroll bar gets a strip of its own while the list scrolls, so it never
+    // covers the rows' text (issue messages, outline titles, file names, search results).
+    let scroll = &mut child.spacing_mut().scroll;
+    scroll.floating_allocated_width = scroll.bar_width + scroll.bar_outer_margin;
     let filter = st
         .filter
         .get(tab_key(tab))
@@ -1433,7 +1437,9 @@ fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
                 ui.add(
                     egui::TextEdit::multiline(&mut log)
                         .font(egui::FontId::monospace(10.5))
-                        .frame(egui::Frame::NONE)
+                        // A custom frame replaces TextEdit's own margin: give the text the
+                        // panel's 10 pt sides (as the issue rows) and some air above and below.
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 6)))
                         .desired_width(f32::INFINITY)
                         .interactive(true),
                 );
@@ -1441,7 +1447,7 @@ fn results(ui: &mut Ui, t: &Tokens, session: &mut Session) {
         return;
     }
     let (e, w, b) = session.issue_counts();
-    if session.typeset.is_running() && session.typeset.last.is_none() {
+    if session.typeset.shows_progress() && session.typeset.last.is_none() {
         ui.vertical_centered(|ui| {
             ui.label(egui::RichText::new(tr("Typesetting…")).color(t.text_weak))
         });
@@ -2211,5 +2217,52 @@ fn tag_search(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut SidebarSt
         });
     if let Some((p, l)) = jump {
         jump_and_sync(session, &p, l);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The issues list's scroll bar has a strip of its own: no row runs under it.
+    #[test]
+    fn the_scroll_bar_does_not_cover_the_issue_rows() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::install_style(&ctx);
+        let mut session = Session::new(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.view.sidebar = true;
+        session.view.sidebar_tab = SidebarTab::Results;
+        session.view.results_mode = ResultsMode::Issues;
+        session.typeset.issues = (0..60)
+            .map(|n| texcraft_log::Issue {
+                severity: Severity::Warning,
+                file: Some("sigconf.tex".into()),
+                line: Some(n),
+                message: "Package natbib: Citation 'Example' on page 1 undefined".into(),
+                detail: String::new(),
+                log_line: n,
+            })
+            .collect();
+        let mut st = SidebarState::default();
+        let area = Rect::from_min_size(egui::Pos2::ZERO, vec2(260.0, 400.0));
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(area),
+                    ..Default::default()
+                },
+                |ui| show(ui, &Tokens::light(), &mut session, &mut st, area),
+            );
+            out.textures_delta.clear();
+        }
+        let row = ctx.read_response(Id::new(("issue", 0))).unwrap().rect;
+        let bar = ctx.global_style().spacing.scroll.bar_width;
+        assert!(
+            row.right() <= area.right() - bar,
+            "row {row:?} runs under the scroll bar of {area:?}"
+        );
     }
 }

@@ -1524,6 +1524,11 @@ fn bibliography_refresh_coalesces_edits_and_preserves_followup_work_in_every_mod
         s.open_path(&bib).unwrap();
         s.run(&format!("typeset.mode.{mode}"), &Value::Null)
             .unwrap();
+        // Only the refresh itself here: how the preview goes first is
+        // `live_preview_does_not_wait_for_a_bibliography_refresh`.
+        if s.settings.live_typeset {
+            s.run("typeset.pauseLive", &Value::Null).unwrap();
+        }
         s.toolchain = Toolchain::default();
         s.run(
             "edit.setText",
@@ -1577,12 +1582,12 @@ fn bibliography_refresh_coalesces_edits_and_preserves_followup_work_in_every_mod
                 .iter()
                 .any(|effect| matches!(effect, Effect::Alert { .. }))
         );
-        // The unanimated Typeset button still requests a foreground run, rather than
-        // unexpectedly cancelling the invisible bibliography work.
+        // ⌘T does not wait behind the invisible bibliography work: the refresh stops without
+        // trace and the full typeset follows at once.
         s.run("typeset.refreshBibliography", &Value::Null).unwrap();
         s.tick_bibliography(Instant::now() + Duration::from_secs(2));
         s.run("typeset.run", &Value::Null).unwrap();
-        assert!(s.typeset.queued && s.typeset.bibliography_job);
+        assert!(s.typeset.queued && s.typeset.bibliography_job && s.typeset.live_dropped);
         settle(&mut s);
         assert!(!s.typeset.background && !s.typeset.bibliography_job);
         // Delayed work cannot enter another project after this one is closed.
@@ -1591,6 +1596,132 @@ fn bibliography_refresh_coalesces_edits_and_preserves_followup_work_in_every_mod
         s.tick_bibliography(Instant::now() + Duration::from_secs(2));
         assert!(s.typeset.bibliography_due.is_none() && !s.typeset.is_running());
     }
+}
+
+/// Regression: a citation edit armed the bibliography refresh, and while it waited (and ran)
+/// every live pass was held back, so the preview showed no edit for seconds.
+#[test]
+fn live_preview_does_not_wait_for_a_bibliography_refresh() {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping live/bibliography ordering: no pdfLaTeX toolchain");
+        return;
+    }
+    let dir = temp_dir("bibliography-live-first");
+    let main = dir.join("main.tex");
+    let source = "\\documentclass{article}\n\\begin{document}\nSee \\cite{old}.\n\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n";
+    std::fs::write(&main, source).unwrap();
+    std::fs::write(
+        dir.join("refs.bib"),
+        "@book{old, title={Old Reference}, author={Example Author}, year={2020}}\n@book{new, title={New Reference}, author={Another Author}, year={2026}}\n",
+    )
+    .unwrap();
+    s.open_path(&main).unwrap();
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    s.settings.live_delay_ms = 0;
+    s.refresh_index(true);
+
+    // A newly cited key: the refresh is armed, but the live pass starts at once.
+    let generation = s.pdf.generation;
+    let cited = source.replace("\\cite{old}", "\\cite{old,new}");
+    s.run("edit.setText", &json!({"text": cited})).unwrap();
+    s.refresh_index(true);
+    let (_, due) = s.typeset.bibliography_due.clone().unwrap();
+    s.tick(Instant::now());
+    assert!(
+        s.typeset.is_running() && s.typeset.live_job,
+        "the live pass must not wait for the bibliography refresh"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while s.typeset.is_running() && s.typeset.live_job && Instant::now() < deadline {
+        s.tick(Instant::now().min(due));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        s.pdf.generation > generation,
+        "the edit reached the preview"
+    );
+    assert!(s.typeset.last.as_ref().unwrap().live);
+
+    // With the preview current, the refresh runs at the pause.
+    s.tick(due);
+    assert!(s.typeset.is_full_running() && s.typeset.bibliography_job);
+    // An edit meanwhile stops it (no trace) and is previewed right after; the refresh is
+    // re-armed for the next pause.
+    let runs = s.typeset.runs;
+    let last_success = s.typeset.last.as_ref().map(|o| o.success);
+    s.run(
+        "edit.setText",
+        &json!({"text": cited.replace("See", "Now see")}),
+    )
+    .unwrap();
+    assert!(s.typeset.live_dropped && s.typeset.queued_live);
+    assert!(s.typeset.bibliography_due.is_some());
+    while !(s.typeset.is_running() && s.typeset.live_job) && Instant::now() < deadline {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(s.typeset.live_job && s.typeset.is_running());
+    assert_eq!(s.typeset.runs, runs, "the stopped refresh leaves no trace");
+    assert_eq!(s.typeset.last.as_ref().map(|o| o.success), last_success);
+
+    // Left alone, the re-armed refresh completes and the bibliography lists the new key.
+    while s.typeset.is_busy() && Instant::now() < deadline {
+        s.tick(Instant::now() + Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!s.typeset.is_busy());
+    let last = s.typeset.last.as_ref().unwrap();
+    assert!(last.success && !last.live, "{}", last.console);
+    let bbl = std::fs::read_to_string(texcraft_project::build_dir(&main).join("main.bbl")).unwrap();
+    assert!(bbl.contains("New Reference"), "{bbl}");
+    assert_eq!(std::fs::read_to_string(&main).unwrap(), source);
+}
+
+/// Regression: quitting while a quiet bibliography refresh of an outdated snapshot ran let that
+/// refresh count as the exit rebuild; when it failed, the quit failed although the saved files
+/// were fine and their forced rebuild never ran.
+#[test]
+fn quitting_stops_a_bibliography_refresh_instead_of_failing_on_it() {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping quit during bibliography refresh: no pdfLaTeX toolchain");
+        return;
+    }
+    let dir = temp_dir("bibliography-quit");
+    let main = dir.join("main.tex");
+    let bib = dir.join("refs.bib");
+    let good = "@book{old, title={Old Reference}, author={Example Author}, year={2020}}\n";
+    std::fs::write(&main, "\\documentclass{article}\n\\begin{document}\nSee \\cite{old}.\n\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n").unwrap();
+    std::fs::write(&bib, good).unwrap();
+    s.open_path(&main).unwrap();
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    s.run("typeset.mode.manual", &Value::Null).unwrap();
+    s.open_path(&bib).unwrap();
+    // A half-typed entry starts a refresh that will fail…
+    s.run(
+        "edit.setText",
+        &json!({"text": "@book{old, title={Unfinished"}),
+    )
+    .unwrap();
+    s.tick(Instant::now() + Duration::from_secs(2));
+    assert!(s.typeset.is_full_running() && s.typeset.bibliography_job);
+    // …but the entry is finished and saved, and the window closed, before it does.
+    s.run("edit.setText", &json!({ "text": good })).unwrap();
+    s.save(s.active).unwrap();
+    s.effects.clear();
+    assert!(s.quit_requested());
+    assert!(s.typeset.live_dropped, "the outdated refresh is stopped");
+    settle_quit(&mut s);
+    assert_eq!(s.typeset.quit, QuitTypeset::Done);
+    assert!(s.effects.contains(&Effect::Quit));
+    let last = s.typeset.last.as_ref().unwrap();
+    assert!(last.success && !last.live, "{}", last.console);
 }
 
 #[test]
@@ -1873,7 +2004,7 @@ fn publishing_a_pdf_does_not_inherit_finders_hidden_attributes() {
     let pdf = texcraft_project::output_pdf(&root);
     std::fs::create_dir_all(pdf.parent().unwrap()).unwrap();
     let published = texcraft_project::published_pdf(&root);
-    let part = published.with_file_name(".main.pdf.part");
+    let part = published.with_file_name(format!(".main.pdf.{}.part", std::process::id()));
     // Both the cached TeX output and an old published/staging file may already be hidden.
     // Finder supports both the BSD flag and the legacy invisible bit in FinderInfo.
     for path in [&pdf, &published, &part] {
@@ -2306,4 +2437,229 @@ fn a_live_pass_that_cannot_start_is_not_retried_every_frame() {
     assert!(s.live_behind());
     assert_eq!(s.typeset.catch_ups, 0);
     assert!(s.status.is_some(), "the failure was reported");
+}
+
+/// Regression: quitting chose what to rebuild by guessing a root for every tab, so an
+/// included chapter in a subfolder was typeset on its own (and failed), and a `.bib` tab could
+/// pull in an unrelated project in the same folder. The window's own root decides.
+#[test]
+fn quitting_rebuilds_the_windows_root_not_a_guess_per_tab() {
+    let mut s = session();
+    let dir = temp_dir("quit-roots").canonicalize().unwrap();
+    let thesis = dir.join("thesis.tex");
+    std::fs::create_dir_all(dir.join("parts/a")).unwrap();
+    std::fs::write(&thesis, "\\documentclass{article}\n\\begin{document}\n\\input{parts/a/intro}\n\\bibliography{refs}\n\\end{document}\n").unwrap();
+    std::fs::write(dir.join("parts/a/intro.tex"), "Intro.\n").unwrap();
+    std::fs::write(dir.join("refs.bib"), "@book{a, title={A}}\n").unwrap();
+    // An unrelated project in the same folder (it opens in a window of its own).
+    std::fs::write(
+        dir.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\nOther.\n\\end{document}\n",
+    )
+    .unwrap();
+    s.open_path(&thesis).unwrap();
+    s.open_path(&dir.join("parts/a/intro.tex")).unwrap();
+    s.open_path(&dir.join("refs.bib")).unwrap();
+    s.toolchain = Toolchain::default();
+    assert!(s.quit_requested());
+    assert_eq!(s.typeset.quit, QuitTypeset::Running(vec![thesis]));
+}
+
+/// Regression: a full typeset that failed made its root due even if it was never edited, and
+/// that never went away: a project whose opening typeset failed (or an untitled document's
+/// scratch file) had to be rebuilt to quit, even after it was closed.
+#[test]
+fn a_failed_typeset_of_an_unedited_project_does_not_hold_up_quitting_after_it_closes() {
+    let mut s = session();
+    let main = temp_dir("quit-unedited").join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\n\\undefinedcommand\n\\end{document}\n",
+    )
+    .unwrap();
+    s.open_path(&main).unwrap();
+    // No TeX here: the typeset fails at once.
+    s.toolchain = Toolchain::default();
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(!s.typeset.last.as_ref().unwrap().success);
+    assert!(s.typeset.stale.is_empty(), "never edited: nothing due");
+    while !s.docs.is_empty() {
+        s.close(0);
+    }
+    assert!(!s.quit_requested(), "nothing to rebuild once it is closed");
+
+    // An untitled document typeset (and failing) leaves nothing due either.
+    s.run("file.new", &Value::Null).unwrap();
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n\\begin{document}\n\\bad\n\\end{document}\n"}),
+    )
+    .unwrap();
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(s.typeset.stale.is_empty());
+
+    // An edited project that fails stays due, as before.
+    let mut s = session();
+    s.toolchain = Toolchain::default();
+    s.open_path(&main).unwrap();
+    s.run("edit.setText", &json!({"text": "\\documentclass{article}\n\\begin{document}\nEdited \\bad\n\\end{document}\n"})).unwrap();
+    assert!(!s.typeset.stale.is_empty());
+    s.typeset().unwrap();
+    settle(&mut s);
+    assert!(
+        s.typeset
+            .stale
+            .iter()
+            .any(|(r, _)| *r == main.canonicalize().unwrap()),
+        "edited and still not published: {:?}",
+        s.typeset.stale
+    );
+}
+
+/// Regression: a background full typeset already running when the window was closed (it read
+/// files saved before the prompt) decided the exit: if it failed, so did quitting.
+#[test]
+fn only_the_exits_own_typeset_decides_it() {
+    let mut s = session();
+    let main = temp_dir("quit-own-job").join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\nSaved.\n\\end{document}\n",
+    )
+    .unwrap();
+    s.open_path(&main).unwrap();
+    let root = texcraft_project::normalize(&main);
+    s.typeset.root = Some(root.clone());
+    s.typeset.background = true;
+    s.typeset.quit_job = false;
+    s.typeset.quit = QuitTypeset::Running(vec![root.clone()]);
+    s.finish_typeset(Outcome {
+        success: false,
+        ..Outcome::default()
+    });
+    assert_eq!(s.typeset.quit, QuitTypeset::Running(vec![root.clone()]));
+    // The exit's own typeset failing does keep the window open.
+    s.typeset.quit_job = true;
+    s.finish_typeset(Outcome {
+        success: false,
+        ..Outcome::default()
+    });
+    assert!(matches!(s.typeset.quit, QuitTypeset::Failed { .. }));
+}
+
+/// Regression: Don't Quit left the exit's typeset running; a document that loops kept it (and
+/// every live pass behind it) going for good.
+#[test]
+fn dont_quit_stops_the_exits_typeset() {
+    let mut s = session();
+    if !s.toolchain.supports(Engine::PdfLatex) {
+        eprintln!("skipping Don't Quit: no pdfLaTeX toolchain");
+        return;
+    }
+    let main = temp_dir("quit-loop").join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\n\\def\\a{\\a}\\a\n\\end{document}\n",
+    )
+    .unwrap();
+    s.open_path(&main).unwrap();
+    assert!(s.quit_requested());
+    s.tick(Instant::now());
+    assert!(s.typeset.is_full_running() && s.typeset.quit_job);
+    std::thread::sleep(Duration::from_millis(300));
+    s.cancel_quit();
+    settle(&mut s);
+    assert!(!s.typeset.is_running(), "the looping typeset was stopped");
+    assert_eq!(s.typeset.quit, QuitTypeset::Idle);
+    assert!(!s.effects.contains(&Effect::Quit));
+}
+
+/// Regression: while quitting, the rebuild of a project closed earlier replaced this window's
+/// issues, log and status with that project's. They stay; its failure names it in the sheet.
+#[test]
+fn a_closed_projects_exit_rebuild_leaves_this_windows_diagnostics_alone() {
+    let mut s = session();
+    let main = temp_dir("quit-closed").join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\nSaved.\n\\end{document}\n",
+    )
+    .unwrap();
+    let closed = temp_dir("quit-closed-other").join("other.tex");
+    std::fs::write(
+        &closed,
+        "\\documentclass{article}\n\\begin{document}\nOther.\n\\end{document}\n",
+    )
+    .unwrap();
+    s.open_path(&main).unwrap();
+    s.typeset.issues = vec![texcraft_log::Issue {
+        severity: texcraft_log::Severity::Warning,
+        file: Some(main.clone()),
+        line: Some(1),
+        message: "this window's own warning".into(),
+        detail: String::new(),
+        log_line: 1,
+    }];
+    s.typeset.console = "this window's log\n".into();
+    let other = texcraft_project::normalize(&closed.canonicalize().unwrap());
+    s.typeset.root = Some(other.clone());
+    s.typeset.background = true;
+    s.typeset.quit_job = true;
+    s.typeset.job_was_stale = true;
+    s.typeset.quit = QuitTypeset::Running(Vec::new());
+    s.finish_typeset(Outcome {
+        success: false,
+        report: texcraft_log::LogReport {
+            issues: vec![texcraft_log::Issue {
+                severity: texcraft_log::Severity::Error,
+                file: Some(closed.clone()),
+                line: Some(3),
+                message: "the other project's error".into(),
+                detail: String::new(),
+                log_line: 3,
+            }],
+            ..texcraft_log::LogReport::default()
+        },
+        ..Outcome::default()
+    });
+    assert_eq!(s.typeset.issues.len(), 1);
+    assert_eq!(s.typeset.issues[0].message, "this window's own warning");
+    assert_eq!(s.typeset.console, "this window's log\n");
+    assert!(matches!(&s.typeset.quit, QuitTypeset::Failed { root, .. } if *root == other));
+    assert!(
+        s.typeset.stale.iter().any(|(r, _)| *r == other),
+        "still due"
+    );
+}
+
+/// The quiet bibliography refresh shows no progress, so ⌘. (Abort Typesetting) is not for it:
+/// the command is off while only the refresh runs, and stopping anyway runs it again later.
+#[test]
+fn abort_leaves_the_quiet_bibliography_refresh_alone() {
+    let mut s = session();
+    let dir = temp_dir("bibliography-abort");
+    let main = dir.join("main.tex");
+    std::fs::write(&main, "\\documentclass{article}\n\\bibliography{refs}\n").unwrap();
+    std::fs::write(dir.join("refs.bib"), "@book{a, title={A}}\n").unwrap();
+    s.open_path(&main).unwrap();
+    s.toolchain = Toolchain::default();
+    s.run("typeset.refreshBibliography", &Value::Null).unwrap();
+    // (The refresh waits for a live pass that is due: none here.)
+    s.typeset.live_due = None;
+    s.tick_bibliography(Instant::now() + Duration::from_secs(2));
+    assert!(s.typeset.is_running() && s.typeset.bibliography_job);
+    assert!(!s.typeset.shows_progress());
+    assert!(!s.is_enabled("typeset.stop"));
+    s.stop_typeset();
+    assert!(
+        s.typeset.bibliography_due.is_some(),
+        "stopped, it runs again at the next pause"
+    );
+    settle(&mut s);
+    // A typeset the user started is what ⌘. stops.
+    s.typeset().unwrap();
+    assert!(s.typeset.shows_progress() && s.is_enabled("typeset.stop"));
+    settle(&mut s);
 }

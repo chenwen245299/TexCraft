@@ -30,8 +30,9 @@ A crate depends only on lower layers. Nothing below `ui` knows about egui.
   state or platform `Request`s for the app (file panels, Finder, quit, native edit actions).
 
 The desktop app starts with `Session::empty`. Ordinary launches show the welcome window for
-the user to choose a project; neither a persisted workspace nor legacy recent documents open
-automatically. Settings and the recent-documents list still load, and explicit launch paths
+the user to choose a project; with "Show welcome window at startup" off they reopen the most
+recent project that still exists instead (the chooser shows if there is none), never an empty
+window. Settings and the recent-documents list still load, and explicit launch paths
 open the selected files or folders directly. Untitled documents are created by New/template
 commands; edited unsaved documents must pass the save prompt before quitting. Quit prompts
 keep saved tabs available for the final typeset, while closing the last tab clears the
@@ -41,6 +42,26 @@ is cancelled.
 Each project owns an independent native window. Open Recent resolves a file to its owning
 project; opening another root or folder queues `Effect::OpenProjectWindow` without changing
 the current session. Included chapters and shared assets remain tabs of their project.
+A project shows in one window only, across these processes: a window holds an exclusive
+`flock` on `windows/<hash of its project_key>.lock` in the data folder while it shows that
+project (`apps/texcraft/src/window_registry.rs`; the system releases it when the process ends,
+crashes included). Opening a held project anywhere (Open Recent, the welcome window, a launch
+path, a link) appends the path to that project's `.inbox` instead and activates the owner
+(`texcraft_macos::activate_process`); a watcher thread wakes the owner, which opens the paths
+and comes forward. A process started for a project another window holds forwards its paths and
+exits before showing a window, which also settles two windows starting with one project.
+`texcraft_engine::project_key` (root file, else folder) is what every window compares.
+If no window can start for a path, an empty window opens it itself; otherwise an alert says
+where the saved file is.
+
+Preferences (`app.ron`) and the AI configuration (`ai.json`) are shared by all windows. Each
+save is a three-way merge (`texcraft_engine::prefs::merge3`, `apps/texcraft/src/prefs.rs`):
+what this window changed since it last read or wrote the file wins field by field, the rest
+is the file's. Windows look at the files every 0.7 s and save their own changes within that,
+so a preference changed in one window applies in all; recent documents merge as lists. A
+window's layout (sidebar, tabs, split, zoom, page mode) stays its own. One window does the
+automatic update checks (`windows/updates.lock`); the installer waits until every TexCraft
+process running from the bundle has quit, and a second installer steps aside.
 The desktop platform starts an independent app instance for the new window after flushing
 preferences. Its engine, PDF worker, menus and AI conversation are separate; closing either
 window leaves the other running. Controlled child windows use an automatically allocated
@@ -65,8 +86,19 @@ the file identity still accompanies a question when contents are excluded. The c
 shows the active path, and `ai.editor` exposes the same metadata to agents. Requests already
 in flight retain the editor context captured when their question was sent.
 
+Conversations live in `iCloud Drive/TexCraft/AI Assistant/` when iCloud Drive is on (so every
+Mac on the account shares them), else in the data folder's `chats/` (`ChatStore::locate`; it
+moves older local folders over). Each project folder holds one `<id>.json` per conversation,
+`attachments/` (images, named by SHA-256, written once) and `project.json`; `index.json` only
+caches titles, and the list comes from the conversation files. Folders are keyed by the
+project's path relative to iCloud Drive or home, and stored paths use `$icloud/…`/`$home/…`,
+so another Mac maps them to its own. Nothing is deleted automatically: a project missing on
+this Mac may be on another one or on a drive not connected.
+
 Messages persist their source project, root and file. Inserting an answer requires the same
-source file; legacy answers without provenance must be copied manually. AI actions and inline
+source file; legacy answers without provenance must be copied manually. Renames record
+timed aliases that apply only to conversations saved before them; the conversation shown
+follows a rename of its own project (messages, draft and sources) instead of starting afresh. AI actions and inline
 suggestions validate their original targets, including the file identity when a tab index is
 reused. Tool rounds capture their directory at request time. Git operations discard stale
 results/queued work when their directory changes. Renames remap tabs, navigation, roots and
@@ -144,16 +176,22 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
 
 Full typesets (⌘T, and on opening a project) save edited files and run latexmk on the real files
 into `.texcraft/build/`, then atomically publish a successful PDF beside the root. Publication
-writes only the PDF bytes into a fresh staging file, so macOS hidden flags and FinderInfo from
-the build or an old staging file cannot make the final PDF invisible in Finder. Live passes
+writes only the PDF bytes into a fresh per-process staging file (synced before the rename), so
+macOS hidden flags and FinderInfo from the build or an old staging file cannot make the final
+PDF invisible in Finder, and two windows cannot rename each other's half-written file. Live passes
 never touch that PDF. LIVE mode periodically refreshes edited projects: 5 minutes after the
 first edit, at a 5 s typing pause (at once after 10 minutes).
 
 Bibliography edits additionally request `typeset.refreshBibliography`: after an 800 ms pause,
 a quiet full toolchain run updates BibTeX/Biber output in every mode. It reads a separate
 mirror of current buffers, writes the normal build cache and refreshes the PDF without saving
-source files. Later live passes reuse the updated `.bbl`. Edits during a run queue another
-snapshot; foreground requests take priority. Failed snapshots preserve the good `.bbl`, PDF
+source files. Later live passes reuse the updated `.bbl`. It is background work: it never
+holds up a live pass, and starts only once nothing runs and no live pass is due or queued. In
+LIVE mode an edit during a run stops it without trace and re-arms it for the next pause (the
+live pass shows the edit at once); otherwise edits queue another snapshot. Foreground
+requests take priority: ⌘T stops a running refresh the same way, and quitting stops it. Nothing
+shows it running (no gears, no "Typesetting…"), so Abort Typesetting is off for it; stopped
+anyway, it runs again at the next pause. Failed snapshots preserve the good `.bbl`, PDF
 and SyncTeX files. Newly added or changed citation keys in the body request the same refresh,
 so entries first cited after a `.bib` rebuild also appear correctly. Ordinary text edits and
 citation line-number changes keep using fast live passes. This refresh does not animate the
@@ -166,7 +204,13 @@ by default); persisted-preferences version 3 disables the old enabled default on
 Explicit SyncTeX navigation and the separate scroll-lock option still work as before.
 
 Every normal exit waits for a forced full rebuild (`latexmk -g`) of each open project plus
-edited projects whose tabs were closed, in LIVE, AUTO and MANUAL modes. Unsaved buffers go
+edited projects whose tabs were closed, in LIVE, AUTO and MANUAL modes. Open tabs count through
+the root they are typeset with (`Session::root_of`), and only whole documents are rebuilt. A
+project is "edited" while the PDF beside it lags an edit: a failed typeset keeps an edited
+root due but never makes an unedited one (or an untitled scratch file) due. Only the exit's
+own typesets (`quit_job`) decide it; Don't Quit stops the one running. A closed project's
+exit rebuild never replaces this window's issues, log or status; its failure names it in the
+sheet. Unsaved buffers go
 through the save prompt first; edits received during a build return to that prompt. Both the
 compiler and publishing the PDF beside its root must succeed. Failure preserves the previous
 published PDF and keeps TexCraft open with Retry Typesetting / Don't Quit; a running build

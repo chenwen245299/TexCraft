@@ -31,17 +31,20 @@ pub mod index;
 pub mod inline;
 pub mod live;
 mod opening;
+pub mod prefs;
 #[cfg(test)]
 mod project_context_tests;
 pub mod sync;
 pub mod update;
-pub mod workspace;
 
 pub use commands::{CommandSpec, Shortcut, registry};
 pub use edit::Selection;
 pub use full::QuitTypeset;
 pub use index::ProjectIndex;
-pub use opening::OpenResult;
+pub use opening::{OpenResult, project_key};
+
+/// Answers whether another window shows the project with this [`project_key`].
+pub type ProjectElsewhere = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 pub use update::{CURRENT_VERSION, UpdateState, UpdateStatus};
 
 /// An open text document.
@@ -633,10 +636,15 @@ pub struct TypesetState {
     pub background: bool,
     /// A quiet full run updating bibliography data from unsaved buffers.
     pub bibliography_job: bool,
+    /// The running full typeset is one the exit started: only its result decides the exit.
+    pub quit_job: bool,
+    /// The running full typeset's root was edited since its PDF was last published: if that
+    /// PDF is not replaced after all, it is still due.
+    pub job_was_stale: bool,
     /// Owning root and debounce deadline for the next bibliography refresh.
     pub bibliography_due: Option<(PathBuf, Instant)>,
-    /// The running live pass was stopped on purpose (it took too long, or TexCraft is quitting):
-    /// it leaves no trace.
+    /// The running live pass (it took too long, or TexCraft is quitting) or quiet bibliography
+    /// refresh (an edit superseded it) was stopped on purpose: it leaves no trace.
     pub live_dropped: bool,
     /// The documents (normalized typeset paths) and the revisions the running job typesets:
     /// each one's `typeset_revision` when it finishes.
@@ -668,6 +676,12 @@ impl TypesetState {
             || self.queued
             || self.queued_live
             || self.bibliography_due.is_some()
+    }
+
+    /// A run the user sees is in progress: not the quiet bibliography refresh, which shows no
+    /// progress and which ⌘. leaves alone.
+    pub fn shows_progress(&self) -> bool {
+        self.job.is_some() && !self.bibliography_job
     }
 
     /// A full toolchain run, including quiet bibliography work, is in progress.
@@ -753,6 +767,9 @@ pub struct Session {
     /// launch; empty means English). The Language setting's System choice follows them.
     pub system_languages: Vec<String>,
     waker: Arc<dyn Fn() + Send + Sync>,
+    /// Whether another window (process) shows the project with this [`project_key`]: set by
+    /// the desktop app, which keeps one window per project.
+    pub project_elsewhere: Option<ProjectElsewhere>,
 }
 
 /// Errors from commands. `Failed` carries a message for the user, already in the interface
@@ -823,6 +840,7 @@ impl Session {
             trash: files::system_trash,
             system_languages: Vec::new(),
             waker,
+            project_elsewhere: None,
         }
     }
 
@@ -900,7 +918,7 @@ impl Session {
     /// Opens a file or folder, routing other projects to an independent window.
     pub fn open_path(&mut self, path: &Path) -> Result<OpenResult, CommandError> {
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if self.needs_project_window(&path) {
+        if self.needs_project_window(&path) || self.shown_elsewhere(&path) {
             // Validate before requesting a window; a missing/unreadable file leaves this
             // project's editor, preview and Assistant untouched.
             if !path.is_dir() {
@@ -1071,7 +1089,10 @@ impl Session {
         })?;
         doc.saved_revision = doc.revision;
         if self.project_root.is_none() && texcraft_syntax::is_root_document(&doc.text) {
+            // The same project, now with its root: the conversation stays.
+            self.ai_carry_next(None);
             self.project_root = Some(path.clone());
+            self.ai_follow_project();
         }
         self.git.stale = true;
         Ok(())
@@ -1118,10 +1139,17 @@ impl Session {
             return Ok(());
         }
         self.inline_dismiss();
+        let path = path.canonicalize().unwrap_or(path);
+        // Saved into a folder (or this project): the same work, so its conversation stays.
+        let old_file = self
+            .docs
+            .get(idx)
+            .and_then(|doc| doc.typeset_path())
+            .map(Path::to_path_buf);
+        self.ai_carry_next(old_file.map(|old| (old, path.clone())));
         let Some(doc) = self.docs.get_mut(idx) else {
             return Ok(());
         };
-        let path = path.canonicalize().unwrap_or(path);
         doc.path = Some(path.clone());
         doc.scratch = None;
         doc.saved_revision = doc.revision;
@@ -1135,6 +1163,8 @@ impl Session {
         } else {
             self.refresh_files();
         }
+        // Settles the carried conversation now (a no-op when the project stayed the same).
+        self.ai_follow_project();
         self.remember_recent(&path);
         Ok(())
     }
@@ -1186,6 +1216,11 @@ impl Session {
                 self.typeset.root = None;
             }
             self.clear_pdf();
+            // Back / Forward would reopen the closed project (in a window of its own).
+            self.history.clear();
+            self.history_pos = 0;
+            // Also when the identity did not change (a window of untitled documents only).
+            self.ai_start_afresh();
             self.effect(Effect::Welcome);
         }
         self.active = self.active.min(self.docs.len().saturating_sub(1));
@@ -1208,7 +1243,9 @@ impl Session {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let part = dest.with_file_name(format!(".{name}.part"));
+        // Per process: another window publishing the same PDF must not delete or rename this
+        // staging file half-written.
+        let part = dest.with_file_name(format!(".{name}.{}.part", std::process::id()));
         let copied = (|| -> std::io::Result<()> {
             let mut source = std::fs::File::open(pdf)?;
             // fs::copy clones macOS metadata too, including UF_HIDDEN and FinderInfo's
@@ -1221,6 +1258,8 @@ impl Session {
             }
             let mut staging = std::fs::File::create_new(&part)?;
             std::io::copy(&mut source, &mut staging)?;
+            // On disk before it replaces the good PDF (a crash must not leave an empty one).
+            staging.sync_all()?;
             drop(staging);
             std::fs::rename(&part, &dest)
         })();
@@ -1247,7 +1286,11 @@ impl Session {
 
     /// The root file for the active document (typesetting target).
     pub fn root_path(&self) -> Option<PathBuf> {
-        let doc = self.doc()?;
+        self.root_of(self.doc()?)
+    }
+
+    /// The root file `doc` is typeset through (as [`Session::root_path`] for the active one).
+    pub(crate) fn root_of(&self, doc: &Document) -> Option<PathBuf> {
         let path = doc.typeset_path()?.to_path_buf();
         if doc.path.is_none() {
             return Some(path);
@@ -1256,8 +1299,12 @@ impl Session {
             return Some(root.clone());
         }
         if doc.is_bib() {
-            // A .bib file belongs to the last root that was typeset.
-            return self.typeset.root.clone();
+            // A .bib file belongs to the last root that was typeset, if it is that root's (in
+            // its folder): never to a project whose window has closed meanwhile.
+            return self.typeset.root.clone().filter(|root| {
+                root.parent()
+                    .is_some_and(|dir| texcraft_project::normalize(&path).starts_with(dir))
+            });
         }
         let docs = &self.docs;
         let read = |p: &Path| -> Option<String> {
@@ -1373,7 +1420,9 @@ impl Session {
             let pause = u64::from(self.settings.live_delay_ms).max(800);
             self.typeset.live_due = Some(Instant::now() + Duration::from_millis(pause));
         } else if self.typeset.is_running() {
-            // Exactly one more pass right after the current one: back-to-back while typing.
+            // A quiet bibliography refresh gives way; otherwise exactly one more pass right
+            // after the current one: back-to-back while typing.
+            self.yield_bibliography();
             self.typeset.queued_live = true;
         } else {
             self.typeset.live_due = Some(
@@ -1387,12 +1436,15 @@ impl Session {
         self.typeset.live_due = None;
         if self.typeset.is_running() {
             self.typeset.queued = true;
-            // A live pass gives way: the full typeset starts as soon as it has stopped.
+            // A live pass gives way: the full typeset starts as soon as it has stopped. So does a
+            // quiet bibliography refresh (again later, unless the full typeset saves the buffers
+            // it would have read).
             if self.typeset.live_job
                 && let Some(job) = &self.typeset.job
             {
                 job.cancel();
             }
+            self.drop_bibliography_job(true);
             return Ok(());
         }
         let root = self
@@ -1464,16 +1516,18 @@ impl Session {
             pretex: self.pretex_for(&plan),
             force: background && matches!(self.typeset.quit, QuitTypeset::Running(_)),
         };
-        if self.pdf_wanted(&root) || self.typeset.is_quitting() {
+        if self.pdf_wanted(&root) {
             self.typeset.console.clear();
         }
         // The PDF beside this root will be current again.
         let key = texcraft_project::normalize(&root);
+        self.typeset.job_was_stale = self.typeset.stale.iter().any(|(r, _)| *r == key);
         self.typeset.stale.retain(|(r, _)| *r != key);
         self.typeset.root = Some(root);
         self.typeset.live_job = false;
         self.typeset.background = background;
         self.typeset.bibliography_job = false;
+        self.typeset.quit_job = req.force;
         if self
             .typeset
             .bibliography_due
@@ -1529,6 +1583,8 @@ impl Session {
         self.typeset.live_job = true;
         self.typeset.background = false;
         self.typeset.bibliography_job = false;
+        self.typeset.quit_job = false;
+        self.typeset.job_was_stale = false;
         self.typeset.job = Some(texcraft_typeset::start_live(
             req,
             &self.toolchain,
@@ -1537,10 +1593,15 @@ impl Session {
         Ok(())
     }
 
-    /// Stops the running typeset.
+    /// Stops the running typeset. The quiet bibliography refresh (nothing shows it running)
+    /// is not what ⌘. means: it stops too, but runs again at the next pause instead of being
+    /// forgotten until the next edit.
     pub fn stop_typeset(&mut self) {
         self.typeset.queued = false;
         self.typeset.live_due = None;
+        if self.drop_bibliography_job(true) {
+            return;
+        }
         if let Some(job) = &self.typeset.job {
             job.cancel();
         }
@@ -1571,14 +1632,15 @@ impl Session {
         if let Some(job) = &self.typeset.job {
             while let Some(ev) = job.try_recv() {
                 match ev {
+                    // Another project's output (one closed earlier, rebuilt on quitting) stays
+                    // out of this window's log.
                     JobEvent::Output(line)
                         if !self.typeset.bibliography_job
-                            && (self
+                            && self
                                 .typeset
                                 .root
                                 .as_deref()
-                                .is_none_or(|root| self.pdf_wanted(root))
-                                || self.typeset.is_quitting()) =>
+                                .is_none_or(|root| self.pdf_wanted(root)) =>
                     {
                         self.typeset.console.push_str(&line);
                         self.typeset.console.push('\n');
@@ -1590,10 +1652,14 @@ impl Session {
         }
         if let Some(outcome) = finished {
             self.typeset.job = None;
-            // A live pass stopped to make way for a full typeset, or on purpose, leaves no trace.
-            let superseded = outcome.live
-                && outcome.cancelled
-                && (self.typeset.queued || self.typeset.live_dropped);
+            // A live pass stopped to make way for a full typeset, or on purpose, leaves no trace;
+            // so does a quiet bibliography refresh an edit superseded.
+            let superseded = outcome.cancelled
+                && if outcome.live {
+                    self.typeset.queued || self.typeset.live_dropped
+                } else {
+                    self.typeset.bibliography_job && self.typeset.live_dropped
+                };
             self.typeset.live_dropped = false;
             if superseded {
                 // Stopped through no fault of the text: a later pass may typeset it again.
@@ -1608,22 +1674,22 @@ impl Session {
                 if let Err(e) = self.typeset() {
                     self.set_status(e.to_string());
                 }
-            } else if self.typeset.queued_live && self.typeset.bibliography_due.is_none() {
+            } else if self.typeset.queued_live {
                 self.typeset.queued_live = false;
                 if let Err(e) = self.live_typeset() {
                     self.set_status(e.to_string());
                 }
             }
+            // The last tab closed while it ran: its root belongs to no document here any more.
+            if self.typeset.job.is_none() && self.docs.is_empty() {
+                self.typeset.root = None;
+            }
         }
-        let bibliography_wait = self.tick_bibliography(now);
         self.watch_live(now);
-        // Live typesetting.
+        // Live typesetting. A pending bibliography refresh never holds it up: it runs once the
+        // preview has caught up (below).
         let mut live_wait = None;
-        if let Some(due) = self
-            .typeset
-            .live_due
-            .filter(|_| self.typeset.bibliography_due.is_none())
-        {
+        if let Some(due) = self.typeset.live_due {
             if !self.settings.live_typeset || self.live_paused {
                 self.typeset.live_due = None;
             } else if now >= due {
@@ -1651,6 +1717,8 @@ impl Session {
         }
         // LIVE mode: the preview catches up with edits no finished pass typeset, and settles.
         self.keep_live_current();
+        // Then quiet bibliography work, when nothing else runs or waits.
+        let bibliography_wait = self.tick_bibliography(now);
         // Full typesets TexCraft starts by itself (LIVE mode, quitting).
         let full_wait = self.tick_full(now);
         if self.typeset.is_running() {
@@ -1693,30 +1761,52 @@ impl Session {
             .root
             .as_deref()
             .is_none_or(|root| self.pdf_wanted(root));
-        if !wanted && !self.typeset.is_quitting() {
-            // An old run may still publish its own PDF, but its diagnostics and status
-            // must never replace the project that has since entered this window.
+        if !wanted {
+            // An old run, or the rebuild on quitting of a project closed earlier, still
+            // publishes its own PDF, but its diagnostics, log and status never replace the
+            // project this window shows. A failed exit rebuild names its project in the sheet.
             self.typeset.job_revisions.clear();
             if !outcome.live {
-                let failed = !outcome.success
-                    || outcome
+                let publication = if outcome.success {
+                    outcome
                         .pdf
                         .as_deref()
-                        .is_some_and(|pdf| self.publish_pdf(pdf).is_err());
-                if failed && let Some(root) = self.typeset.root.clone() {
-                    self.mark_stale(&root, Instant::now());
+                        .and_then(|pdf| self.publish_pdf(pdf).err())
+                } else {
+                    None
+                };
+                let failed = !outcome.success || publication.is_some();
+                if failed {
+                    self.still_stale();
+                }
+                let quitting = self.typeset.background
+                    && self.typeset.quit_job
+                    && matches!(self.typeset.quit, QuitTypeset::Running(_));
+                if quitting
+                    && failed
+                    && let Some(root) = self.typeset.root.clone()
+                {
+                    let message = publication
+                        .map(|e| e.to_string())
+                        .or_else(|| outcome.error.clone())
+                        .unwrap_or_else(|| {
+                            if outcome.cancelled {
+                                tr("Typesetting stopped").to_string()
+                            } else {
+                                tr("The full typeset did not produce a PDF without errors.")
+                                    .to_string()
+                            }
+                        });
+                    self.fail_quit(root, message);
                 }
             }
             return;
         }
-        let quiet = self.typeset.bibliography_job && !self.typeset.is_quitting();
+        let quiet = self.typeset.bibliography_job;
         self.note_typeset(&outcome);
         if quiet && !outcome.success {
             // An incomplete bibliography is normal while typing: keep the last good PDF,
             // diagnostics and focus, and wait for another edit rather than retrying forever.
-            if let Some(root) = self.typeset.root.clone() {
-                self.mark_stale(&root, Instant::now());
-            }
             self.typeset.last = Some(outcome);
             return;
         }
@@ -1725,14 +1815,15 @@ impl Session {
             self.typeset.issues = outcome.report.issues.clone();
         }
         let background = !outcome.live && self.typeset.background;
-        let quitting = background && matches!(self.typeset.quit, QuitTypeset::Running(_));
+        // Only a typeset the exit started decides it: one already running when the window was
+        // closed read files saved before the prompt.
+        let quitting = background
+            && self.typeset.quit_job
+            && matches!(self.typeset.quit, QuitTypeset::Running(_));
         let mut publication_error = None;
-        if !outcome.live
-            && !outcome.success
-            && let Some(root) = self.typeset.root.clone()
-        {
+        if !outcome.live && !outcome.success {
             // The PDF beside the source did not change after all.
-            self.mark_stale(&root, Instant::now());
+            self.still_stale();
         }
         if let Some(err) = &outcome.error {
             self.set_status(err.clone());
@@ -1779,6 +1870,7 @@ impl Session {
                 if !quiet {
                     self.set_status(e.to_string());
                 }
+                self.still_stale();
                 publication_error = Some(e.to_string());
             }
         }
@@ -1999,8 +2091,16 @@ impl Session {
             }
         }
         self.reveal(file, line)?;
-        self.history.push((file.to_path_buf(), line));
-        self.history_pos = self.history.len() - 1;
+        // A file another window opened is that window's jump, not this one's.
+        let norm = texcraft_project::normalize(file);
+        if self
+            .doc()
+            .and_then(|d| d.typeset_path())
+            .is_some_and(|p| texcraft_project::normalize(p) == norm)
+        {
+            self.history.push((file.to_path_buf(), line));
+        }
+        self.history_pos = self.history.len().saturating_sub(1);
         Ok(())
     }
 

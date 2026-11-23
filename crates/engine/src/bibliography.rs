@@ -30,6 +30,47 @@ impl Session {
         Ok(())
     }
 
+    /// An edit arrived while a quiet refresh of this project runs: its snapshot is already out
+    /// of date, and the full toolchain would hold up the live pass for seconds. Stop it and
+    /// refresh again at the next pause.
+    pub(crate) fn yield_bibliography(&mut self) {
+        if self.typeset.queued || self.typeset.is_quitting() {
+            return;
+        }
+        if self
+            .root_path()
+            .is_none_or(|current| Some(texcraft_project::normalize(&current)) != self.typeset.root)
+        {
+            return;
+        }
+        self.drop_bibliography_job(true);
+    }
+
+    /// Stops a running quiet refresh so that it leaves no trace (the toolchain restores the
+    /// last good outputs), for work that matters more. `rearm`: refresh again at the next
+    /// pause. Returns whether one was running.
+    pub(crate) fn drop_bibliography_job(&mut self, rearm: bool) -> bool {
+        if !self.typeset.bibliography_job
+            || !self.typeset.is_full_running()
+            || self.typeset.live_dropped
+        {
+            return false;
+        }
+        let Some(root) = self.typeset.root.clone() else {
+            return false;
+        };
+        if let Some(job) = &self.typeset.job {
+            job.cancel();
+        }
+        self.typeset.live_dropped = true;
+        if rearm {
+            let now = Instant::now();
+            self.typeset.bibliography_due =
+                Some((root, now.checked_add(BIBLIOGRAPHY_PAUSE).unwrap_or(now)));
+        }
+        true
+    }
+
     pub(crate) fn tick_bibliography(&mut self, now: Instant) -> Option<Duration> {
         let (root, due) = self.typeset.bibliography_due.clone()?;
         // A delayed request belongs to its original project, even if tabs/windows changed.
@@ -46,22 +87,19 @@ impl Session {
         if now < due {
             return Some(due.saturating_duration_since(now));
         }
-        if self.typeset.is_running() {
-            // A foreground build finishes normally. A live pass yields to the full refresh.
-            if self.typeset.live_job && !self.typeset.live_dropped {
-                if let Some(job) = &self.typeset.job {
-                    job.cancel();
-                }
-                self.typeset.live_dropped = true;
-            }
+        // Background work: the preview of the latest edit comes first. Wait for whatever runs
+        // (it wakes the next tick when it finishes) and for the live pass that is due.
+        if self.typeset.is_running() || self.typeset.live_due.is_some() || self.typeset.queued_live
+        {
             return None;
         }
         self.typeset.bibliography_due = None;
         let Ok(buffers) = self.preview_request(&root) else {
             return None;
         };
+        // Not `last_attempt`: that belongs to live passes, and a refresh that fails must not
+        // stop the preview from catching up with these buffers.
         let inputs = self.live_buffers(&buffers.project_dir);
-        self.typeset.last_attempt = Some(self.live_stamp(&root, &inputs));
         self.typeset.job_revisions = inputs
             .iter()
             .filter_map(|(i, _)| {
@@ -81,11 +119,12 @@ impl Session {
             force: true,
         };
         self.typeset.root = Some(root);
-        self.typeset.live_due = None;
-        self.typeset.queued_live = false;
         self.typeset.live_job = false;
         self.typeset.background = true;
         self.typeset.bibliography_job = true;
+        self.typeset.quit_job = false;
+        // It publishes nothing when it fails: the root's staleness is untouched.
+        self.typeset.job_was_stale = false;
         self.typeset.job = Some(texcraft_typeset::start_buffered(
             req,
             buffers,

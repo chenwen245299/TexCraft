@@ -4091,6 +4091,7 @@ dependencies = [
  "image",
  "muda",
  "rfd",
+ "ron",
  "serde",
  "serde_json",
  "texcraft-engine",
@@ -4132,6 +4133,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "texcraft-ai",
  "texcraft-git",
  "texcraft-i18n",

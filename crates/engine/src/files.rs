@@ -67,6 +67,17 @@ fn relative(path: &Path, base: &Path) -> String {
 }
 
 /// `p` with symbolic links resolved when it exists, else just normalised.
+/// `path` once `from` is renamed to `to` (`None`: not at or under `from`). Exactly `from`
+/// becomes `to` itself: `to.join("")` would add a trailing separator, a different path.
+pub(crate) fn rebase(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
+}
+
 fn real(p: &Path) -> PathBuf {
     p.canonicalize()
         .unwrap_or_else(|_| texcraft_project::normalize(p))
@@ -183,12 +194,10 @@ impl Session {
             .project_root
             .clone()
             .or_else(|| self.project_dir.clone());
-        let moved_directory = self.project_dir.as_ref().and_then(|dir| {
-            real(dir)
-                .strip_prefix(&from)
-                .ok()
-                .map(|rest| to_real.join(rest))
-        });
+        let moved_directory = self
+            .project_dir
+            .as_ref()
+            .and_then(|dir| rebase(&real(dir), &from, &to_real));
         let affects_output = moved_directory.is_some()
             || self
                 .project_root
@@ -230,8 +239,8 @@ impl Session {
             }
         }
         let remap = |path: &mut PathBuf| {
-            if let Ok(rest) = path.strip_prefix(&from) {
-                *path = to_real.join(rest);
+            if let Some(moved) = rebase(path, &from, &to_real) {
+                *path = moved;
             }
         };
         for path in &mut self.recent {
@@ -258,6 +267,8 @@ impl Session {
         self.inline_dismiss();
         self.ai_stop();
         self.ai_action_dismiss();
+        // Before the project's new identity is noticed: the conversation carries on.
+        self.ai_follow_rename(&from, &to_real);
         if affects_output {
             if let Some(job) = self.typeset.job.take() {
                 job.cancel();

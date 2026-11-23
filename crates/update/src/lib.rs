@@ -493,27 +493,44 @@ pub fn install_location(exe: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The shell script that waits for process `$1` to exit, replaces `$2` with `$3` and, if `$4` is
-/// 1, opens the new app (macOS).
+/// The shell script that waits for process `$1` to exit, then for every other TexCraft window
+/// running from `$2` (each project window is a process of its own: the app is replaced once
+/// the last one has quit), replaces `$2` with `$3` and, if `$4` is 1, opens the new app
+/// (macOS). Of several installers (one per window that quit with the update ready) the first
+/// installs it; the others find it gone and stop.
 pub const MACOS_INSTALLER: &str = r#"pid="$1"; old="$2"; new="$3"; relaunch="$4"
 while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
-rm -rf "$old.previous"
-if mv "$old" "$old.previous" && mv "$new" "$old"; then
-  rm -rf "$old.previous"
-  xattr -dr com.apple.quarantine "$old" 2>/dev/null
-else
-  [ -d "$old.previous" ] && [ ! -d "$old" ] && mv "$old.previous" "$old"
+running=$(printf '%s' "$old/Contents/MacOS/" | sed 's/[][\\.*^$(){}?+|]/\\&/g')
+while pgrep -f -- "$running" >/dev/null 2>&1; do sleep 1; done
+lock="$old.installing"
+if ! mkdir "$lock" 2>/dev/null; then
+  sleep 3
+  [ -d "$new" ] || exit 0
+  rm -rf "$lock"; mkdir "$lock" 2>/dev/null || exit 0
 fi
+if [ -d "$new" ]; then
+  rm -rf "$old.previous"
+  if mv "$old" "$old.previous" && mv "$new" "$old"; then
+    rm -rf "$old.previous"
+    xattr -dr com.apple.quarantine "$old" 2>/dev/null
+  else
+    [ -d "$old.previous" ] && [ ! -d "$old" ] && mv "$old.previous" "$old"
+  fi
+fi
+rmdir "$lock" 2>/dev/null
 [ "$relaunch" = 1 ] && open "$old"
 exit 0
 "#;
 
-/// The batch file doing the same on Windows: wait for `%1`, copy `%3` over `%2`, start it if
-/// `%4` is 1.
+/// The batch file doing the same on Windows: wait for `%1` and then for every other TexCraft
+/// window, copy `%3` over `%2`, start it if `%4` is 1.
 pub const WINDOWS_INSTALLER: &str = "@echo off\r\n\
 :wait\r\n\
 tasklist /FI \"PID eq %1\" /NH 2>NUL | find \" %1 \" >NUL\r\n\
 if not errorlevel 1 (timeout /t 1 /nobreak >NUL & goto wait)\r\n\
+:others\r\n\
+tasklist /FI \"IMAGENAME eq texcraft.exe\" /NH 2>NUL | find /I \"texcraft.exe\" >NUL\r\n\
+if not errorlevel 1 (timeout /t 1 /nobreak >NUL & goto others)\r\n\
 robocopy \"%~3\" \"%~2\" /E /NFL /NDL /NJH /NJS /NP >NUL\r\n\
 if \"%4\"==\"1\" start \"\" \"%~2\\texcraft.exe\"\r\n\
 del \"%~f0\"\r\n";
@@ -692,6 +709,17 @@ mod tests {
         let mut sleeper = Command::new("sleep").arg("0.3").spawn().unwrap();
         let pid = sleeper.id().to_string();
         let reaper = std::thread::spawn(move || sleeper.wait());
+        // Another project window, still running from the installed copy for a while: the app
+        // is replaced only once it has quit too.
+        let window = installed.join("Contents/MacOS/other-window");
+        std::fs::write(&window, "#!/bin/sh\nsleep \"$1\"\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut other = Command::new(&window).arg("1.5").spawn().unwrap();
+        let other_reaper = std::thread::spawn(move || other.wait());
+        let started = std::time::Instant::now();
         let status = Command::new("/bin/sh")
             .arg("-c")
             .arg(MACOS_INSTALLER)
@@ -703,7 +731,29 @@ mod tests {
             .status()
             .unwrap();
         let _ = reaper.join();
+        let _ = other_reaper.join();
         assert!(status.success());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1400),
+            "waited for the other window"
+        );
+        assert_eq!(
+            std::fs::read(installed.join("Contents/MacOS/texcraft")).unwrap(),
+            b"new"
+        );
+        assert!(!d.join("Applications/TexCraft.app.installing").exists());
+        // A second installer (another window quit with the update ready) finds it installed.
+        let again = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(MACOS_INSTALLER)
+            .arg("texcraft-update")
+            .arg("999999")
+            .arg(&installed)
+            .arg(&staged.path)
+            .arg("0")
+            .status()
+            .unwrap();
+        assert!(again.success());
         assert_eq!(
             std::fs::read(installed.join("Contents/MacOS/texcraft")).unwrap(),
             b"new"

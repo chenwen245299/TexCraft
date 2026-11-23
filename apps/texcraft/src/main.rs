@@ -9,9 +9,11 @@
 mod control;
 #[cfg(target_os = "macos")]
 mod menu;
+mod prefs;
 mod project_windows;
 #[cfg(test)]
 mod tests;
+mod window_registry;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,21 +25,10 @@ use texcraft_engine::{LanguageChoice, NativeEdit, Session, View, registry};
 use texcraft_i18n::tr;
 use texcraft_ui::{Request, Workbench};
 
-const STORAGE_KEY: &str = "texcraft-state-v2";
+use prefs::{Persisted, STORAGE_KEY};
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Persisted {
-    view: Option<View>,
-    settings: Option<texcraft_project::Settings>,
-    recent: Vec<PathBuf>,
-    split: Option<f32>,
-    /// Bumped when defaults change in a way saved settings should pick up.
-    #[serde(default)]
-    version: u32,
-    /// Saved snapshot retained for compatibility, never opened implicitly at startup.
-    #[serde(default)]
-    workspace: Option<texcraft_engine::workspace::Workspace>,
-}
+/// How often a window looks for preferences other windows saved (and saves its own).
+const PREFS_POLL: Duration = Duration::from_millis(700);
 
 /// Current [`Persisted::version`]. 1: live preview starts on the first keystroke (no delay).
 /// 2: the editor's default font size is 16 pt, as measured on the target.
@@ -70,6 +61,23 @@ struct Options {
     lang: Option<LanguageChoice>,
     welcome: bool,
     commands: Vec<String>,
+}
+
+/// Opens `path` in this window if it has nothing open (no other window could start for it).
+fn open_in_empty_window(session: &mut Session, path: &std::path::Path) -> bool {
+    session.docs.is_empty()
+        && session.project_dir.is_none()
+        && session.open_path(path).is_ok_and(|result| result.is_here())
+}
+
+/// The most recent project that still exists opens (the welcome window is turned off).
+fn reopen_last_project(session: &mut Session) {
+    let Some(last) = session.recent.iter().find(|p| p.exists()).cloned() else {
+        return;
+    };
+    if let Err(e) = session.open_path(&last) {
+        session.set_status(e.to_string());
+    }
 }
 
 /// Only explicit launch paths open documents. Ordinary launches wait for the user to choose
@@ -192,6 +200,15 @@ struct App {
     control: Option<control::Server>,
     control_token_file: Option<PathBuf>,
     project_windows: Vec<project_windows::ProjectWindow>,
+    /// One window per project across processes (`None`: no data folder to coordinate in).
+    windows: Option<window_registry::Registry>,
+    /// The inbox the watcher thread looks at for this window's project.
+    inbox_watch: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// Preferences shared with the other windows (`None`: no data folder).
+    shared_prefs: Option<prefs::Shared>,
+    prefs_checked: Option<Instant>,
+    /// Automatic update checks are wanted here (they run in one window only).
+    updates_wanted: bool,
     deferred: Vec<Deferred>,
     native: Vec<NativeEdit>,
     /// The window title last sent (every viewport command costs a frame, so send changes only).
@@ -209,13 +226,40 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        opts: Options,
+        windows: Option<window_registry::Registry>,
+    ) -> Self {
         let ctx = cc.egui_ctx.clone();
         let waker = {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint()) as Arc<dyn Fn() + Send + Sync>
         };
         let mut session = Session::empty(waker);
+        // A window without a project leaves another window's project to that window.
+        if let Some(dir) = windows.as_ref().map(|w| w.dir().to_path_buf()) {
+            session.project_elsewhere = Some(Arc::new(move |key| {
+                window_registry::Registry::owner(&dir, key).is_some()
+            }));
+        }
+        // Paths another window hands over wake this one (it may be idle, drawing no frames).
+        let inbox_watch: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
+        if windows.is_some() {
+            let watch = inbox_watch.clone();
+            let wake = ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name("texcraft-window-inbox".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let inbox = watch.lock().ok().and_then(|w| w.clone());
+                        if inbox.is_some_and(|p| p.is_file()) {
+                            wake.request_repaint();
+                        }
+                    }
+                });
+        }
         let quit_ctx = ctx.clone();
         let native_quit_routing = texcraft_macos::route_quit_requests(Arc::new(move || {
             quit_ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Close);
@@ -228,9 +272,13 @@ impl App {
         // AI Assistant providers live next to the app's settings (owner-only file: API keys).
         if let Some(dir) = eframe::storage_dir("TexCraft") {
             session.load_ai_config(dir.join("ai.json"));
-            // Conversations: per project, in TexCraft's data folder (never in the project);
-            // those of deleted projects are removed.
-            session.set_chat_store(dir.join("chats"));
+            // Conversations: per project, never in the project; in iCloud Drive when it is on
+            // (they sync between Macs), else in TexCraft's data folder.
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            session.set_chats(texcraft_engine::chats::ChatStore::locate(
+                dir.join("chats"),
+                home.as_deref(),
+            ));
         }
         // Move to Trash through AppKit (Finder's Put Back works).
         #[cfg(target_os = "macos")]
@@ -244,11 +292,18 @@ impl App {
         if let Ok(url) = std::env::var("TEXCRAFT_UPDATE_URL") {
             session.update.url = url;
         }
+        // One window checks for (and downloads) updates; the others leave it to that one.
+        let updates_wanted = session.update.enabled;
+        let mut windows = windows;
+        session.update.enabled =
+            updates_wanted && windows.as_mut().is_none_or(|w| w.hold_updates());
         let mut bench = Workbench::new(&ctx);
-        if let Some(p) = cc
+        let loaded = cc
             .storage
-            .and_then(|s| eframe::get_value::<Persisted>(s, STORAGE_KEY))
-        {
+            .and_then(|s| eframe::get_value::<Persisted>(s, STORAGE_KEY));
+        let shared_prefs = eframe::storage_dir("TexCraft")
+            .map(|dir| prefs::Shared::new(dir.join("app.ron"), loaded.clone().unwrap_or_default()));
+        if let Some(p) = loaded {
             if let Some(v) = p.view {
                 session.view = v;
             }
@@ -273,18 +328,25 @@ impl App {
         // Before anything shows text: the menu bar, the welcome window, status messages.
         texcraft_i18n::set_language(session.lang());
         open_startup(&mut session, &opts);
+        let nothing_open =
+            |s: &Session| s.docs.is_empty() && s.project_dir.is_none() && s.pdf.path.is_none();
+        if nothing_open(&session)
+            && opts.welcome
+            && !session.view.show_welcome
+            && opts.screenshot.is_none()
+        {
+            // Without the welcome window an ordinary launch reopens the last project (another
+            // window may already show it: it comes forward and this one offers the chooser).
+            reopen_last_project(&mut session);
+        }
         if session.root_path().is_some() {
             // Typeset right away so the PDF appears (like opening a project in the target app).
             if let Err(e) = session.typeset() {
                 session.set_status(e.to_string());
             }
-        } else if session.docs.is_empty()
-            && session.project_dir.is_none()
-            && session.pdf.path.is_none()
-            && opts.welcome
-            && session.view.show_welcome
-            && opts.screenshot.is_none()
-        {
+        } else if nothing_open(&session) && opts.welcome && opts.screenshot.is_none() {
+            // The welcome window, or (with it turned off) the project chooser when there was no
+            // last project to reopen: never an empty window.
             bench.welcome.show_window(true);
         }
         for id in &opts.commands {
@@ -330,6 +392,11 @@ impl App {
         Self {
             control_token_file: opts.control_token_file,
             project_windows: Vec::new(),
+            windows,
+            inbox_watch,
+            shared_prefs,
+            prefs_checked: None,
+            updates_wanted,
             native_quit_routing,
             session,
             bench,
@@ -381,6 +448,149 @@ impl App {
         if let Err(e) = self.session.run(id, &Value::Null) {
             self.session.set_status(e.to_string());
         }
+    }
+
+    /// Hands `path` to the window that shows (or is starting with) its project, and brings that
+    /// window forward. `false`: no window does; this one starts one.
+    fn hand_over(&mut self, path: &std::path::Path) -> bool {
+        let Some(dir) = self.windows.as_ref().map(|w| w.dir().to_path_buf()) else {
+            return false;
+        };
+        let Some(key) = texcraft_engine::project_key(path) else {
+            return false;
+        };
+        let owner = window_registry::Registry::owner(&dir, &key);
+        // A window this one just started for it may not hold it yet: it takes the path then.
+        let starting = self
+            .project_windows
+            .iter_mut()
+            .any(|w| w.key.as_deref() == Some(key.as_path()) && w.starting());
+        if owner.is_none() && !starting {
+            return false;
+        }
+        if let Err(e) = window_registry::Registry::forward(&dir, &key, path) {
+            self.session.set_status(texcraft_i18n::trf!(
+                "cannot open {path}: {e}",
+                path = path.display(),
+                e = e
+            ));
+            return true;
+        }
+        if let Some(pid) = owner {
+            texcraft_macos::activate_process(pid);
+        }
+        true
+    }
+
+    /// No window could start for `path` (a file saved into another project, say). This window,
+    /// if it has nothing open, shows it itself; otherwise the user learns where it is, rather
+    /// than the tab just disappearing.
+    fn window_not_started(
+        &mut self,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+        e: &std::io::Error,
+    ) {
+        if open_in_empty_window(&mut self.session, path) {
+            self.bench.document_opened(ctx);
+            return;
+        }
+        self.bench.dialog = texcraft_ui::dialogs::Dialog::Alert {
+            title: tr("Cannot open a new window").into(),
+            message: texcraft_i18n::trf!(
+                "{path} is saved, but TexCraft could not open a window for it ({e}). Open it from File → Open Recent.",
+                path = path.display(),
+                e = e
+            ),
+        };
+    }
+
+    /// This window's preferences, as saved.
+    fn persisted(&self) -> Persisted {
+        Persisted {
+            view: Some(self.session.view.clone()),
+            settings: Some(self.session.settings.clone()),
+            recent: self.session.recent.clone(),
+            split: Some(self.bench.split),
+            version: PERSISTED_VERSION,
+        }
+    }
+
+    /// Takes over preferences another window changed (this window's layout stays its own).
+    fn adopt_prefs(&mut self, p: &Persisted) {
+        if let Some(view) = &p.view {
+            self.session.view = prefs::adopt_view(&self.session.view, view);
+        }
+        if let Some(settings) = &p.settings {
+            self.session.settings = settings.clone();
+        }
+        if p.recent != self.session.recent {
+            self.session.set_recent(p.recent.clone());
+        }
+    }
+
+    /// Now and then: takes over what other windows saved (preferences, AI settings), and saves
+    /// this window's own changes soon, so the others take them over too.
+    fn follow_shared_prefs(&mut self, frame: &mut eframe::Frame) {
+        if self
+            .prefs_checked
+            .is_some_and(|at| at.elapsed() < PREFS_POLL)
+        {
+            return;
+        }
+        self.prefs_checked = Some(Instant::now());
+        self.session.ai_follow_config_file();
+        // The window that checked for updates quit: this one takes over.
+        if self.updates_wanted
+            && !self.session.update.enabled
+            && self.windows.as_mut().is_some_and(|w| w.hold_updates())
+        {
+            self.session.update.enabled = true;
+        }
+        let ours = self.persisted();
+        let Some(shared) = self.shared_prefs.as_mut() else {
+            return;
+        };
+        if let Some(merged) = shared.poll(&ours) {
+            self.adopt_prefs(&merged);
+        }
+        let ours = self.persisted();
+        if self
+            .shared_prefs
+            .as_ref()
+            .is_some_and(|shared| shared.unsaved(&ours))
+            && let Some(storage) = frame.storage_mut()
+        {
+            eframe::App::save(self, storage);
+            storage.flush();
+        }
+    }
+
+    /// Keeps this window's hold on its project in step, and opens what other windows handed
+    /// over (bringing this window forward).
+    fn follow_window_registry(&mut self, ctx: &egui::Context) {
+        let Some(windows) = self.windows.as_mut() else {
+            return;
+        };
+        let key = self.session.window_key();
+        if windows.held() != key.as_deref() {
+            windows.follow(key.as_deref());
+            if let Ok(mut watch) = self.inbox_watch.lock() {
+                *watch = windows.inbox();
+            }
+        }
+        let paths = windows.take_inbox();
+        if paths.is_empty() {
+            return;
+        }
+        for path in paths {
+            match self.session.open_path(&path) {
+                Ok(result) if result.is_here() => self.bench.document_opened(ctx),
+                Ok(_) => {}
+                Err(e) => self.session.set_status(e.to_string()),
+            }
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Focus);
     }
 
     fn handle_requests(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -480,6 +690,10 @@ impl App {
                 Request::Reveal(p) => reveal(&p),
                 Request::OpenExternally(p) => open_externally(&p),
                 Request::OpenProjectWindow(path) => {
+                    // A project already in a window opens there: that window comes forward.
+                    if self.hand_over(&path) {
+                        continue;
+                    }
                     // The new instance reads the current preferences and recents, while its
                     // explicit path starts a fresh project/AI session instead of restoring tabs.
                     if let Some(storage) = frame.storage_mut() {
@@ -493,11 +707,7 @@ impl App {
                             .filter(|_| self.control.is_some()),
                     ) {
                         Ok(window) => self.project_windows.push(window),
-                        Err(e) => self.session.set_status(texcraft_i18n::trf!(
-                            "cannot open {path}: {e}",
-                            path = path.display(),
-                            e = e
-                        )),
+                        Err(e) => self.window_not_started(ctx, &path, &e),
                     }
                 }
                 Request::NewProjectWindow(template) => {
@@ -512,7 +722,10 @@ impl App {
                             .filter(|_| self.control.is_some()),
                     ) {
                         Ok(window) => self.project_windows.push(window),
-                        Err(error) => self.session.set_status(error.to_string()),
+                        Err(e) => self.session.set_status(texcraft_i18n::trf!(
+                            "cannot open a new window: {e}",
+                            e = e
+                        )),
                     }
                 }
                 Request::Native(n) => {
@@ -1141,6 +1354,8 @@ impl eframe::App for App {
         self.bench.ui(ui, &mut self.session);
         // A language chosen this frame (Settings, a menu, a command) shows from the next one.
         self.apply_language(&ctx);
+        self.follow_window_registry(&ctx);
+        self.follow_shared_prefs(frame);
         self.handle_requests(&ctx, frame);
         self.project_windows
             .retain_mut(|window| window.is_running());
@@ -1174,14 +1389,13 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let p = Persisted {
-            view: Some(self.session.view.clone()),
-            settings: Some(self.session.settings.clone()),
-            recent: self.session.recent.clone(),
-            split: Some(self.bench.split),
-            version: PERSISTED_VERSION,
-            workspace: Some(self.session.workspace()),
+        let ours = self.persisted();
+        // Other windows' changes since this one last read the file stay, and apply here too.
+        let p = match self.shared_prefs.as_mut() {
+            Some(shared) => shared.for_save(&ours),
+            None => ours,
         };
+        self.adopt_prefs(&p);
         eframe::set_value(storage, STORAGE_KEY, &p);
     }
 }
@@ -1211,6 +1425,25 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+    // One window per project: a project another TexCraft window shows opens there instead
+    // (this process ends before it shows a window). Two windows starting with one project at
+    // once settle it here too: the lock goes to one of them.
+    let mut windows = eframe::storage_dir("TexCraft")
+        .map(|dir| window_registry::Registry::new(dir.join("windows")));
+    if opts.screenshot.is_none()
+        && let Some(registry) = windows.as_mut()
+        && let Some(first) = opts.paths.first()
+        && let Some(key) = texcraft_engine::project_key(first)
+        && !registry.hold(Some(&key))
+        && let Some(owner) = window_registry::Registry::owner(registry.dir(), &key)
+    {
+        for path in &opts.paths {
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let _ = window_registry::Registry::forward(registry.dir(), &key, &path);
+        }
+        texcraft_macos::activate_process(owner);
+        return Ok(());
+    }
     let (w, h) = opts.size.unwrap_or((1388.0, 824.0));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("TexCraft")
@@ -1236,6 +1469,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "TexCraft",
         native,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, opts)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, opts, windows)))),
     )
 }

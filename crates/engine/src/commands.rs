@@ -255,8 +255,9 @@ fn is_quitting(s: &Session) -> bool {
     s.typeset.is_quitting()
 }
 
-fn is_running(s: &Session) -> bool {
-    s.typeset.is_running()
+/// ⌘. stops what the user sees running (not the quiet bibliography refresh).
+fn shows_progress(s: &Session) -> bool {
+    s.typeset.shows_progress()
 }
 fn can_typeset(s: &Session) -> bool {
     s.root_path().is_some()
@@ -982,17 +983,21 @@ static REGISTRY: &[CommandSpec] = &[
     ),
     cmd!(
         "ai.copy",
-        "Copy Answer",
+        "Copy Message",
         None,
         0,
         None,
         always,
         |s, p| {
             let i = param_u32(p, "index")? as usize;
+            // A question or an answer; a failed answer without text copies its error.
             let text =
                 s.ai.messages
                     .get(i)
-                    .map(|m| m.text.clone())
+                    .map(|m| match &m.error {
+                        Some(error) if m.text.trim().is_empty() => error.clone(),
+                        _ => m.text.clone(),
+                    })
                     .ok_or_else(|| CommandError::Failed(tr("no such message").into()))?;
             s.effect(Effect::CopyText(text));
             Ok(())
@@ -1769,7 +1774,7 @@ static REGISTRY: &[CommandSpec] = &[
         Typeset,
         0,
         Some(Shortcut::cmd(".")),
-        is_running,
+        shows_progress,
         |s, _| {
             s.stop_typeset();
             Ok(())

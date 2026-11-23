@@ -19,6 +19,7 @@ texcraft-git.workspace = true
 texcraft-ai.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"
 
 [lints]
 workspace = true
