@@ -55,6 +55,19 @@ pub(crate) fn recent_entry(path: &Path, read: &dyn Fn(&Path) -> Option<String>) 
     }
 }
 
+/// Only a saved root document can represent a project in Recent. A loose file, an empty
+/// folder or an ambiguous asset must not become an entry merely because it can be opened.
+pub(crate) fn recent_root(path: &Path, read: &dyn Fn(&Path) -> Option<String>) -> Option<PathBuf> {
+    let path = path.canonicalize().ok()?;
+    let entry = recent_entry(&path, read);
+    if texcraft_project::FileKind::of(&entry) != texcraft_project::FileKind::Tex
+        || !read(&entry).is_some_and(|text| texcraft_syntax::is_root_document(&text))
+    {
+        return None;
+    }
+    entry.canonicalize().ok()
+}
+
 /// Where an open request was handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenResult {
@@ -449,7 +462,7 @@ mod tests {
         let empty = base.join("a/empty-project");
         std::fs::create_dir_all(&empty).unwrap();
         s.set_recent(vec![empty.clone()]);
-        assert_eq!(s.recent.as_slice(), std::slice::from_ref(&empty));
+        assert!(s.recent.is_empty());
         s.run("file.openRecent", &json!({"path": empty})).unwrap();
         assert_eq!(s.effects.back(), Some(&Effect::OpenProjectWindow(empty)));
         let before = s.effects.len();

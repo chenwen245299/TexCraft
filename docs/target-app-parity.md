@@ -20,11 +20,11 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | AI Assistant (not in the target) | ✅ | providers in Settings → AI (SoCLaaS at NUS, Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Kimi, Qwen Token Plan, MiMo, Zhipu GLM, MiniMax, StepFun, MoleAPI, Ollama, custom: Argus's list), sidebar tab before Search, Settings pane after Editor, keys encrypted at rest, streaming answers with Insert/Copy, provider/model logos (LobeHub, Apache-2.0); manual scrolling preserves history during generation, returning to the bottom resumes following |
 | Interface type | ✅ | system font in its Text optical size (`opsz` 17) and semibold weight, sizes measured on the target |
 | Scroll bars | ✅ | always-visible 11 pt thumbs, as the target shows them with a mouse attached |
-| Settings window | ✅ | separate window, pane toolbar (General, Sidebar, Editor with Editing Aids / Look & Feel, Document Viewer, Typesetting), description–control rows; only TexCraft's own options (no snippets hotkey, AI completion, cloud) |
+| Settings window | ✅ | separate window, pane toolbar (General, Sidebar, Editor with Editing Aids / Look & Feel, AI, Document Viewer, Typesetting), description–control rows; AI → Conversations has opt-in iCloud Drive chat storage (off by default), actual location and copy/error states |
 | Editor / PDF 50:50 split, ⌘2/⌘3/⌘4 | ✅ | draggable divider |
 | Native window tabs | 🟡 | in-window tab strip when more than one file is open |
 | No console / status bar | ✅ | log and issues live in the sidebar |
-| Welcome / organiser window | ✅ | separate 780×480 window on the system's translucent material, the only window when no workspace reopens; Documents/About/Licence and Recent Documents/Templates tabs, filter, "Last Modified" dates; cancelling Open keeps it open; closing the last tab returns here; no Account or Connect panes (no cloud service) |
+| Welcome / organiser window | ✅ | separate 780×480 window on the system's translucent material, the only window when no workspace reopens; Documents/About/Licence and Recent Documents/Templates tabs, filter, "Last Modified" dates; Recent lists saved project roots only, with legacy loose-file entries resolved or removed; cancelling Open keeps it open; closing the last tab returns here; no Account or Connect panes (no cloud service) |
 | Workspace restoration | 🟡 | relaunch restores the project folder, saved tabs, active file and cursor/selection; explicit launch paths win; legacy settings reopen the latest existing recent project once. PDF scroll position and unsaved-buffer crash recovery remain open |
 
 ## Typesetting

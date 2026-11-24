@@ -2,6 +2,48 @@
 //! Also the user-visible strings of crates/ai (provider kinds, capabilities, errors).
 
 pub(super) const ENTRIES: super::Entries = &[
+    // Opt-in conversation storage (Settings → AI → Conversations).
+    ("Conversations", "对话"),
+    ("Sync with iCloud Drive", "通过 iCloud Drive 同步"),
+    (
+        "Sync Conversations with iCloud Drive",
+        "通过 iCloud Drive 同步对话",
+    ),
+    (
+        "Keep AI conversations and image attachments available on your other Macs.",
+        "在你的其他 Mac 上查看 AI 对话和图片附件。",
+    ),
+    ("Storage", "保存方式"),
+    ("Save Location", "保存位置"),
+    ("Saving to iCloud Drive", "保存到 iCloud Drive"),
+    ("Saving on this Mac", "保存在本机"),
+    ("Copying conversations…", "正在复制对话…"),
+    ("Retry Copy", "重试复制"),
+    (
+        "iCloud Drive is unavailable. Conversations are saved on this Mac. Enable iCloud Drive in macOS System Settings to use sync.",
+        "iCloud Drive 不可用，对话保存在本机。请在 macOS 系统设置中开启 iCloud Drive 后再启用同步。",
+    ),
+    (
+        "Only AI conversations and image attachments are synced. API keys and AI settings stay on this Mac.",
+        "仅同步 AI 对话和图片附件。API 密钥和 AI 设置保留在本机。",
+    ),
+    (
+        "Turning sync off keeps a local copy of your conversations. Existing iCloud files are kept.",
+        "关闭同步后，对话会保留本地副本，已有的 iCloud 文件也会保留。",
+    ),
+    ("Could not copy conversations: {e}", "无法复制对话：{e}"),
+    (
+        "Conversation storage is not configured.",
+        "尚未配置对话保存位置。",
+    ),
+    (
+        "Enable iCloud Drive in macOS System Settings to sync conversations.",
+        "请在 macOS 系统设置中开启 iCloud Drive 后再同步对话。",
+    ),
+    (
+        "Conversation storage stopped unexpectedly.",
+        "对话保存任务意外停止。",
+    ),
     // Conversation history (ai_panel.rs, engine ai.rs)
     ("Conversation History", "对话记录"),
     ("Conversations in This Project", "此项目的对话"),

@@ -104,6 +104,8 @@ pub struct AiState {
     round: Option<Round>,
     /// Where conversations are saved (`None`: not saved, as in tests).
     pub chats: Option<ChatStore>,
+    /// Opt-in local/iCloud storage and its background copy.
+    pub storage: Option<crate::chat_storage::ChatStorage>,
     /// The conversation shown (`None`: new, not saved yet).
     pub chat_id: Option<String>,
     /// The current project's saved conversations, the latest first.
@@ -423,18 +425,16 @@ impl Session {
     /// Another window changed the AI configuration: take its changes over (this window's own
     /// unsaved changes stay). Cheap when nothing changed (one file date).
     pub fn ai_follow_config_file(&mut self) {
-        let Some(path) = self.ai.config_path.clone() else {
-            return;
-        };
-        let seen = modified(&path);
-        if seen.is_none() || seen == self.ai.config_seen {
-            return;
-        }
-        if let Some((config, disk)) = self.ai_config_merged() {
+        let seen = self.ai.config_path.as_deref().and_then(modified);
+        if seen.is_some()
+            && seen != self.ai.config_seen
+            && let Some((config, disk)) = self.ai_config_merged()
+        {
             self.ai.config = config;
             self.ai.config_base = Some(disk);
             self.ai.config_seen = seen;
         }
+        self.ai_follow_chat_storage();
     }
 
     /// Stores the API key of provider `id` (encrypted; it cannot be read back from the app).
@@ -487,15 +487,15 @@ impl Session {
         if let Some((config, _)) = self.ai_config_merged() {
             self.ai.config = config;
         }
-        let Some(p) = self.ai.config_path.clone() else {
-            return Ok(());
-        };
-        self.ai
-            .config
-            .save(&p)
-            .map_err(|e| CommandError::Failed(e.0))?;
-        self.ai.config_base = serde_json::to_value(&self.ai.config).ok();
-        self.ai.config_seen = modified(&p);
+        if let Some(p) = self.ai.config_path.clone() {
+            self.ai
+                .config
+                .save(&p)
+                .map_err(|e| CommandError::Failed(e.0))?;
+            self.ai.config_base = serde_json::to_value(&self.ai.config).ok();
+            self.ai.config_seen = modified(&p);
+        }
+        self.ai_follow_chat_storage();
         Ok(())
     }
 

@@ -21,6 +21,7 @@ pub mod ai_actions;
 pub mod ai_tools;
 pub mod ai_usage;
 pub mod bibliography;
+pub mod chat_storage;
 pub mod chats;
 pub mod commands;
 pub mod edit;
@@ -740,7 +741,7 @@ pub struct Session {
     pub inline: inline::InlineState,
     /// PDF preview.
     pub pdf: PdfState,
-    /// Recently opened files (most recent first).
+    /// Recently opened project root files (most recent first).
     pub recent: Vec<PathBuf>,
     /// Pending effects for the UI.
     pub effects: VecDeque<Effect>,
@@ -1095,6 +1096,7 @@ impl Session {
             self.ai_follow_project();
         }
         self.git.stale = true;
+        self.remember_recent(&path);
         Ok(())
     }
 
@@ -1169,21 +1171,31 @@ impl Session {
         Ok(())
     }
 
-    /// Puts `path`'s project at the top of the recent documents, by its entry point (the main
-    /// file: see [`texcraft_project::project_entry`]), so a project is listed once.
+    /// Puts `path`'s project at the top of Recent, only by a saved root file. Files already
+    /// open in this window belong to its fixed root, even beside several independent roots.
     pub fn remember_recent(&mut self, path: &Path) {
-        let entry = opening::recent_entry(path, &|p| self.text_of(p));
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let owner = self.project_root.as_deref().filter(|_| {
+            self.docs
+                .iter()
+                .any(|doc| doc.path.as_deref() == Some(path.as_path()))
+        });
+        let Some(entry) = opening::recent_root(owner.unwrap_or(&path), &|p| self.text_of(p)) else {
+            return;
+        };
         self.recent.retain(|p| p != &entry);
         self.recent.insert(0, entry);
         self.recent.truncate(12);
     }
 
-    /// Sets the recent documents (from the saved state), each project by its entry point and
-    /// once, in their order.
+    /// Restores Recent, resolving legacy file/folder entries to saved roots, dropping entries
+    /// without a confirmed root and listing each project once in its original order.
     pub fn set_recent(&mut self, list: Vec<PathBuf>) {
         let mut out: Vec<PathBuf> = Vec::new();
         for p in list {
-            let entry = opening::recent_entry(&p, &|q| std::fs::read_to_string(q).ok());
+            let Some(entry) = opening::recent_root(&p, &|q| std::fs::read_to_string(q).ok()) else {
+                continue;
+            };
             if !out.contains(&entry) {
                 out.push(entry);
             }
@@ -1618,6 +1630,7 @@ impl Session {
             self.tick_git(now),
             self.tick_git_message(),
             self.tick_ai(),
+            self.tick_chat_storage(),
             self.tick_ai_action(),
             self.tick_inline(now),
         ]
@@ -2300,6 +2313,14 @@ impl Session {
                 "project": self.ai_project_root(),
                 "editor": self.ai_editor_context(),
                 "chatId": self.ai.chat_id,
+                "chatStorage": {
+                    "syncICloud": self.ai.config.sync_chats_icloud,
+                    "icloudAvailable": self.ai.storage.as_ref().is_some_and(|s| s.icloud_available()),
+                    "usingICloud": self.ai.storage.as_ref().is_some_and(|s| s.uses_icloud()),
+                    "copying": self.ai.storage.as_ref().is_some_and(|s| s.is_busy()),
+                    "path": self.ai.chats.as_ref().map(|s| s.root()),
+                    "error": self.ai.storage.as_ref().and_then(|s| s.error.as_ref()),
+                },
                 "history": self.ai.history.iter().map(|c| serde_json::json!({
                     "id": c.id, "title": c.title, "updated": c.updated,
                 })).collect::<Vec<_>>(),

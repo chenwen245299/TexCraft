@@ -263,6 +263,11 @@ pub struct Config {
     pub model: String,
     /// Send the open document with each question.
     pub include_document: bool,
+    /// Sync AI conversations and their images through iCloud Drive. Opt-in, on this Mac.
+    pub sync_chats_icloud: bool,
+    /// 0: copy cloud history back to local storage once (an older automatic-cloud release,
+    /// or a newly disabled sync). Set to 1 only after the copy finishes, so a restart resumes it.
+    pub chat_storage_version: u8,
     /// Inline suggestions in the editor.
     pub inline: inline::InlineSettings,
     /// The editor's right-click AI actions, in menu order.
@@ -276,6 +281,8 @@ impl Default for Config {
             provider: String::new(),
             model: String::new(),
             include_document: true,
+            sync_chats_icloud: false,
+            chat_storage_version: 0,
             inline: inline::InlineSettings::default(),
             actions: actions::defaults(),
         }
@@ -2094,6 +2101,22 @@ mod tests {
         );
         p.line("data: [DONE]");
         assert!(matches!(p.finish(true), Event::Done { .. }));
+    }
+
+    #[test]
+    fn conversation_sync_is_opt_in_and_the_choice_round_trips() {
+        let old: Config = serde_json::from_str(r#"{"include_document":false}"#).unwrap();
+        assert!(!old.sync_chats_icloud);
+        assert!(!Config::default().sync_chats_icloud);
+        for sync in [true, false] {
+            let c = Config {
+                sync_chats_icloud: sync,
+                chat_storage_version: 1,
+                ..Config::default()
+            };
+            let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+            assert_eq!(back, c);
+        }
     }
 
     #[test]

@@ -39,6 +39,11 @@ keep saved tabs available for the final typeset, while closing the last tab clea
 project/PDF and opens the welcome window. The welcome window remains open when a file panel
 is cancelled.
 
+Recent lists saved project root files only. Opening or saving a project's bibliography,
+chapter or other tab remembers the window's fixed root. Legacy file/folder entries resolve
+to confirmed roots and deduplicate on load and shared-preference adoption; ambiguous assets,
+rootless folders and missing files are discarded.
+
 Each project owns an independent native window. Open Recent resolves a file to its owning
 project; opening another root or folder queues `Effect::OpenProjectWindow` without changing
 the current session. Included chapters and shared assets remain tabs of their project.
@@ -86,9 +91,17 @@ the file identity still accompanies a question when contents are excluded. The c
 shows the active path, and `ai.editor` exposes the same metadata to agents. Requests already
 in flight retain the editor context captured when their question was sent.
 
-Conversations live in `iCloud Drive/TexCraft/AI Assistant/` when iCloud Drive is on (so every
-Mac on the account shares them), else in the data folder's `chats/` (`ChatStore::locate`; it
-moves older local folders over). Each project folder holds one `<id>.json` per conversation,
+Conversations stay in the data folder's `chats/` by default. Settings → AI → Conversations
+offers an explicit local preference, `Config::sync_chats_icloud` (`ai.setICloudSync`); when
+enabled and iCloud Drive is available they use `iCloud Drive/TexCraft/AI Assistant/` instead.
+The pane reports the actual store and location, unavailability, copying and errors; it does
+not claim to know iCloud's network upload status. Changing stores takes effect immediately
+without stopping an answer or clearing its draft. A cancellable worker copies history and
+images, retaining the source and choosing the newer saved conversation; other windows follow
+the local configuration. Turning sync off never deletes cloud files. Old automatic-cloud
+histories are copied back once without opting in; `chat_storage_version` stays 0 until an
+import finishes (also on disabling), so an interrupted import resumes on restart. With sync
+off, a completed import does not keep reading cloud history. Each project folder holds one `<id>.json` per conversation,
 `attachments/` (images, named by SHA-256, written once) and `project.json`; `index.json` only
 caches titles, and the list comes from the conversation files. Folders are keyed by the
 project's path relative to iCloud Drive or home, and stored paths use `$icloud/…`/`$home/…`,

@@ -84,9 +84,10 @@ fn independent_project_windows_get_only_the_selected_project_and_a_separate_cont
 fn startup_waits_for_a_project_choice_with_legacy_or_saved_workspaces() {
     let dir = std::env::temp_dir().join(format!("texcraft-startup-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
     let file = dir.join("main.tex");
     let pdf = dir.join("paper.pdf");
-    std::fs::write(&file, "saved project").unwrap();
+    std::fs::write(&file, "\\documentclass{article}\n").unwrap();
     std::fs::write(&pdf, b"%PDF-1.5").unwrap();
     for workspace in [
         Value::Null,

@@ -1,5 +1,49 @@
 # TexCraft devlog
 
+## Release notes prepared for 0.6.6 (2026-11-24)
+
+- Prepared `texcraft-v0.6.6.md` from the changes since v0.6.5: opt-in iCloud conversation
+  storage and root-only Recent entries. Checked the implementation, previous notes and release
+  workflow; local and remote tags end at v0.6.5.
+- Documentation only; no code checks rerun, build, commit, tag or push performed.
+
+## Recent lists project roots only (2026-11-24)
+
+- Recent accepts saved, confirmed project roots only. Bibliography/chapter tabs remember the
+  window's fixed root even with multiple roots in one folder; saving a newly created root
+  adds it. Legacy entries resolve to roots, deduplicate canonical paths, and discard ambiguous
+  assets, rootless folders, broken root links and missing files on load/shared-preference adoption.
+- Added three engine regressions and a bilingual welcome-list/click regression. Updated the
+  empty-folder expectation and startup fixture. Gates: fmt; 253 passing results across engine,
+  UI, desktop and i18n (one measurement ignored); all-target Clippy with warnings denied.
+- Isolated native control run confirmed legacy `.bib` removal, project reopening and a `.bib`
+  tab retaining its root/recent entry. Native screenshot callbacks timed out; rendered the
+  actual welcome UI offscreen at 2× in English/zh-Hans, light/dark, and inspected the PNGs.
+
+## Opt-in iCloud conversation storage (2026-11-24)
+
+- Settings → AI → Conversations adds an iCloud Drive checkbox, off by default, the actual
+  save location, and copying/unavailability/error states. Turning it off returns to local
+  storage and keeps existing cloud files; keys and AI settings remain local.
+- A cancellable storage worker copies history and attachments without clearing the current
+  answer or draft; newer saved conversations win. Project windows follow the local preference.
+  Legacy automatic-cloud histories import locally once. Disabling persists an unfinished-import
+  marker until completion, so quitting during a copy resumes it on the next launch. Failed
+  copies retain their originals and can be retried; an off store stops importing cloud changes.
+- Added `ai.setICloudSync {enabled}` and `ai.chatStorage` inspection; `ui.prefs` AI tab 2 opens
+  Conversations. Dedicated `TEXCRAFT_DATA_DIR` / `TEXCRAFT_CHAT_HOME` test overrides isolate
+  preferences, keys, the window registry and simulated iCloud data without overriding `HOME`.
+- Nine new regressions cover opt-in (failed before the fix), preference persistence, two-way
+  copies/images/drafts, no cloud writes while off, one-time legacy import, restart recovery,
+  multiple windows, unavailability/retry, and real checkbox input in English and zh-Hans.
+  Gates: fmt; 295 reported passing results across AI/engine/UI/i18n/desktop, one measurement
+  ignored; all-target Clippy with warnings denied; desktop build passes.
+- Started isolated native instances over the control channel; native screenshot callbacks did
+  not return in this environment. Rendered the actual Workbench/Prefs offscreen with wgpu
+  instead: 900×600 pt at 2×, English/light and zh-Hans/dark, off/on/unavailable; inspected the
+  PNGs for clipping and wrapping. Test windows stopped. Real iCloud network transfer between
+  Macs was not exercised here.
+
 ## Release notes prepared for 0.6.5 (2026-11-23)
 
 - Prepared local `texcraft-v0.6.5.md` from the changes since v0.6.4: AI chat storage and copy,

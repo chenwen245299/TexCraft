@@ -105,9 +105,9 @@ fn editor_tabs() -> [&'static str; 2] {
     [tr("Editing Aids"), tr("Editor Look & Feel")]
 }
 
-/// AI pane tabs: the providers and their models, the editor's right-click actions.
-fn ai_tabs() -> [&'static str; 2] {
-    [tr("Providers"), tr("Actions")]
+/// AI pane tabs: providers, editor actions and conversation storage.
+fn ai_tabs() -> [&'static str; 3] {
+    [tr("Providers"), tr("Actions"), tr("Conversations")]
 }
 
 /// State of the Settings window and the Typeset Configuration sheet.
@@ -121,7 +121,7 @@ pub struct Prefs {
     pub pane: Pane,
     /// Editor pane tab (index into Editing Aids, Editor Look & Feel).
     pub editor_tab: usize,
-    /// AI pane tab (index into Providers, Actions).
+    /// AI pane tab (index into Providers, Actions, Conversations).
     pub ai_tab: usize,
     /// Typeset Configuration tab (Summary, General, Bibliographies, Indices).
     pub sheet_tab: usize,
@@ -831,6 +831,9 @@ fn settings_body(
             Pane::Viewer => viewer_pane(&mut form, session),
             Pane::Typesetting => open_sheet = typesetting_pane(&mut form, session),
             Pane::Ai if prefs.ai_tab == 1 => ai_actions_pane(&mut form, session, &mut prefs.ai),
+            Pane::Ai if prefs.ai_tab == 2 => {
+                ai_conversations_pane(&mut form, session, &mut prefs.ai)
+            }
             Pane::Ai => ai_pane(&mut form, session, &mut prefs.ai),
         }
         let wanted = (form.y - rect.top() + 36.0).max(300.0).round();
@@ -891,10 +894,12 @@ fn pane_bar(ui: &mut Ui, pal: &Pal, prefs: &mut Prefs, rect: Rect) -> f32 {
         }
     }
     if matches!(prefs.pane, Pane::Editor | Pane::Ai) {
-        let (names, tab) = if prefs.pane == Pane::Editor {
-            (editor_tabs(), &mut prefs.editor_tab)
+        let editor_names = editor_tabs();
+        let ai_names = ai_tabs();
+        let (names, tab): (&[&str], &mut usize) = if prefs.pane == Pane::Editor {
+            (&editor_names, &mut prefs.editor_tab)
         } else {
-            (ai_tabs(), &mut prefs.ai_tab)
+            (&ai_names, &mut prefs.ai_tab)
         };
         if let Some(i) = text_tabs(
             ui,
@@ -904,7 +909,7 @@ fn pane_bar(ui: &mut Ui, pal: &Pal, prefs: &mut Prefs, rect: Rect) -> f32 {
             top + PANE_BAR_H - 0.5,
             20.0,
             112.0,
-            &names,
+            names,
             *tab,
             11.8,
         ) {
@@ -1612,6 +1617,103 @@ pub(crate) struct AiPaneState {
     action_fields: Option<String>,
     action_name: String,
     action_prompt: String,
+    /// An error from the conversation-storage command.
+    chat_error: Option<String>,
+}
+
+fn ai_conversations_pane(f: &mut Form<'_>, session: &mut Session, st: &mut AiPaneState) {
+    let mut enabled = session.ai.config.sync_chats_icloud;
+    let available = session
+        .ai
+        .storage
+        .as_ref()
+        .is_some_and(|s| s.icloud_available());
+    let busy = session.ai.storage.as_ref().is_some_and(|s| s.is_busy());
+    let can_change = session.ai.storage.is_some() && (available || enabled);
+    if f.checkbox_enabled(
+        tr("Keep AI conversations and image attachments available on your other Macs."),
+        tr("Sync with iCloud Drive"),
+        &mut enabled,
+        can_change,
+    ) {
+        st.chat_error = session
+            .run(
+                "ai.setICloudSync",
+                &serde_json::json!({ "enabled": enabled }),
+            )
+            .err()
+            .map(|e| e.to_string());
+    }
+    let in_cloud = session.ai.storage.as_ref().is_some_and(|s| s.uses_icloud());
+    f.value(
+        tr("Storage"),
+        if in_cloud {
+            tr("Saving to iCloud Drive")
+        } else {
+            tr("Saving on this Mac")
+        },
+    );
+    if let Some(store) = &session.ai.chats {
+        let path = session.ai.storage.as_ref().map_or_else(
+            || store.root().display().to_string(),
+            |s| s.display_path(store.root()),
+        );
+        f.value(tr("Save Location"), &path);
+    }
+    let paragraph = |f: &mut Form<'_>, text: &str, color: Color32| {
+        let g = f.ui.painter().layout(
+            text.to_string(),
+            FontId::proportional(f.style.desc_size),
+            color,
+            f.right - f.left - 14.0,
+        );
+        let h = g.size().y;
+        f.ui.painter()
+            .galley(pos2(f.left + 7.0, f.y + 6.0), g, color);
+        f.y += h + 18.0;
+    };
+    if !available {
+        paragraph(
+            f,
+            tr(
+                "iCloud Drive is unavailable. Conversations are saved on this Mac. Enable iCloud Drive in macOS System Settings to use sync.",
+            ),
+            f.pal.note,
+        );
+    }
+    if session.ai.storage.as_ref().is_some_and(|s| s.is_busy()) {
+        paragraph(f, tr("Copying conversations…"), f.pal.note);
+    }
+    let error = st
+        .chat_error
+        .as_ref()
+        .or_else(|| session.ai.storage.as_ref().and_then(|s| s.error.as_ref()));
+    if let Some(error) = error {
+        paragraph(f, error, f.pal.close);
+        if !busy && f.button("", tr("Retry Copy")) {
+            st.chat_error = session
+                .run(
+                    "ai.setICloudSync",
+                    &serde_json::json!({ "enabled": session.ai.config.sync_chats_icloud }),
+                )
+                .err()
+                .map(|e| e.to_string());
+        }
+    }
+    paragraph(
+        f,
+        tr(
+            "Only AI conversations and image attachments are synced. API keys and AI settings stay on this Mac.",
+        ),
+        f.pal.note,
+    );
+    paragraph(
+        f,
+        tr(
+            "Turning sync off keeps a local copy of your conversations. Existing iCloud files are kept.",
+        ),
+        f.pal.note,
+    );
 }
 
 /// Added models shown before their list scrolls, and their row height.
@@ -2772,6 +2874,7 @@ mod tests {
             assert_eq!(Pane::Viewer.label(), "文稿查看器");
             assert_eq!(Pane::Ai.label(), "AI");
             assert_eq!(editor_tabs(), ["编辑辅助", "编辑器外观"]);
+            assert_eq!(ai_tabs(), ["服务商", "操作", "对话"]);
             assert_eq!(sheet_tabs(), ["概览", "通用", "参考文献", "索引"]);
             // The window is created and found again under the same translated title.
             assert_eq!(tr(SETTINGS_TITLE), "TexCraft 设置");
@@ -2779,6 +2882,93 @@ mod tests {
         let _en = scoped(Lang::En);
         assert_eq!(Pane::Viewer.label(), "Document Viewer");
         assert_eq!(tr(SETTINGS_TITLE), SETTINGS_TITLE);
+    }
+
+    /// The real checkbox in both languages dispatches the storage command, instead of only
+    /// changing a check mark; the chosen store changes in both directions.
+    #[test]
+    fn conversation_sync_checkbox_changes_the_store_in_both_languages() {
+        use std::time::{Duration, Instant};
+        for lang in [Lang::En, Lang::ZhHans] {
+            let _lang = scoped(lang);
+            let base = std::env::temp_dir().join(format!(
+                "texcraft-prefs-cloud-{}-{}",
+                lang.code(),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            let home = base.join("home");
+            std::fs::create_dir_all(home.join("Library/Mobile Documents/com~apple~CloudDocs"))
+                .unwrap();
+            let mut session = Session::empty(Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            session.configure_chat_storage(base.join("chats"), Some(home));
+            let ctx = Context::default();
+            crate::theme::install_fonts(&ctx);
+            let pal = pal(&Tokens::light());
+            let mut prefs = Prefs {
+                pane: Pane::Ai,
+                ai_tab: 2,
+                inline: true,
+                ..Default::default()
+            };
+            let mut draw = |session: &mut Session, events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(700.0, 650.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        settings_body(
+                            ui,
+                            &pal,
+                            session,
+                            &mut prefs,
+                            &mut 3,
+                            Rect::from_min_size(egui::Pos2::ZERO, vec2(700.0, 650.0)),
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+            };
+            for enabled in [true, false] {
+                draw(&mut session, Vec::new());
+                let id = Id::new(("prefs", Pane::Ai, 0_usize, 2_usize))
+                    .with(tr("Sync with iCloud Drive"));
+                let response = ctx.read_response(id).unwrap();
+                assert!(response.enabled());
+                assert!(response.rect.right() < 700.0, "translated label fits");
+                let pos = response.rect.center();
+                for pressed in [true, false] {
+                    draw(
+                        &mut session,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                assert_eq!(session.ai.config.sync_chats_icloud, enabled);
+                assert_eq!(session.ai.storage.as_ref().unwrap().uses_icloud(), enabled);
+            }
+            let start = Instant::now();
+            while session.ai.storage.as_ref().is_some_and(|s| s.is_busy()) {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                session.tick(Instant::now());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(session.ai.storage.as_ref().unwrap().error.is_none());
+            let _ = std::fs::remove_dir_all(base);
+        }
     }
 
     #[test]

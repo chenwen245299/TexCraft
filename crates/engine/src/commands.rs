@@ -306,6 +306,21 @@ fn param_f32(p: &Value, key: &str) -> Result<f32, CommandError> {
 }
 
 macro_rules! cmd {
+    ($id:literal, $label:literal, $menu:ident, $group:literal, $sc:expr, $enabled:expr, $run:expr, checked = $checked:expr, params = $params:literal) => {
+        CommandSpec {
+            checked: Some($checked),
+            ..cmd!(
+                $id,
+                $label,
+                $menu,
+                $group,
+                $sc,
+                $enabled,
+                $run,
+                params = $params
+            )
+        }
+    };
     ($id:literal, $label:literal, $menu:ident, $group:literal, $sc:expr, $enabled:expr, $run:expr) => {
         CommandSpec {
             id: $id,
@@ -937,6 +952,23 @@ static REGISTRY: &[CommandSpec] = &[
             }
         },
         params = "{index: number} — an image attached to the question being written"
+    ),
+    cmd!(
+        "ai.setICloudSync",
+        "Sync Conversations with iCloud Drive",
+        None,
+        0,
+        None,
+        |s| s.ai.storage.is_some(),
+        |s, p| {
+            let enabled = p
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| CommandError::Params("enabled: expected a boolean".into()))?;
+            s.ai_set_icloud_sync(enabled)
+        },
+        checked = |s| s.ai.config.sync_chats_icloud,
+        params = "{enabled: boolean} — opt into iCloud conversation storage, or keep chats local"
     ),
     cmd!(
         "ai.clear",

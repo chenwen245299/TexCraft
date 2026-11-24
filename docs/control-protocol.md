@@ -15,6 +15,11 @@ authenticate:
 {"id": 1, "method": "command.run", "params": {"id": "typeset.run"}}
 ```
 
+For isolated UI tests, `TEXCRAFT_DATA_DIR` overrides all app data (including eframe's
+preferences and the window registry); `TEXCRAFT_CHAT_HOME` supplies the home/iCloud anchor for
+conversation storage. Point both at test folders to exercise iCloud availability without
+reading or writing the user's app data or changing the process's `HOME`.
+
 Replies: `{"id": 1, "ok": true, "result": …}` or `{"id": 1, "ok": false, "error": "…"}`.
 
 One project occupies one window. `command.run` with `file.openRecent {path}` opens that file's
@@ -54,7 +59,7 @@ debounce and compilation, including edits queued during an earlier run.
 | `typeset.wait` | `{timeoutMs?}` | waits until no typeset is running or pending; returns the typeset summary |
 | `ui.screenshot` | `{path}` | saves a PNG of the window; returns path and size |
 | `ui.welcome` | `{open?, inline?, leftTab?, rightTab?, close?}` | opens/closes the welcome window; `inline` draws it inside the main window for `ui.screenshot`; `close: true` presses its close button (at launch that quits) |
-| `ui.prefs` | `{open?, pane?, editorTab?, aiTab?, sheet?, sheetTab?, inline?, models?, modelGroup?}` | opens/closes the Settings window (panes `general`, `sidebar`, `editor`, `viewer`, `typesetting`, `ai`; `aiTab` 0 Providers, 1 Actions) and the Typeset Configuration sheet; `models` opens (fetching the list) or closes the model picker for the provider selected in the AI pane, `modelGroup` picks its tab (`text`, `vision`, `other`; anything else: all); `inline` draws the Settings contents and the picker inside the main window so `ui.screenshot` can capture them |
+| `ui.prefs` | `{open?, pane?, editorTab?, aiTab?, sheet?, sheetTab?, inline?, models?, modelGroup?}` | opens/closes the Settings window (panes `general`, `sidebar`, `editor`, `viewer`, `typesetting`, `ai`; `aiTab` 0 Providers, 1 Actions, 2 Conversations) and the Typeset Configuration sheet; `models` opens (fetching the list) or closes the model picker for the provider selected in the AI pane, `modelGroup` picks its tab (`text`, `vision`, `other`; anything else: all); `inline` draws the Settings contents and the picker inside the main window so `ui.screenshot` can capture them |
 | `ui.resize` | `{width, height}` | resizes the window |
 
 Useful command ids: `file.openPath {path}`, `edit.setText {text}`, `edit.select {anchor, cursor}`,
@@ -75,6 +80,13 @@ its `ui.welcome` reports `launch` (the welcome window is the only window) and `m
 (the editor window is hidden behind it). `git` reports branch, staged, changes, busy and error;
 `ai` reports providers with `hasKey` only — API keys are never reported — plus model and
 messages. `commands.list` documents the rest.
+
+`ai.setICloudSync {enabled: boolean}` opts into iCloud Drive conversation storage (off by
+default), or returns to local storage, without discarding the current answer or draft.
+Copies run asynchronously and retain the source; the same command retries a failed copy.
+`state.inspect` → `ai.chatStorage` reports `syncICloud` (the local preference),
+`icloudAvailable`, `usingICloud` (the actual store), `copying`, `path` and `error`.
+These describe storage and copying, not Apple's network sync progress.
 
 `typeset.quitting` covers both the running exit rebuild and a failed exit waiting for action.
 `typeset.quitError` is `null` or `{root, message}`. `app.retryQuit` retries a failed exit;

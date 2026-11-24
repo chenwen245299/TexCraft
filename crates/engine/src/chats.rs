@@ -1,5 +1,6 @@
 //! Saved AI conversations, kept per project in a folder of their own, never in the project (a
-//! project sent to someone carries no chats). With iCloud Drive on they live in
+//! project sent to someone carries no chats). With conversation sync explicitly enabled in
+//! Settings and iCloud Drive available they live in
 //! `iCloud Drive/TexCraft/AI Assistant/`, so every Mac signed in to the same account sees them;
 //! otherwise in TexCraft's data folder's `chats/` ([`ChatStore::locate`]).
 //!
@@ -14,6 +15,7 @@
 //! conversations.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use texcraft_ai::{Image, Role};
@@ -212,13 +214,81 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.part"));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{n}.part", std::process::id()));
     std::fs::write(&tmp, bytes)
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("cannot save the conversation: {e}")
         })
+}
+
+/// A conversation's save time, independent of iCloud's download time on this Mac.
+fn saved_at(path: &Path) -> u64 {
+    #[derive(Deserialize)]
+    struct Time {
+        saved: Option<u64>,
+        updated: Option<u64>,
+    }
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Time>(&bytes).ok())
+        .and_then(|time| {
+            time.saved
+                .or_else(|| time.updated.map(|t| t.saturating_mul(1000)))
+        })
+        .unwrap_or_else(|| modified_secs(path).saturating_mul(1000))
+}
+
+/// Copies a store without deleting the source. A newer conversation wins, attachments are
+/// immutable, and the two metadata files merge. Runs on the storage worker, never per frame.
+fn copy_dir(from: &Path, to: &Path, cancel: &AtomicBool) -> std::io::Result<()> {
+    if !from.try_exists()? {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || kind.is_symlink() {
+            continue;
+        }
+        let source = entry.path();
+        let dest = to.join(name.as_ref());
+        if kind.is_dir() {
+            copy_dir(&source, &dest, cancel)?;
+        } else if kind.is_file() {
+            if dest.try_exists()? {
+                let merged = match name.as_ref() {
+                    "index.json" => Some(merge_index(&source, &dest)),
+                    "project.json" => Some(merge_project(&source, &dest)),
+                    _ => None,
+                };
+                if let Some(ok) = merged {
+                    if !ok {
+                        return Err(std::io::Error::other(
+                            "could not merge conversation metadata",
+                        ));
+                    }
+                    continue;
+                }
+                let conversation = name.strip_suffix(".json").is_some_and(valid_id);
+                if !conversation || saved_at(&source) <= saved_at(&dest) {
+                    continue;
+                }
+            }
+            let bytes = std::fs::read(&source)?;
+            write_atomic(&dest, &bytes).map_err(std::io::Error::other)?;
+        }
+    }
+    Ok(())
 }
 
 /// The SHA-256 of `bytes` in hex: an attachment's name.
@@ -374,11 +444,9 @@ impl ChatStore {
         }
     }
 
-    /// Where this Mac keeps conversations: in iCloud Drive (`TexCraft/AI Assistant`) when it is
-    /// on, so they sync between Macs, else in `local` (TexCraft's data folder's `chats`).
-    /// Conversations still in `local`, or kept under an older naming, move to where they belong
-    /// now; a folder that cannot move stays where it is.
-    pub fn locate(local: PathBuf, home: Option<&Path>) -> Self {
+    /// Selects where this Mac keeps conversations. Merely having iCloud Drive never opts in.
+    /// Copies and legacy folder adoption run separately on the storage worker.
+    pub fn locate(local: PathBuf, home: Option<&Path>, sync_icloud: bool) -> Self {
         let icloud = home.and_then(icloud_drive);
         let mut anchors = Vec::new();
         if let Some(dir) = &icloud {
@@ -393,17 +461,29 @@ impl ChatStore {
                 home.canonicalize().unwrap_or(home.to_path_buf()),
             ));
         }
-        let root = icloud.map_or_else(
+        let root = icloud.filter(|_| sync_icloud).map_or_else(
             || local.clone(),
             |dir| dir.join("TexCraft").join("AI Assistant"),
         );
-        let store = Self { root, anchors };
-        store.adopt(&local);
-        if store.root != local {
-            // Left only when something could not move.
-            let _ = std::fs::remove_dir(&local);
+        Self { root, anchors }
+    }
+
+    /// Imports old storage without removing anything there. Called off the UI thread.
+    pub(crate) fn prepare(&self, sources: &[PathBuf], cancel: &AtomicBool) -> Result<(), String> {
+        std::fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
+        for source in sources {
+            if source != &self.root {
+                if self.root.starts_with(source) || source.starts_with(&self.root) {
+                    return Err("conversation storage folders overlap".into());
+                }
+                copy_dir(source, &self.root, cancel).map_err(|e| e.to_string())?;
+            }
         }
-        store
+        if cancel.load(Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::Interrupted.to_string());
+        }
+        self.adopt(&self.root);
+        Ok(())
     }
 
     /// The folder conversations are kept in.
@@ -1062,7 +1142,7 @@ mod tests {
         // The project is gone from this Mac (moved, on a drive not connected, or only on
         // another Mac): its conversations stay.
         std::fs::remove_dir_all(&project).unwrap();
-        let _ = ChatStore::locate(base.join("data/chats"), None);
+        let _ = ChatStore::locate(base.join("data/chats"), None, false);
         assert_eq!(store.list(Some(&project)).len(), 1);
         assert_eq!(store.list(Some(&other)).len(), 1);
         let _ = std::fs::remove_dir_all(&base);
@@ -1156,12 +1236,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// With iCloud Drive on, conversations move there from the data folder (and from the
+    /// An available iCloud folder must not opt a user into uploading conversations.
+    #[test]
+    fn conversations_stay_local_until_sync_is_enabled() {
+        let base =
+            std::env::temp_dir().join(format!("texcraft-chat-opt-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let cloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let local = base.join("data/chats");
+        let store = ChatStore::locate(local.clone(), Some(&home), false);
+        assert_eq!(
+            store.root(),
+            local,
+            "iCloud sync must require an explicit opt-in"
+        );
+        store
+            .save(
+                None,
+                "abc123",
+                &[message(Role::User, "Local only")],
+                &ChatUsage::default(),
+            )
+            .unwrap();
+        assert!(!cloud.join("TexCraft").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// With sync explicitly on, conversations copy there from the data folder (and from the
     /// naming by absolute path); another Mac with a different home folder sees the same
     /// history for the same project, with its own paths; conversations another Mac added
     /// show up although this Mac's index never heard of them.
     #[test]
-    fn conversations_move_to_icloud_and_follow_the_project_between_macs() {
+    fn conversations_copy_to_icloud_and_follow_the_project_between_macs() {
         let base = std::env::temp_dir().join(format!("texcraft-icloud-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let cloud = |home: &Path| home.join("Library/Mobile Documents/com~apple~CloudDocs");
@@ -1197,9 +1305,12 @@ mod tests {
             )
             .unwrap();
 
-        let store = ChatStore::locate(local.clone(), Some(&home));
+        let store = ChatStore::locate(local.clone(), Some(&home), true);
+        store
+            .prepare(std::slice::from_ref(&local), &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(store.root(), cloud(&home).join("TexCraft/AI Assistant"));
-        assert!(!local.exists(), "nothing is left behind in the data folder");
+        assert!(local.exists(), "the original history is retained");
         assert_eq!(store.list(Some(&root_file)).len(), 1);
         let (back, _) = store.load(Some(&root_file), &id).unwrap();
         assert_eq!(back[0].source, question.source);
@@ -1222,7 +1333,8 @@ mod tests {
             .status()
             .unwrap();
         assert!(copy.success());
-        let there = ChatStore::locate(base.join("mac2/support/chats"), Some(&other_home));
+        let there = ChatStore::locate(base.join("mac2/support/chats"), Some(&other_home), true);
+        there.prepare(&[], &AtomicBool::new(false)).unwrap();
         let there_root = cloud(&other_home).join("CS6215/sigconf.tex");
         assert_eq!(there.list(Some(&there_root)).len(), 1);
         let (back, _) = there.load(Some(&there_root), &id).unwrap();

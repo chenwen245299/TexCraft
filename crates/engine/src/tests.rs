@@ -692,6 +692,88 @@ fn recent_documents_list_a_project_once_by_its_main_file() {
 }
 
 #[test]
+fn recent_uses_the_windows_root_when_opening_assets_beside_multiple_roots() {
+    let dir = temp_dir("recent-multiple-roots").canonicalize().unwrap();
+    let main = dir.join("main.tex");
+    let alternate = dir.join("alternate.tex");
+    for root in [&main, &alternate] {
+        std::fs::write(
+            root,
+            "\\documentclass{article}\n\\input{notes}\n\\bibliography{refs}\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.join("refs.bib"), "@book{k, title={T}}\n").unwrap();
+    std::fs::write(dir.join("notes.tex"), "Notes.\n").unwrap();
+    let mut s = session();
+    s.open_path(&alternate).unwrap();
+    for name in ["refs.bib", "notes.tex"] {
+        assert!(s.open_path(&dir.join(name)).unwrap().is_here());
+        assert_eq!(s.project_root, Some(alternate.clone()));
+        assert_eq!(s.recent, vec![alternate.clone()], "{name}");
+        s.save(s.active).unwrap();
+        assert_eq!(s.recent, vec![alternate.clone()]);
+    }
+    // Opening another independent root still records that project, not this window's root.
+    assert_eq!(s.open_path(&main).unwrap(), OpenResult::NewWindow);
+    assert_eq!(s.recent, vec![main, alternate]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn saved_recents_keep_only_confirmed_project_roots_and_deduplicate_aliases() {
+    let dir = temp_dir("recent-cleanup").canonicalize().unwrap();
+    let paper = dir.join("paper.tex");
+    let draft = dir.join("draft.tex");
+    for root in [&paper, &draft] {
+        std::fs::write(root, "\\documentclass{article}\n").unwrap();
+    }
+    std::fs::write(dir.join("refs.bib"), "@book{k, title={T}}\n").unwrap();
+    std::fs::write(dir.join("notes.tex"), "Notes.\n").unwrap();
+    std::fs::write(dir.join("broken.tex"), "% !TEX root = missing.tex\n").unwrap();
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut s = session();
+    s.set_recent(vec![
+        dir.join("refs.bib"),
+        paper.clone(),
+        dir.join("notes.tex"),
+        dir.join("broken.tex"),
+        dir.join("missing.tex"),
+        empty,
+        dir.join("./paper.tex"),
+        draft.clone(),
+    ]);
+    assert_eq!(s.recent, vec![paper.clone(), draft.clone()]);
+    // Restoring again (including another window's preferences) has the same result.
+    s.set_recent(s.recent.clone());
+    assert_eq!(s.recent, vec![paper, draft]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rootless_files_stay_out_of_recents_until_a_root_is_saved() {
+    let dir = temp_dir("recent-rootless").canonicalize().unwrap();
+    let mut s = session();
+    std::fs::write(dir.join("refs.bib"), "@book{k, title={T}}\n").unwrap();
+    s.open_path(&dir.join("refs.bib")).unwrap();
+    assert!(s.recent.is_empty());
+    s.close(s.active);
+    let main = dir.join("main.tex");
+    std::fs::write(&main, "Work in progress.\n").unwrap();
+    s.open_path(&main).unwrap();
+    assert!(s.recent.is_empty());
+    s.run(
+        "edit.setText",
+        &json!({"text": "\\documentclass{article}\n"}),
+    )
+    .unwrap();
+    s.save(s.active).unwrap();
+    assert_eq!(s.recent, vec![main]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn files_context_menu_commands_rename_duplicate_trash_and_insert() {
     let mut s = session();
     let dir = temp_dir("files-menu");

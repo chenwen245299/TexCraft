@@ -35,6 +35,15 @@ const PREFS_POLL: Duration = Duration::from_millis(700);
 /// 3: recompiling preserves the PDF reading position instead of following the source caret.
 const PERSISTED_VERSION: u32 = 3;
 
+/// A dedicated data folder for isolated control-channel tests, without changing the process
+/// home or the user's normal preferences, conversations, keys or window registry.
+fn app_data_dir() -> Option<PathBuf> {
+    std::env::var_os("TEXCRAFT_DATA_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| eframe::storage_dir("TexCraft"))
+}
+
 fn migrate_preferences(version: u32, view: &mut View, settings: &mut texcraft_project::Settings) {
     if version < 1 {
         settings.live_delay_ms = 0;
@@ -270,15 +279,13 @@ impl App {
             session.system_languages = texcraft_i18n::languages_from_env(|k| std::env::var(k).ok());
         }
         // AI Assistant providers live next to the app's settings (owner-only file: API keys).
-        if let Some(dir) = eframe::storage_dir("TexCraft") {
+        if let Some(dir) = app_data_dir() {
             session.load_ai_config(dir.join("ai.json"));
-            // Conversations: per project, never in the project; in iCloud Drive when it is on
-            // (they sync between Macs), else in TexCraft's data folder.
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            session.set_chats(texcraft_engine::chats::ChatStore::locate(
-                dir.join("chats"),
-                home.as_deref(),
-            ));
+            // Conversations stay local unless the user opts into iCloud in Settings → AI.
+            let home = std::env::var_os("TEXCRAFT_CHAT_HOME")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from);
+            session.configure_chat_storage(dir.join("chats"), home);
         }
         // Move to Trash through AppKit (Finder's Put Back works).
         #[cfg(target_os = "macos")]
@@ -301,7 +308,7 @@ impl App {
         let loaded = cc
             .storage
             .and_then(|s| eframe::get_value::<Persisted>(s, STORAGE_KEY));
-        let shared_prefs = eframe::storage_dir("TexCraft")
+        let shared_prefs = app_data_dir()
             .map(|dir| prefs::Shared::new(dir.join("app.ron"), loaded.clone().unwrap_or_default()));
         if let Some(p) = loaded {
             if let Some(v) = p.view {
@@ -878,7 +885,7 @@ impl App {
                 }
                 "ui.prefs" => {
                     // {open?: bool, pane?: "general"|"sidebar"|"editor"|"viewer"|"typesetting"|"ai",
-                    //  editorTab?: n, aiTab?: n (0 providers, 1 actions), sheet?: bool,
+                    //  editorTab?: n, aiTab?: n (0 providers, 1 actions, 2 conversations), sheet?: bool,
                     //  sheetTab?: n, inline?: bool, models?: bool,
                     //  modelGroup?: "text"|"vision"|"other"|null}
                     let prefs = &mut self.bench.prefs;
@@ -901,7 +908,7 @@ impl App {
                         prefs.editor_tab = n.min(1) as usize;
                     }
                     if let Some(n) = p.params.get("aiTab").and_then(Value::as_u64) {
-                        prefs.ai_tab = n.min(1) as usize;
+                        prefs.ai_tab = n.min(2) as usize;
                     }
                     if let Some(n) = p.params.get("sheetTab").and_then(Value::as_u64) {
                         prefs.sheet_tab = n.min(3) as usize;
@@ -1428,8 +1435,7 @@ fn main() -> eframe::Result {
     // One window per project: a project another TexCraft window shows opens there instead
     // (this process ends before it shows a window). Two windows starting with one project at
     // once settle it here too: the lock goes to one of them.
-    let mut windows = eframe::storage_dir("TexCraft")
-        .map(|dir| window_registry::Registry::new(dir.join("windows")));
+    let mut windows = app_data_dir().map(|dir| window_registry::Registry::new(dir.join("windows")));
     if opts.screenshot.is_none()
         && let Some(registry) = windows.as_mut()
         && let Some(first) = opts.paths.first()
@@ -1463,6 +1469,9 @@ fn main() -> eframe::Result {
     }
     let native = eframe::NativeOptions {
         viewport,
+        persistence_path: std::env::var_os("TEXCRAFT_DATA_DIR")
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(path).join("app.ron")),
         persist_window: opts.screenshot.is_none() && opts.size.is_none(),
         ..eframe::NativeOptions::default()
     };

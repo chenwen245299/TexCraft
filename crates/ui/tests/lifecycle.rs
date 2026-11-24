@@ -107,6 +107,48 @@ fn cancelling_an_open_panel_keeps_welcome_and_never_exposes_a_template() {
 }
 
 #[test]
+fn welcome_recent_lists_only_roots_and_opens_the_project_in_both_languages() {
+    fn texts(shape: &Shape, out: &mut Vec<String>) {
+        match shape {
+            Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, out)),
+            _ => {}
+        }
+    }
+    let base = std::env::temp_dir().join(format!("texcraft-ui-recents-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let paper = base.join("paper.tex");
+    let draft = base.join("draft.tex");
+    for root in [&paper, &draft] {
+        std::fs::write(root, "\\documentclass{article}\n\\bibliography{refs}\n").unwrap();
+    }
+    let bib = base.join("refs.bib");
+    std::fs::write(&bib, "@book{k, title={T}}\n").unwrap();
+    for lang in [texcraft_i18n::Lang::En, texcraft_i18n::Lang::ZhHans] {
+        let _language = texcraft_i18n::scoped(lang);
+        let mut rig = Rig::new();
+        rig.session
+            .set_recent(vec![bib.clone(), paper.clone(), draft.clone()]);
+        rig.bench.welcome.inline = true;
+        rig.bench.welcome.show_window(true);
+        rig.frame(Vec::new());
+        let frame = rig.frame(Vec::new());
+        let mut labels = Vec::new();
+        for shape in &frame.shapes {
+            texts(&shape.shape, &mut labels);
+        }
+        assert!(labels.iter().any(|label| label == "paper.tex"));
+        assert!(labels.iter().any(|label| label == "draft.tex"));
+        assert!(!labels.iter().any(|label| label.contains("refs.bib")));
+        rig.click("paper.tex");
+        assert_eq!(rig.session.root_path(), Some(paper.canonicalize().unwrap()));
+        assert_eq!(rig.session.docs.len(), 1);
+        assert!(!rig.bench.welcome.open);
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn picking_another_recent_project_requests_a_window_and_keeps_the_original_tabs() {
     let mut rig = Rig::new();
     let base = std::env::temp_dir().join(format!("texcraft-ui-projects-{}", std::process::id()));
