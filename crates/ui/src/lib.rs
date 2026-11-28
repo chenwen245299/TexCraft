@@ -471,6 +471,11 @@ impl Workbench {
         }
         self.apply_effects(ctx, session);
         self.pdf.sync_document(ctx, session);
+        if self.pdf.take_recovery_request() == Some(session.pdf.generation)
+            && session.recover_preview()
+        {
+            ctx.request_repaint();
+        }
         session.refresh_index(false);
         let t = self.tokens.clone();
 

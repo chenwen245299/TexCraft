@@ -310,12 +310,14 @@ pub struct Outcome {
     /// [`live::read_back_state`]): another pass over the same text can come out different (the
     /// contents, references and outline catch up; errors left there by half-typed text go).
     pub read_back_changed: bool,
+    /// This result included a bounded clean-cache retry after a failed preview attempt.
+    pub recovery_attempted: bool,
 }
 
 /// Where a live pass mirrored the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mirror {
-    /// `<project>/.texcraft/live`
+    /// This root's cache: `<project>/.texcraft/live/root-<hash>`.
     pub live_dir: PathBuf,
     /// The project folder.
     pub project_dir: PathBuf,
@@ -365,6 +367,7 @@ pub struct Job {
     rx: Receiver<JobEvent>,
     cancel: Arc<AtomicBool>,
     pid: Arc<Mutex<Option<u32>>>,
+    precompiling: Arc<AtomicBool>,
     /// When it started.
     pub started: Instant,
     /// The root file being typeset.
@@ -376,6 +379,17 @@ pub struct Job {
 }
 
 impl Job {
+    /// Cache preparation/recovery is still running; a newer edit can replace this obsolete
+    /// snapshot immediately instead of waiting behind expensive preamble work.
+    pub fn is_precompiling(&self) -> bool {
+        self.precompiling.load(Ordering::SeqCst)
+    }
+
+    /// The tracked engine/format process, when it has started.
+    pub fn process_id(&self) -> Option<u32> {
+        *self.pid.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Next event, if any. A run whose thread ended without reporting (it panicked) finishes
     /// with an error, so callers never wait for it forever.
     pub fn try_recv(&self) -> Option<JobEvent> {
@@ -421,6 +435,14 @@ impl Job {
                 }
             }
         }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // Closing/reopening a window must not leave its TeX/format processes alive after the
+        // engine receiver disappears. Completed jobs have already cleared their PID slot.
+        self.cancel();
     }
 }
 
@@ -476,6 +498,7 @@ fn start_full(
         rx,
         cancel: cancel.clone(),
         pid: pid.clone(),
+        precompiling: Arc::new(AtomicBool::new(false)),
         started: Instant::now(),
         root: req.root.clone(),
         live: false,
@@ -753,13 +776,33 @@ fn run_process(
 
 /// Starts a live-preview pass for `req` on a background thread.
 pub fn start_live(req: LiveRequest, tc: &Toolchain, wake: Arc<dyn Fn() + Send + Sync>) -> Job {
+    start_live_job(req, tc, wake, false)
+}
+
+/// Starts a bounded clean-state preview rebuild, without changing or saving source files.
+pub fn start_live_recovery(
+    req: LiveRequest,
+    tc: &Toolchain,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> Job {
+    start_live_job(req, tc, wake, true)
+}
+
+fn start_live_job(
+    req: LiveRequest,
+    tc: &Toolchain,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    recover: bool,
+) -> Job {
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let pid = Arc::new(Mutex::new(None));
+    let precompiling = Arc::new(AtomicBool::new(false));
     let job = Job {
         rx,
         cancel: cancel.clone(),
         pid: pid.clone(),
+        precompiling: precompiling.clone(),
         started: Instant::now(),
         root: req.project_dir.join(&req.root_rel),
         live: true,
@@ -772,7 +815,32 @@ pub fn start_live(req: LiveRequest, tc: &Toolchain, wake: Arc<dyn Fn() + Send + 
             let tx = tx.clone();
             let wake = wake.clone();
             move || {
-                let outcome = run_live(&req, &tc, &tx, &wake, &cancel, &pid);
+                let process = LiveProcess {
+                    tx: &tx,
+                    wake: &wake,
+                    cancel: &cancel,
+                    pid_slot: &pid,
+                    precompiling: &precompiling,
+                };
+                let outcome = if recover {
+                    match live::recovery::reset(&req) {
+                        Ok(()) => {
+                            let mut clean = req.clone();
+                            clean.cache_preamble = false;
+                            let mut result = run_live_once(&clean, &tc, &process, true);
+                            result.recovery_attempted = true;
+                            result
+                        }
+                        Err(e) => Outcome {
+                            live: true,
+                            error: Some(trf!("cannot prepare the live preview: {e}", e = e)),
+                            ..Outcome::default()
+                        },
+                    }
+                } else {
+                    run_live(&req, &tc, &process)
+                };
+                precompiling.store(false, Ordering::SeqCst);
                 let _ = tx.send(JobEvent::Finished(Box::new(outcome)));
                 wake();
             }
@@ -819,17 +887,94 @@ fn xe_map(
     let _ = live::write_xe_map(cwd, &cfg, &map, &live::tfms_from_fls(&fls));
 }
 
-fn run_live(
+pub(crate) struct LiveProcess<'a> {
+    tx: &'a Sender<JobEvent>,
+    wake: &'a Arc<dyn Fn() + Send + Sync>,
+    cancel: &'a AtomicBool,
+    pid_slot: &'a Mutex<Option<u32>>,
+    precompiling: &'a AtomicBool,
+}
+
+impl LiveProcess<'_> {
+    /// Format building used to call Command::status without tracking its child. Neither Abort
+    /// nor the preview watchdog could stop a hung format, so every later edit waited forever.
+    fn build_format(&self, command: &mut Command, limit: Duration) -> bool {
+        if self.cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        *self.pid_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(child.id());
+        let started = Instant::now();
+        let success = loop {
+            if self.cancel.load(Ordering::SeqCst) || started.elapsed() >= limit {
+                kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+            }
+        };
+        *self.pid_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        success
+    }
+}
+
+fn run_live(req: &LiveRequest, tc: &Toolchain, process: &LiveProcess<'_>) -> Outcome {
+    let mut first = run_live_once(req, tc, process, false);
+    if first.success
+        || first.cancelled
+        || first.error.is_some()
+        || process.cancel.load(Ordering::SeqCst)
+    {
+        return first;
+    }
+    // A source error and a damaged generated file can look alike. One clean retry proves
+    // whether this was persistent cache state; the engine never retries the same stable
+    // source error indefinitely. Formats/maps/aux are only this root's generated copies.
+    if let Err(e) = live::recovery::reset(req) {
+        first.error = Some(trf!("cannot prepare the live preview: {e}", e = e));
+        return first;
+    }
+    let mut clean = req.clone();
+    clean.cache_preamble = false;
+    let mut result = run_live_once(&clean, tc, process, true);
+    result.duration = result.duration.saturating_add(first.duration);
+    result.recovery_attempted = true;
+    result
+}
+
+fn run_live_once(
     req: &LiveRequest,
     tc: &Toolchain,
-    tx: &Sender<JobEvent>,
-    wake: &Arc<dyn Fn() + Send + Sync>,
-    cancel: &AtomicBool,
-    pid_slot: &Mutex<Option<u32>>,
+    process: &LiveProcess<'_>,
+    recovering: bool,
 ) -> Outcome {
+    let (tx, wake, cancel, pid_slot) = (process.tx, process.wake, process.cancel, process.pid_slot);
+    process.precompiling.store(true, Ordering::SeqCst);
     let started = Instant::now();
-    let start_time = SystemTime::now();
     let live_dir = req.live_dir();
+    let pdf = live_dir.join(&req.root_rel).with_extension("pdf");
+    let pdf_stamp = || {
+        std::fs::metadata(&pdf)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()))
+    };
+    let pdf_before = pdf_stamp();
     let mut outcome = Outcome {
         live: true,
         mirror: Some(Mirror {
@@ -865,13 +1010,20 @@ fn run_live(
         }
     };
     let env = engine_env(tc, Some(live::search_path(&req.project_dir)));
-    let format = live::ensure_format(
+    let mut format = live::ensure_format(
         req,
         &root_text,
         tc,
         &env,
         cjk_fonts.as_deref().unwrap_or(""),
+        process,
     );
+    if cancel.load(Ordering::SeqCst) {
+        outcome.cancelled = true;
+        outcome.duration = started.elapsed();
+        return outcome;
+    }
+    process.precompiling.store(recovering, Ordering::SeqCst);
     if root_replaced && format.is_none() {
         // No format after all (the preamble loads system fonts, say): typeset the user's root.
         if let Err(e) = live::write_root(req, &root_text) {
@@ -902,9 +1054,9 @@ fn run_live(
     // Tectonic reruns the engine until these files settle by itself.
     let read_back_before =
         (req.engine != Engine::Tectonic).then(|| live::read_back_state(req, &cwd));
-    // Up to three attempts: fast pass, then normal passes when the fast environment or the
-    // reduced font map turned out to miss something.
-    for _attempt in 0..3 {
+    // One rejected-format recovery, then fast/normal/reduced-font-map recovery as before.
+    // Each fallback is bounded; a genuine source error never causes an endless retry loop.
+    for _attempt in 0..4 {
         let reduced = uses_map && local_map.is_file();
         // XeLaTeX passes always record the TFMs they read (to build xdvipdfmx's reduced map).
         let xe_reduced = uses_xetex && cwd.join(live::XE_CFG).is_file();
@@ -942,6 +1094,21 @@ fn run_live(
         outcome.fast_env = fast;
         if outcome.cancelled || outcome.error.is_some() {
             break;
+        }
+        if live::invalid_format(&outcome.console)
+            && let Some(rejected) = format.take()
+        {
+            live::discard_format(req, &rejected);
+            outcome.recovery_attempted = true;
+            // Xe/Lua cached-format variants are only valid with their format. The uncached
+            // retry must read the original source and use its normal pretex/CJK setup.
+            if root_replaced && let Err(e) = live::write_root(req, &root_text) {
+                outcome.error = Some(trf!("cannot prepare the live preview: {e}", e = e));
+                break;
+            }
+            outcome.preamble_cached = false;
+            fast = false;
+            continue;
         }
         if uses_xetex {
             if xe_reduced {
@@ -1005,13 +1172,9 @@ fn run_live(
     outcome.read_back_changed = !outcome.cancelled
         && read_back_before.is_some_and(|before| live::read_back_state(req, &cwd) != before);
     let out_dir = cwd;
-    let fresh = |p: &Path| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t + Duration::from_secs(1) >= start_time)
-    };
-    let pdf = out_dir.join(format!("{stem}.pdf"));
-    if pdf.is_file() && fresh(&pdf) {
+    // A failed engine can leave yesterday's PDF/log untouched. Timestamp tolerance used to
+    // accept a PDF from the previous second as this pass's output and hide that failure.
+    if pdf.is_file() && pdf_stamp() != pdf_before {
         outcome.pdf = Some(pdf);
         outcome.pdf_fresh = true;
     }
@@ -1037,7 +1200,11 @@ fn run_live(
         outcome.report = report;
         outcome.log_path = Some(log);
     }
-    outcome.success = !outcome.cancelled && outcome.pdf.is_some() && outcome.report.errors() == 0;
+    outcome.success = !outcome.cancelled
+        && outcome.error.is_none()
+        && outcome.exit_code == Some(0)
+        && outcome.pdf.is_some()
+        && outcome.report.errors() == 0;
     outcome
 }
 
@@ -1068,6 +1235,68 @@ fn spawn_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn format_build_deadlines_kill_the_child_and_clear_its_pid() {
+        let (tx, _rx) = channel();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let cancel = AtomicBool::new(false);
+        let pid = Mutex::new(None);
+        let preparing = AtomicBool::new(true);
+        let process = LiveProcess {
+            tx: &tx,
+            wake: &wake,
+            cancel: &cancel,
+            pid_slot: &pid,
+            precompiling: &preparing,
+        };
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let began = Instant::now();
+        assert!(!process.build_format(&mut command, Duration::from_millis(20)));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(pid.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_an_unfinished_job_terminates_its_process() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (_tx, rx) = channel();
+        let job = Job {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pid: Arc::new(Mutex::new(Some(child.id()))),
+            precompiling: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+            root: PathBuf::from("generated.tex"),
+            live: true,
+            finished: std::cell::Cell::new(false),
+        };
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stopped = false;
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(stopped, "closing the job left its child alive");
+    }
 
     fn tc() -> Toolchain {
         Toolchain {
@@ -1101,6 +1330,7 @@ mod tests {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
             pid: Arc::new(Mutex::new(None)),
+            precompiling: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
             root: "/proj/main.tex".into(),
             live: true,
@@ -1236,7 +1466,7 @@ mod tests {
         // changes nothing.
         let o = pass(req("Intro"));
         assert!(o.pdf.is_some() && o.read_back_changed, "{}", o.console);
-        assert!(dir.join(".texcraft/live/chapters/one.aux").is_file());
+        assert!(req("Intro").live_dir().join("chapters/one.aux").is_file());
         let o = pass(req("Intro"));
         assert_eq!(o.report.errors(), 0, "{:?}", o.report.issues);
         assert!(!o.read_back_changed);
@@ -1248,7 +1478,11 @@ mod tests {
         let o = pass(req("file_name"));
         assert!(o.read_back_changed && o.report.errors() > 0);
         let o = pass(req("file\\_name"));
-        assert!(o.read_back_changed && o.report.errors() > 0, "inherited");
+        assert!(
+            o.read_back_changed && o.success && o.recovery_attempted,
+            "the inherited broken contents must recover in the same request: {}",
+            o.console
+        );
         let o = pass(req("file\\_name"));
         assert!(!o.read_back_changed, "settled");
         assert_eq!(o.report.errors(), 0, "{:?}", o.report.issues);
@@ -1340,7 +1574,7 @@ mod tests {
             cache_preamble: true,
             pretex,
         };
-        let live = dir.join(".texcraft/live");
+        let live = req("", None).live_dir();
         let pass = |r: LiveRequest| start_live(r, &tc, Arc::new(|| {})).wait(|_| {});
         let mut times = Vec::new();
         for (i, body) in ["测试 one $a^2$", "测试 two $b^2$", "测试 three $c^2$"]
@@ -1432,7 +1666,7 @@ mod tests {
         assert!(o.pdf.is_some(), "{}", o.console);
         assert!(!o.preamble_cached);
         assert_eq!(
-            std::fs::read_to_string(dir.join(".texcraft/live/main.tex")).unwrap(),
+            std::fs::read_to_string(req(text.clone()).live_dir().join("main.tex")).unwrap(),
             text
         );
         std::fs::remove_dir_all(&dir).ok();

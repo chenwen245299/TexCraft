@@ -34,12 +34,24 @@ struct PageTexture {
     graded: bool,
 }
 
+struct Reload {
+    attempts: u8,
+    due: Instant,
+}
+
+const RELOAD_LIMIT: u8 = 2;
+const LOAD_WATCHDOG: Duration = Duration::from_secs(10);
+
 /// PDF viewer state.
 #[derive(Default)]
 pub struct PdfView {
     worker: Option<RenderWorker>,
     /// Session generation last opened.
     opened_generation: u64,
+    reload: Option<Reload>,
+    recovery_request: Option<u64>,
+    failed_generation: Option<u64>,
+    was_visible: bool,
     /// Document id whose page sizes we have.
     loaded_doc: u64,
     pages: Vec<PageSize>,
@@ -86,14 +98,52 @@ pub struct PdfView {
 impl PdfView {
     /// Opens the session's PDF if it changed.
     pub fn sync_document(&mut self, ctx: &egui::Context, session: &Session) {
+        let visible = self.window || session.view.layout != texcraft_engine::Layout::EditorOnly;
+        let became_visible = visible && !self.was_visible;
+        self.was_visible = visible;
         if self.worker.is_none() {
             let ctx = ctx.clone();
             self.worker = Some(RenderWorker::spawn(move || ctx.request_repaint()));
         }
         if session.pdf.generation == self.opened_generation {
-            return;
+            let Some(reload) = self.reload.as_mut() else {
+                return;
+            };
+            if !visible || became_visible {
+                reload.due = Instant::now() + LOAD_WATCHDOG;
+            }
+            if !visible {
+                return;
+            }
+            let wait = reload.due.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                ctx.request_repaint_after(wait);
+                return;
+            }
+            if reload.attempts >= RELOAD_LIMIT {
+                self.reload = None;
+                self.recovery_request = Some(self.opened_generation);
+                self.failed_generation = Some(self.opened_generation);
+                if self.error.is_none() {
+                    self.error = Some(tr("Preview could not be updated automatically").into());
+                }
+                return;
+            }
+            reload.attempts = reload.attempts.saturating_add(1);
+            // A dead/stuck worker or an old request cannot prevent retrying this generation.
+            let wake = ctx.clone();
+            self.worker = Some(RenderWorker::spawn(move || wake.request_repaint()));
+            self.requested.clear();
+            self.text_requested.clear();
+        } else {
+            self.opened_generation = session.pdf.generation;
+            self.reload = Some(Reload {
+                attempts: 0,
+                due: Instant::now() + LOAD_WATCHDOG,
+            });
+            self.recovery_request = None;
+            self.failed_generation = None;
         }
-        self.opened_generation = session.pdf.generation;
         let Some(path) = session.pdf.path.as_ref() else {
             // The pane was emptied (its PDF belonged to another document): no stale pages.
             self.loaded_doc = self.opened_generation;
@@ -105,6 +155,7 @@ impl PdfView {
             self.flash = None;
             self.error = None;
             self.current_page = 0;
+            self.reload = None;
             return;
         };
         match std::fs::read(path) {
@@ -133,6 +184,12 @@ impl PdfView {
                 }
                 self.edit_at = session.pdf.edit_at;
                 self.error = None;
+                if let Some(reload) = &mut self.reload {
+                    reload.due = Instant::now() + LOAD_WATCHDOG;
+                    if visible {
+                        ctx.request_repaint_after(LOAD_WATCHDOG);
+                    }
+                }
             }
             Err(e) => {
                 self.error = Some(trf!(
@@ -140,8 +197,27 @@ impl PdfView {
                     path = path.display(),
                     e = e
                 ));
+                self.retry_soon(ctx);
             }
         }
+    }
+
+    fn retry_soon(&mut self, ctx: &egui::Context) {
+        if self.failed_generation == Some(self.opened_generation) {
+            return;
+        }
+        let reload = self.reload.get_or_insert(Reload {
+            attempts: 0,
+            due: Instant::now(),
+        });
+        reload.due = Instant::now() + Duration::from_millis(100);
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    /// A compiled generation still failed after bounded local reloads. The engine may use
+    /// its own per-source recovery budget to rebuild automatically, without a user action.
+    pub fn take_recovery_request(&mut self) -> Option<u64> {
+        self.recovery_request.take()
     }
 
     /// Scrolls to and optionally flashes SyncTeX rectangles.
@@ -165,15 +241,17 @@ impl PdfView {
     }
 
     fn poll(&mut self, ctx: &egui::Context, dark_grade: bool) {
-        let Some(worker) = &self.worker else { return };
-        while let Some(ev) = worker.try_recv() {
+        while let Some(ev) = self.worker.as_ref().and_then(RenderWorker::try_recv) {
             match ev {
                 RenderEvent::Opened { doc, pages } => {
                     if doc == self.opened_generation {
                         self.loaded_doc = doc;
                         self.pages = pages;
+                        self.current_page =
+                            self.current_page.min(self.pages.len().saturating_sub(1));
                         // Keep the prefetched requests for this document.
-                        self.requested.retain(|_, (_, d)| *d == doc);
+                        self.requested
+                            .retain(|page, (_, d)| *d == doc && *page < self.pages.len());
                         self.error = None;
                     }
                 }
@@ -187,6 +265,12 @@ impl PdfView {
                             self.latency = Some(at.elapsed());
                         }
                         self.requested.remove(&r.page);
+                        if r.doc == self.opened_generation
+                            && self.requested.values().all(|(_, doc)| *doc != r.doc)
+                        {
+                            self.reload = None;
+                            self.error = None;
+                        }
                         let page = r.page;
                         let scale = r.scale;
                         let doc = r.doc;
@@ -220,10 +304,19 @@ impl PdfView {
                     }
                 }
                 RenderEvent::Failed { doc, page, error } => {
-                    if doc == self.opened_generation && page.is_none() {
-                        self.error = Some(error.to_string());
+                    if page.is_some_and(|p| p >= self.pages.len()) {
+                        if let Some(p) = page {
+                            self.requested.remove(&p);
+                        }
+                        continue;
                     }
-                    if let Some(p) = page {
+                    if doc == self.opened_generation {
+                        self.error = Some(error.to_string());
+                        self.retry_soon(ctx);
+                    }
+                    if doc != self.opened_generation
+                        && let Some(p) = page
+                    {
                         self.requested.remove(&p);
                     }
                 }
@@ -431,6 +524,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
 
     if view.pages.is_empty() {
         empty_state(ui, t, session, view, body);
+        recovery_notice(ui, t, session, view, body);
         return;
     }
 
@@ -839,6 +933,52 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
         let doc = view.loaded_doc;
         view.text_requested
             .retain(|&(d, k)| d == doc && (near(k) || view.texts.contains_key(&k)));
+    }
+    recovery_notice(ui, t, session, view, body);
+}
+
+fn recovery_notice(ui: &mut Ui, t: &Tokens, session: &Session, view: &PdfView, body: Rect) {
+    let message = if view.error.is_some() {
+        Some(if view.reload.is_some() {
+            tr("Recovering preview…")
+        } else {
+            tr("Preview could not be updated automatically")
+        })
+    } else if !session.typeset.is_running()
+        && session.live_behind()
+        && session
+            .typeset
+            .last
+            .as_ref()
+            .is_some_and(|last| !last.success && !last.cancelled)
+    {
+        Some(tr("Preview is out of date"))
+    } else {
+        None
+    };
+    let Some(message) = message else {
+        return;
+    };
+    let gap = ui.spacing().item_spacing;
+    let galley = ui.painter().layout(
+        message.into(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        t.text_weak,
+        (body.width() - gap.x * 2.0).max(1.0),
+    );
+    let notice = Rect::from_min_size(body.min, vec2(body.width(), galley.size().y + gap.y * 2.0));
+    ui.painter().rect_filled(notice, 0.0, t.pdf_bg);
+    ui.painter().galley(
+        pos2(
+            notice.center().x - galley.size().x / 2.0,
+            notice.top() + gap.y,
+        ),
+        galley,
+        t.text_weak,
+    );
+    if let Some(error) = &view.error {
+        ui.interact(notice, Id::new("pdf-recovery-notice"), Sense::hover())
+            .on_hover_text(error);
     }
 }
 
@@ -1433,6 +1573,11 @@ fn sep(p: &egui::Painter, t: &Tokens, x: f32, cy: f32) {
 }
 
 impl PdfView {
+    /// Document generation actually displayed for 0-based `page`, not merely queued to render.
+    pub fn rendered_generation(&self, page: usize) -> Option<u64> {
+        self.textures.get(&page).map(|texture| texture.doc)
+    }
+
     /// For tests and the control channel: which pages have textures.
     pub fn rendered_pages(&self) -> Vec<usize> {
         let mut v: Vec<usize> = self.textures.keys().copied().collect();
@@ -1459,6 +1604,64 @@ impl PdfView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pdf_reads_and_invalid_bytes_reload_automatically_without_a_new_generation() {
+        for invalid_bytes in [false, true] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut session = Session::empty(Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            let path = std::env::temp_dir().join(format!(
+                "texcraft-reload-{}-{invalid_bytes}.pdf",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            if invalid_bytes {
+                std::fs::write(&path, b"partial PDF").unwrap();
+            }
+            session.show_pdf(path.clone());
+            let generation = session.pdf.generation;
+            let mut view = PdfView::default();
+            let frame = |view: &mut PdfView, session: &mut Session| {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 500.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        view.sync_document(ui.ctx(), session);
+                        show(ui, &Tokens::light(), session, view);
+                    },
+                );
+                out.textures_delta.clear();
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while view.error.is_none() && Instant::now() < deadline {
+                frame(&mut view, &mut session);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(view.error.is_some());
+            let bytes = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../pdf/tests/data/select-en.pdf"),
+            )
+            .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while view.rendered_generation(0) != Some(generation) && Instant::now() < deadline {
+                frame(&mut view, &mut session);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                view.rendered_generation(0),
+                Some(generation),
+                "failed PDF load never retried"
+            );
+            assert!(view.error.is_none());
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn grading_maps_paper_and_ink() {

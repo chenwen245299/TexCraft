@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 use std::time::{Duration, Instant};
+use texcraft_project::Typesetter;
 
 fn session() -> Session {
     let mut s = Session::new(Arc::new(|| {}));
@@ -1891,6 +1892,9 @@ fn live_mode_typesets_edited_projects_in_full_now_and_then() {
     s.live_paused = true;
     assert!(s.tick_full(late).is_none() && !s.typeset.is_running());
     s.live_paused = false;
+    // The explicit LIVE choice now schedules the unsaved revision immediately. This test
+    // isolates the later periodic full-build timer after that preview has caught up.
+    s.typeset.live_due = None;
     // Due, but the user typed a moment ago: it waits for a pause in typing.
     s.typeset.last_edit_at = Some(t0 + FULL_TYPESET_EVERY);
     let wait = s.tick_full(t0 + FULL_TYPESET_EVERY + Duration::from_secs(1));
@@ -2221,6 +2225,118 @@ fn a_live_pass_that_hangs_gives_way_to_newer_edits() {
     );
 }
 
+#[test]
+fn a_new_edit_cancels_a_stuck_precompiled_preamble_and_recovers_automatically() {
+    let Some((mut s, _)) = live_contents_project("live-precompile-stuck") else {
+        return;
+    };
+    let bad = "\\documentclass{article}\n\\def\\forever{\\forever}\\forever\n\\begin{document}\nBody.\n\\end{document}\n";
+    s.run("edit.setText", &json!({"text": bad})).unwrap();
+    s.tick(Instant::now());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !s
+        .typeset
+        .job
+        .as_ref()
+        .is_some_and(|job| job.is_precompiling() && job.process_id().is_some())
+        && Instant::now() < deadline
+    {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        s.typeset.job.as_ref().unwrap().process_id().is_some(),
+        "the real precompiler started"
+    );
+    assert!(s.typeset.job.as_ref().unwrap().is_precompiling());
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Recovered preamble")}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.typeset.is_busy() && Instant::now() < deadline {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_preview_current(&s);
+}
+
+#[test]
+fn an_unqueued_last_keystroke_timeout_repairs_once_and_never_restarts_forever() {
+    let Some((mut s, _)) = live_contents_project("live-last-keystroke-stuck") else {
+        return;
+    };
+    let bad = contents_doc("Intro").replace("Body text.", "\\def\\forever{\\forever}\\forever");
+    s.run("edit.setText", &json!({"text": bad})).unwrap();
+    s.live_typeset().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s
+        .typeset
+        .job
+        .as_ref()
+        .is_some_and(|job| job.process_id().is_none())
+        && Instant::now() < deadline
+    {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!s.typeset.queued_live);
+    let began = s.typeset.job.as_ref().unwrap().started;
+    s.tick(began + crate::full::LIVE_STUCK.saturating_mul(3) + Duration::from_secs(1));
+    assert!(s.typeset.recovery_pending && s.typeset.queued_live);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s
+        .typeset
+        .job
+        .as_ref()
+        .is_some_and(|job| job.started == began || job.process_id().is_none())
+        && Instant::now() < deadline
+    {
+        s.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let retry = s.typeset.job.as_ref().unwrap().started;
+    assert_ne!(retry, began);
+    s.tick(retry + crate::full::LIVE_STUCK.saturating_mul(3) + Duration::from_secs(1));
+    until_idle(&mut s);
+    let runs = s.typeset.runs;
+    for _ in 0..20 {
+        s.tick(Instant::now());
+    }
+    assert_eq!(s.typeset.runs, runs);
+    assert!(s.live_behind() && !s.typeset.is_busy());
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Healthy again")}),
+    )
+    .unwrap();
+    until_idle(&mut s);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn renderer_feedback_gets_one_automatic_rebuild_per_source_revision() {
+    let Some((mut s, _)) = live_contents_project("live-render-recovery") else {
+        return;
+    };
+    let generation = s.pdf.generation;
+    assert!(s.recover_preview());
+    until_idle(&mut s);
+    assert!(s.pdf.generation > generation && s.typeset.recoveries > 0);
+    assert_preview_current(&s);
+    assert!(
+        !s.recover_preview(),
+        "the same render failure must not rebuild forever"
+    );
+    s.run("edit.setText", &json!({"text": contents_doc("New source")}))
+        .unwrap();
+    until_idle(&mut s);
+    assert!(s.recover_preview());
+    until_idle(&mut s);
+    assert_preview_current(&s);
+}
+
 /// What a finished typeset of `root` that produced `pdf` does to the PDF pane.
 fn finish_with_pdf(s: &mut Session, root: &Path, pdf: &Path, live: bool) {
     s.typeset.root = Some(root.to_path_buf());
@@ -2381,7 +2497,9 @@ fn the_live_preview_settles_its_table_of_contents() {
     let Some((mut s, main)) = live_contents_project("live-settle") else {
         return;
     };
-    let live_toc = main.parent().unwrap().join(".texcraft/live/main.toc");
+    let live_toc =
+        texcraft_typeset::live::recovery::cache_dir(main.parent().unwrap(), Path::new("main.tex"))
+            .join("main.toc");
     assert!(s.typeset.runs >= 2, "the pass after opening is settled");
     assert_preview_current(&s);
     s.run("edit.setText", &json!({"text": contents_doc("Renamed")}))
@@ -2494,6 +2612,107 @@ fn a_stopped_live_pass_waits_for_the_next_edit() {
     s.run("edit.setText", &json!({"text": contents_doc("Typed on")}))
         .unwrap();
     until_idle(&mut s);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn selecting_live_explicitly_retries_a_stopped_revision() {
+    let Some((mut s, _)) = live_contents_project("live-restart-stopped") else {
+        return;
+    };
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Retry this revision")}),
+    )
+    .unwrap();
+    s.live_typeset().unwrap();
+    s.stop_typeset();
+    until_idle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().cancelled);
+    assert!(s.live_behind());
+    s.run("typeset.mode.live", &Value::Null).unwrap();
+    until_idle(&mut s);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn pausing_defers_queued_edits_and_resuming_catches_up() {
+    let Some((mut s, _)) = live_contents_project("live-pause-queue") else {
+        return;
+    };
+    let runs = s.typeset.runs;
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Already running")}),
+    )
+    .unwrap();
+    s.live_typeset().unwrap();
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Queued while running")}),
+    )
+    .unwrap();
+    assert!(s.typeset.queued_live);
+    s.run("typeset.pauseLive", &Value::Null).unwrap();
+    until_idle(&mut s);
+    assert_eq!(
+        s.typeset.runs,
+        runs + 1,
+        "paused preview started a queued pass"
+    );
+    assert!(s.live_behind());
+    s.run("typeset.pauseLive", &Value::Null).unwrap();
+    until_idle(&mut s);
+    assert_preview_current(&s);
+}
+
+#[test]
+fn stopping_a_live_pass_also_stops_its_queued_successor() {
+    let Some((mut s, _)) = live_contents_project("live-stop-queue") else {
+        return;
+    };
+    let runs = s.typeset.runs;
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Stop running")}),
+    )
+    .unwrap();
+    s.live_typeset().unwrap();
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Stop queued too")}),
+    )
+    .unwrap();
+    assert!(s.typeset.queued_live);
+    s.stop_typeset();
+    until_idle(&mut s);
+    assert_eq!(
+        s.typeset.runs,
+        runs + 1,
+        "stopping restarted the queued pass"
+    );
+    assert!(s.live_behind());
+}
+
+#[test]
+fn changing_the_engine_retries_a_failed_revision_without_another_text_edit() {
+    let Some((mut s, _)) = live_contents_project("live-engine-recovery") else {
+        return;
+    };
+    s.settings.auto_sense = false;
+    s.settings.engine = Engine::Tectonic;
+    s.toolchain.tectonic = None;
+    s.run(
+        "edit.setText",
+        &json!({"text": contents_doc("Engine recovered")}),
+    )
+    .unwrap();
+    until_idle(&mut s);
+    assert!(s.typeset.last.as_ref().unwrap().error.is_some());
+    let revision = s.doc().unwrap().revision;
+    s.run("typeset.engine.pdflatex", &Value::Null).unwrap();
+    until_idle(&mut s);
+    assert_eq!(s.doc().unwrap().revision, revision);
     assert_preview_current(&s);
 }
 

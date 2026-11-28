@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use texcraft_i18n::{Lang, tr, trf};
 use texcraft_log::{Issue, Severity};
-use texcraft_project::{Engine, FileKind, FileNode, Settings, Typesetter, find_root};
+use texcraft_project::{Engine, FileKind, FileNode, Settings, find_root};
 use texcraft_synctex::{PdfRect, SyncTex};
 use texcraft_typeset::{Job, JobEvent, Mirror, Outcome, Request, Toolchain};
 
@@ -61,7 +61,7 @@ pub struct Document {
     pub revision: u64,
     /// `revision` when last saved or loaded.
     pub saved_revision: u64,
-    /// The revision the PDF preview has typeset: a finished live pass over this buffer, or a
+    /// The revision the PDF preview has typeset successfully: a live pass over this buffer, or a
     /// full typeset of the saved file. In LIVE mode the engine typesets again whenever it falls
     /// behind `revision` (see [`live`]).
     pub typeset_revision: u64,
@@ -609,6 +609,8 @@ pub struct TypesetState {
     pub queued: bool,
     /// Run a live pass as soon as the current run ends.
     pub queued_live: bool,
+    /// Explicit Abort suppresses preview catch-up until a new edit or explicit resume.
+    pub(crate) preview_stopped: bool,
     /// The running job is a live-preview pass (a full typeset started meanwhile replaces it).
     pub live_job: bool,
     /// Duration of the last live pass.
@@ -660,6 +662,13 @@ pub struct TypesetState {
     /// What the last live pass started from (see [`live`]): one that failed or was stopped is
     /// not started again until something changes.
     pub(crate) last_attempt: Option<u64>,
+    /// Bounded automatic repair: at most one watchdog/renderer rebuild for a source stamp.
+    pub(crate) recovery_stamp: Option<u64>,
+    pub(crate) recovery_pending: bool,
+    /// Last observed compiler output (real time), used to distinguish slow progress from a hang.
+    pub(crate) last_output_at: Option<Instant>,
+    /// Successful automatic cache/preview recoveries.
+    pub recoveries: u64,
     /// Typesetting before quitting.
     pub quit: QuitTypeset,
 }
@@ -1418,33 +1427,9 @@ impl Session {
         self.inline_after_edit();
     }
 
-    fn schedule_live(&mut self) {
-        if !self.settings.live_typeset || self.live_paused || self.typeset.quit != QuitTypeset::Idle
-        {
-            return;
-        }
-        // Remember when the first edit not yet in the PDF happened (for the latency readout).
-        self.typeset
-            .pending_edit_at
-            .get_or_insert_with(Instant::now);
-        if self.settings.typesetter == Typesetter::External {
-            // Full typesets start when typing pauses.
-            let pause = u64::from(self.settings.live_delay_ms).max(800);
-            self.typeset.live_due = Some(Instant::now() + Duration::from_millis(pause));
-        } else if self.typeset.is_running() {
-            // A quiet bibliography refresh gives way; otherwise exactly one more pass right
-            // after the current one: back-to-back while typing.
-            self.yield_bibliography();
-            self.typeset.queued_live = true;
-        } else {
-            self.typeset.live_due = Some(
-                Instant::now() + Duration::from_millis(u64::from(self.settings.live_delay_ms)),
-            );
-        }
-    }
-
     /// Starts typesetting the active document's root (queues if a run is in progress).
     pub fn typeset(&mut self) -> Result<(), CommandError> {
+        self.typeset.preview_stopped = false;
         self.typeset.live_due = None;
         if self.typeset.is_running() {
             self.typeset.queued = true;
@@ -1557,63 +1542,17 @@ impl Session {
         Ok(())
     }
 
-    /// Starts a live-preview pass over the unsaved buffers (never saves anything).
-    pub fn live_typeset(&mut self) -> Result<(), CommandError> {
-        self.start_live(false)
-    }
-
-    /// Starts a live pass (queues one if a run is in progress). `settle`: a pass over text the
-    /// last pass already typeset, because that pass rewrote files the next one reads back.
-    pub(crate) fn start_live(&mut self, settle: bool) -> Result<(), CommandError> {
-        if self.typeset.is_running() {
-            self.typeset.queued_live = true;
-            return Ok(());
-        }
-        let root = self
-            .root_path()
-            .ok_or_else(|| CommandError::Failed(tr("nothing to typeset").into()))?;
-        let root = texcraft_project::normalize(&root);
-        let project_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
-        let inputs = self.live_buffers(&project_dir);
-        self.typeset.last_attempt = Some(self.live_stamp(&root, &inputs));
-        let req = self.preview_request(&root)?;
-        self.typeset.console.clear();
-        self.typeset.root = Some(root);
-        self.typeset.job_revisions = inputs
-            .iter()
-            .filter_map(|(i, _)| {
-                let d = self.docs.get(*i)?;
-                Some((texcraft_project::normalize(d.typeset_path()?), d.revision))
-            })
-            .collect();
-        self.typeset.settle_passes = if settle {
-            self.typeset.settle_passes.saturating_add(1)
-        } else {
-            0
-        };
-        self.typeset.job_edit_at = self.typeset.pending_edit_at.take();
-        self.typeset.live_job = true;
-        self.typeset.background = false;
-        self.typeset.bibliography_job = false;
-        self.typeset.quit_job = false;
-        self.typeset.job_was_stale = false;
-        self.typeset.job = Some(texcraft_typeset::start_live(
-            req,
-            &self.toolchain,
-            self.waker.clone(),
-        ));
-        Ok(())
-    }
-
     /// Stops the running typeset. The quiet bibliography refresh (nothing shows it running)
     /// is not what ⌘. means: it stops too, but runs again at the next pause instead of being
     /// forgotten until the next edit.
     pub fn stop_typeset(&mut self) {
         self.typeset.queued = false;
-        self.typeset.live_due = None;
+        self.cancel_pending_preview();
+        self.typeset.live_dropped = false;
         if self.drop_bibliography_job(true) {
             return;
         }
+        self.typeset.preview_stopped = true;
         if let Some(job) = &self.typeset.job {
             job.cancel();
         }
@@ -1644,6 +1583,9 @@ impl Session {
         let mut finished = None;
         if let Some(job) = &self.typeset.job {
             while let Some(ev) = job.try_recv() {
+                if matches!(ev, JobEvent::Output(_)) {
+                    self.typeset.last_output_at = Some(Instant::now());
+                }
                 match ev {
                     // Another project's output (one closed earlier, rebuilt on quitting) stays
                     // out of this window's log.
@@ -1687,49 +1629,15 @@ impl Session {
                 if let Err(e) = self.typeset() {
                     self.set_status(e.to_string());
                 }
-            } else if self.typeset.queued_live {
-                self.typeset.queued_live = false;
-                if let Err(e) = self.live_typeset() {
-                    self.set_status(e.to_string());
-                }
+            } else {
+                self.run_queued_preview();
             }
             // The last tab closed while it ran: its root belongs to no document here any more.
             if self.typeset.job.is_none() && self.docs.is_empty() {
                 self.typeset.root = None;
             }
         }
-        self.watch_live(now);
-        // Live typesetting. A pending bibliography refresh never holds it up: it runs once the
-        // preview has caught up (below).
-        let mut live_wait = None;
-        if let Some(due) = self.typeset.live_due {
-            if !self.settings.live_typeset || self.live_paused {
-                self.typeset.live_due = None;
-            } else if now >= due {
-                self.typeset.live_due = None;
-                let external = self.settings.typesetter == Typesetter::External;
-                if self.typeset.is_running() {
-                    if external {
-                        self.typeset.queued = true;
-                    } else {
-                        self.typeset.queued_live = true;
-                    }
-                } else {
-                    let started = if external {
-                        self.typeset()
-                    } else {
-                        self.live_typeset()
-                    };
-                    if let Err(e) = started {
-                        self.set_status(e.to_string());
-                    }
-                }
-            } else {
-                live_wait = Some(due.saturating_duration_since(now));
-            }
-        }
-        // LIVE mode: the preview catches up with edits no finished pass typeset, and settles.
-        self.keep_live_current();
+        let live_wait = self.tick_live(now);
         // Then quiet bibliography work, when nothing else runs or waits.
         let bibliography_wait = self.tick_bibliography(now);
         // Full typesets TexCraft starts by itself (LIVE mode, quitting).
@@ -1742,29 +1650,6 @@ impl Session {
             .chain(full_wait)
             .chain(bibliography_wait)
             .min()
-    }
-
-    /// A live pass that hangs, or runs far longer than usual, while newer edits wait is stopped:
-    /// the next pass typesets them (otherwise every later edit would wait behind it).
-    fn watch_live(&mut self, now: Instant) {
-        let usual = self
-            .typeset
-            .last_live
-            .map_or(Duration::ZERO, |d| d.saturating_mul(4));
-        let stuck = self.typeset.live_job
-            && self.typeset.queued_live
-            && !self.typeset.live_dropped
-            && self.typeset.job.as_ref().is_some_and(|job| {
-                now.saturating_duration_since(job.started) >= full::LIVE_STUCK.max(usual)
-            });
-        if !stuck {
-            return;
-        }
-        if let Some(job) = &self.typeset.job {
-            job.cancel();
-        }
-        self.typeset.live_dropped = true;
-        self.set_status(tr("A live preview pass took too long and was restarted"));
     }
 
     fn finish_typeset(&mut self, outcome: Outcome) {
@@ -2255,6 +2140,8 @@ impl Session {
                 "active": i == self.active,
                 "chars": d.text.chars().count(),
                 "selection": d.selection,
+                "revision": d.revision,
+                "typesetRevision": d.typeset_revision,
             })).collect::<Vec<_>>(),
             "project": self.project_dir,
             "root": self.root_path(),
@@ -2276,6 +2163,7 @@ impl Session {
             "typeset": {
                 "mode": self.settings.mode().name(),
                 "paused": self.live_paused,
+                "stopped": self.typeset.preview_stopped,
                 "running": self.typeset.is_running(),
                 "live": self.typeset.live_job && self.typeset.is_running(),
                 "lastLive": self.typeset.last.as_ref().map(|o| o.live),
@@ -2284,6 +2172,10 @@ impl Session {
                 "warnings": warnings,
                 "badBoxes": bad_boxes,
                 "success": self.typeset.last.as_ref().map(|o| o.success),
+                "exitCode": self.typeset.last.as_ref().and_then(|o| o.exit_code),
+                "preambleCached": self.typeset.last.as_ref().map(|o| o.preamble_cached),
+                "automaticRecoveries": self.typeset.recoveries,
+                "recoveryPending": self.typeset.recovery_pending,
                 "seconds": self.typeset.last.as_ref().map(|o| o.duration.as_secs_f32()),
                 "fastEnv": self.typeset.last.as_ref().map(|o| o.fast_env),
                 "latencyMs": self.typeset.last_latency.map(|d| d.as_millis() as u64),

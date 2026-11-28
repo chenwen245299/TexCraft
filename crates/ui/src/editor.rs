@@ -1535,6 +1535,14 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
 
     // ---- Keys we handle before the text widget sees them.
     let mut pushed = st.push_selection.take() == Some(active);
+    // TextEdit scrolls to the primary cursor on any selection change. Select All puts that
+    // cursor at EOF, but should leave the user's view in place. Set its range before it runs,
+    // without treating this as an edit/navigation that needs to reveal the caret.
+    let select_all = has_focus && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A));
+    if select_all {
+        session.inline_dismiss();
+        st.completion = None;
+    }
     // An inline AI suggestion: Tab inserts it, ⌘→ its next sentence, Esc drops it.
     if has_focus && st.completion.is_none() && session.inline_suggestion().is_some() {
         let (tab, sentence, esc) = ui.input_mut(|i| {
@@ -1628,13 +1636,21 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
 
     // ---- Push the session's selection into the widget (after commands edited the text).
     let reveal = st.reveal.filter(|(d, _)| *d == active);
-    if (pushed || reveal.is_some())
+    if (pushed || reveal.is_some() || select_all)
         && let Some(doc) = session.docs.get(active)
     {
         let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+        let selection = if select_all {
+            Selection {
+                anchor: 0,
+                cursor: doc.text.chars().count(),
+            }
+        } else {
+            doc.selection
+        };
         state.cursor.set_char_range(Some(CCursorRange::two(
-            CCursor::new(doc.selection.anchor),
-            CCursor::new(doc.selection.cursor),
+            CCursor::new(selection.anchor),
+            CCursor::new(selection.cursor),
         )));
         state.store(ui.ctx(), id);
     }
@@ -2084,7 +2100,9 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                 output_galley = Some((galley, gpos));
                 // Explicit navigation centers its line. Session edits (Smart Return, indent,
                 // completion, etc.) move the cursor before TextEdit can notice a change, so
-                // reveal that caret ourselves, scrolling only as far as necessary.
+                // reveal that caret ourselves, scrolling only as far as necessary. Replacing
+                // a long selection can also leave the shrunken TextEdit entirely offscreen,
+                // where it skips its own scroll request.
                 if let Some((_, line)) = reveal {
                     let ci = edit::char_of_line(&doc.text, line);
                     let r = out
@@ -2096,7 +2114,9 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                         Some(Align::Center),
                         navigation,
                     );
-                } else if pushed && let Some(caret) = caret_row_y {
+                } else if (pushed || changed)
+                    && let Some(caret) = caret_row_y
+                {
                     ui.scroll_to_rect(caret, None);
                 }
             });
@@ -2490,6 +2510,217 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Select All changes the range without moving either scroll axis, including when the
+    /// caret is far from the end. Copy and the next navigation/edit still use the whole range.
+    #[test]
+    fn select_all_preserves_the_view_and_subsequent_edits_reveal_the_caret() {
+        for lang in [texcraft_i18n::Lang::En, texcraft_i18n::Lang::ZhHans] {
+            let _language = texcraft_i18n::scoped(lang);
+            for wrap in [true, false] {
+                for line in [1, 60] {
+                    let ctx = egui::Context::default();
+                    crate::theme::install_fonts(&ctx);
+                    let mut session = Session::new(Arc::new(|| {}));
+                    session.settings.live_typeset = false;
+                    session.view.wrap_lines = wrap;
+                    session.view.spellcheck = false;
+                    session.view.auto_complete = false;
+                    let text: String = (1..=120)
+                        .map(|n| format!("Line {n}: {}中文🙂\n", "some LaTeX source ".repeat(8)))
+                        .collect();
+                    session
+                        .run("edit.setText", &serde_json::json!({"text": text}))
+                        .unwrap();
+                    let at = edit::char_of_line(&text, line) + if line == 1 { 0 } else { 100 };
+                    session.doc_mut().unwrap().selection = Selection::caret(at);
+                    let id = editor_id(session.doc().and_then(|d| d.typeset_path()));
+                    let mut st = EditorState {
+                        focus: true,
+                        push_selection: Some(0),
+                        ..Default::default()
+                    };
+                    let mut time = 0.0;
+                    let mut frame = |session: &mut Session, st: &mut EditorState, events| {
+                        time += 1.0 / 60.0;
+                        let mut clip = Rect::NOTHING;
+                        let mut out = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    vec2(420.0, 240.0),
+                                )),
+                                time: Some(time),
+                                events,
+                                ..Default::default()
+                            },
+                            |ui| {
+                                clip = ui.clip_rect();
+                                text_area(ui, &Tokens::light(), session, st, 0);
+                            },
+                        );
+                        out.textures_delta.clear();
+                        (
+                            ctx.read_response(id).unwrap().rect.min,
+                            clip,
+                            out.platform_output,
+                        )
+                    };
+                    let key = |key, modifiers| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    };
+                    for _ in 0..30 {
+                        frame(&mut session, &mut st, Vec::new());
+                    }
+                    let (origin, _, _) = frame(&mut session, &mut st, Vec::new());
+                    if line > 1 {
+                        assert!(origin.y < -240.0, "test starts partway down the document");
+                        if !wrap {
+                            assert!(origin.x < 0.0, "test also starts horizontally scrolled");
+                        }
+                    }
+                    for _ in 0..2 {
+                        frame(&mut session, &mut st, vec![key(Key::A, Modifiers::COMMAND)]);
+                        assert_eq!(
+                            session.doc().unwrap().selection,
+                            Selection {
+                                anchor: 0,
+                                cursor: text.chars().count(),
+                            }
+                        );
+                        for _ in 0..30 {
+                            let (now, _, _) = frame(&mut session, &mut st, Vec::new());
+                            assert_eq!(
+                                now, origin,
+                                "{lang:?}, wrap={wrap}, line={line}: Select All moved the view"
+                            );
+                        }
+                    }
+                    let (_, _, copied) = frame(&mut session, &mut st, vec![egui::Event::Copy]);
+                    assert!(
+                        copied
+                            .commands
+                            .contains(&egui::OutputCommand::CopyText(text.clone()))
+                    );
+                    frame(
+                        &mut session,
+                        &mut st,
+                        vec![key(Key::ArrowRight, Modifiers::NONE)],
+                    );
+                    frame(&mut session, &mut st, Vec::new());
+                    let (_, clip, _) = frame(&mut session, &mut st, Vec::new());
+                    assert_eq!(
+                        session.doc().unwrap().selection,
+                        Selection::caret(text.chars().count())
+                    );
+                    let caret = st.caret_rect.unwrap();
+                    assert!(
+                        caret.top() >= clip.top() && caret.bottom() <= clip.bottom(),
+                        "{lang:?}, wrap={wrap}, line={line}: navigation caret {caret:?} outside {clip:?}"
+                    );
+
+                    // A replacement after Select All must replace the whole document and
+                    // reveal the new caret near the start, even from a view at the bottom.
+                    frame(&mut session, &mut st, vec![key(Key::A, Modifiers::COMMAND)]);
+                    frame(
+                        &mut session,
+                        &mut st,
+                        vec![egui::Event::Text("new 中文🙂".into())],
+                    );
+                    frame(&mut session, &mut st, Vec::new());
+                    let (_, clip, _) = frame(&mut session, &mut st, Vec::new());
+                    assert_eq!(session.doc().unwrap().text, "new 中文🙂");
+                    assert_eq!(session.doc().unwrap().selection, Selection::caret(7));
+                    let caret = st.caret_rect.unwrap();
+                    assert!(
+                        caret.top() >= clip.top() && caret.bottom() <= clip.bottom(),
+                        "replacement reveals the caret"
+                    );
+                    frame(&mut session, &mut st, vec![key(Key::A, Modifiers::COMMAND)]);
+                    frame(
+                        &mut session,
+                        &mut st,
+                        vec![key(Key::Backspace, Modifiers::NONE)],
+                    );
+                    frame(&mut session, &mut st, Vec::new());
+                    let (_, clip, _) = frame(&mut session, &mut st, Vec::new());
+                    assert!(session.doc().unwrap().text.is_empty());
+                    assert_eq!(session.doc().unwrap().selection, Selection::caret(0));
+                    let caret = st.caret_rect.unwrap();
+                    assert!(
+                        caret.top() >= clip.top() && caret.bottom() <= clip.bottom(),
+                        "deletion reveals the caret"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_all_stays_with_the_focused_text_field() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut session = Session::new(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session
+            .run("edit.setText", &serde_json::json!({"text": "editor text"}))
+            .unwrap();
+        session.doc_mut().unwrap().selection = Selection::caret(3);
+        let mut st = EditorState {
+            push_selection: Some(0),
+            ..Default::default()
+        };
+        let other_id = Id::new("select-all-other-field");
+        let mut other_text = String::from("other field");
+        let mut frame = |events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 500.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut editor = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 500.0))),
+                    );
+                    text_area(&mut editor, &Tokens::light(), &mut session, &mut st, 0);
+                    let mut other = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(Rect::from_min_size(pos(700.0, 100.0), vec2(180.0, 50.0))),
+                    );
+                    egui::TextEdit::singleline(&mut other_text)
+                        .id(other_id)
+                        .show(&mut other);
+                },
+            );
+            out.textures_delta.clear();
+        };
+        frame(Vec::new());
+        ctx.memory_mut(|m| m.request_focus(other_id));
+        frame(Vec::new());
+        frame(vec![egui::Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }]);
+        let range = egui::TextEdit::load_state(&ctx, other_id)
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!(
+            range.sorted_cursors().map(|c| c.index.0),
+            [0, other_text.chars().count()]
+        );
+        assert_eq!(session.doc().unwrap().selection, Selection::caret(3));
+    }
 
     #[test]
     fn completion_closes_when_the_caret_moves_or_editor_loses_focus() {

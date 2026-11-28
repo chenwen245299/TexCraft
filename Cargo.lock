@@ -4239,6 +4239,7 @@ dependencies = [
  "texcraft-spell",
  "texcraft-synctex",
  "texcraft-syntax",
+ "texcraft-typeset",
 ]
 
 [[package]]

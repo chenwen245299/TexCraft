@@ -153,7 +153,9 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
    keystroke-to-pixels latency (`state.inspect` → `typeset.latencyMs`).
 2. `LiveRequest` carries the text of every open buffer inside the project (relative paths), the
    folders holding project files, and the engine.
-3. `live::prepare_mirror` writes the buffers into `<project>/.texcraft/live/` (only when changed),
+3. `live::prepare_mirror` writes the buffers into `<project>/.texcraft/live/root-<hash>/`
+   (only when changed). Each root has its own manifest, formats and generated files, including
+   when multiple roots share a folder. It
    deletes mirror copies of closed buffers, copies the root if it is not open and the `.bbl` of the
    last full typeset. Everything else is found through `TEXINPUTS=.:<project>:`.
 4. pdfLaTeX: `ensure_format` precompiles the preamble with `mylatexformat` into
@@ -174,8 +176,9 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
 8. If the pass has errors and a previous PDF exists, the PDF is kept (setting `live_keep_good`);
    otherwise the viewer reopens it, keeping the old page textures until the new ones arrive, so the
    view neither flickers nor jumps.
-9. The engine keeps LIVE mode's promise itself (`crates/engine/src/live.rs`): each document
-   records the revision a finished pass typeset (`typeset_revision`), and whenever nothing runs or
+9. The preview controller (`crates/engine/src/live.rs`) owns edit scheduling, queues,
+   catch-up/settling and timeout recovery. Each document records the revision a successful pass
+   typeset (`typeset_revision`), and whenever nothing runs or
    waits, text no pass typeset gets a catch-up pass (unless that exact text just failed or was
    stopped). A pass is one engine run, so what it shows of the contents, references and outline
    comes from the previous pass's `.aux`/`.toc`/`.out`/…; a pass that changed those files
@@ -183,9 +186,42 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
    most 3). Without that, a heading corrected after a half-typed one failed on the half-typed
    one's `.toc` and the last good PDF stayed up for good.
 
-10. A pass still running after 20 s (or 4× the last pass's time) while newer edits wait is
-    stopped and the next pass typesets them; a job whose thread dies finishes with an error.
-    Either way no pass can hold up all later ones.
+10. The watchdog detects a live pass with no output for 20 s while newer edits wait, or
+    60 s even for the last keystroke (at least 4× the previous pass's duration). It stops the
+    process group and queues one clean recovery per source/configuration stamp; a second
+    timeout stops instead of restarting forever. Preamble builds have a separate 20 s bound,
+    track their process group and yield immediately to newer edits. Dropping a job cancels
+    its processes. A job whose thread dies finishes with an error.
+
+Rejected precompiled formats are discarded together with their file farm. That pass retries
+once without the format, restoring the original Xe/Lua source variant when needed; later edits
+can rebuild the cache. A live result needs exit status 0 and a PDF changed by that run. A stale
+PDF/log left by a failed engine cannot count as a successful update.
+
+Other failed live passes get one retry without precompiled formats after removing only that
+root's generated auxiliary files, font maps and fast-file farm. Source snapshots and the last
+PDF remain intact; real source files are never modified by recovery. This also repairs poisoned
+`.aux`/`.toc`/`.out` state after reopening a project. A stable source error remains an error.
+
+The PDF view retries failed loads/renders twice, replacing its render worker, with a 10 s
+watchdog for silent stalls. Exhaustion asks the preview controller for one clean rebuild of
+the current source stamp. Hidden panes suspend the display watchdog. Recovery and stale
+preview notices make failures visible while retaining the last good texture.
+
+Mode, pause, resume and queue consumption share the same preview-controller transitions.
+Pause drops queued preview passes. Abort additionally suppresses catch-up until another edit
+or an explicit resume/configuration change; choosing LIVE retries the current revision even
+if that revision failed or stopped earlier. Attempt identity includes the effective engine,
+shell-escape and preamble-cache settings, so changing a compiler setting can recover without
+requiring a dummy text edit.
+
+`crates/ui/tests/live_preview.rs` tests the full editor → TeX → displayed page contract using
+real input events, PDF text and rendered generations. `scripts/check-live-preview.sh` requires
+the TeX prerequisites instead of allowing skips; it gates editor-related work, pull-request
+checks and release builds. It runs the engine suite and covers unsaved typing/paste/Smart Return,
+Chinese engine switching, source-error and corrupted-cache recovery, 300 edits interleaved with
+typesetting/mode/pause transitions, included files, independent editor sessions, six reopen
+cycles with poisoned auxiliary files, and display failures that rebuild without further input.
 
 Full typesets (⌘T, and on opening a project) save edited files and run latexmk on the real files
 into `.texcraft/build/`, then atomically publish a successful PDF beside the root. Publication

@@ -9,7 +9,7 @@
 #
 # Tags with a suffix (v0.2.0-beta.1) become pre-releases, which the updater does not offer.
 #
-# Hardening: nothing is built before the leak scan and the dependency audit pass; only the
+# Hardening: nothing is built before the leak scan, dependency audit and preview contract pass; only the
 # publishing job can write to the repository (the build jobs run dependencies' build scripts);
 # actions are pinned to commits (Dependabot proposes updates); no build cache (a poisoned cache
 # could slip into a release); the checkout does not keep the token.
@@ -68,9 +68,16 @@ jobs:
     with:
       ref: ${{ needs.version.outputs.tag }}
 
+  preview:
+    name: Live preview contract
+    needs: version
+    uses: ./.github/workflows/preview.yml
+    with:
+      ref: ${{ needs.version.outputs.tag }}
+
   macos:
     name: Build macOS
-    needs: [version, secrets, audit]
+    needs: [version, secrets, audit, preview]
     # Apple silicon (the runner's own architecture); no Intel build. macos-14 was retired on
     # 2 Nov 2026 (actions/runner-images#13518).
     runs-on: macos-26
@@ -103,7 +110,7 @@ jobs:
 
   windows:
     name: Build Windows
-    needs: [version, secrets, audit]
+    needs: [version, secrets, audit, preview]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

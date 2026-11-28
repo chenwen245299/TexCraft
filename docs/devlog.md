@@ -1,5 +1,86 @@
 # TexCraft devlog
 
+## Bounded automatic LIVE self-repair (2026-11-27)
+
+- Isolated live mirrors/formats/auxiliary state by root, preventing projects in one folder
+  from removing or reusing each other's snapshots. Failed passes retry once with generated
+  auxiliary/cache state removed and precompiled formats disabled; source snapshots and the
+  saved project are preserved. Persistent poisoned `.aux`/`.toc`/`.out` files now recover
+  across six tested reopen cycles without a manual operation.
+- Track and bound preamble child processes (20 s), cancel obsolete preparation when typing
+  continues and cancel children when their job is dropped. The quiet-pass watchdog also
+  covers the final keystroke, grants one clean rebuild per source/configuration stamp and
+  stops an exhausted retry. Tests cover process cleanup and the no-more-input hang case.
+- PDF loads/renders get two local reloads with a fresh worker and a silent-load watchdog;
+  exhaustion requests the controller's bounded clean rebuild. A broken published PDF recovers
+  to an actually rendered current generation without input or source changes. Added translated
+  recovery/failure/stale notices and `automaticRecoveries`/`recoveryPending` diagnostics.
+- Gates: fmt; 296 passing results across engine/typeset/UI/i18n/desktop (one measurement
+  ignored); all-target Clippy with warnings denied; desktop build; required real-TeX preview
+  script (nine displayed-PDF contracts plus 148 engine tests); workflow YAML syntax checked.
+  The isolated native window also recovered a deliberately poisoned auxiliary file and
+  displayed the current revision. The native `ui.screenshot` request timed out even for an
+  initial healthy page and after positioning the isolated window on screen; visual PNG review
+  of the new notices remains open. No user LaTeX projects accessed, installation or release.
+  Hosted CI remains unrun.
+
+## LIVE transition recovery and sustained editor contracts (2026-11-27)
+
+- Further regressions exposed four missing transitions: selecting LIVE did not retry a stopped
+  revision; pause and Abort left queued passes runnable; changing the compiler could remain
+  blocked by the previous failed attempt. All four tests failed before these fixes.
+- Centralized mode/pause/resume/configuration transitions and queued-pass consumption in
+  `live.rs`. Abort clears queued work and suppresses catch-up until another edit or explicit
+  resume; a stopped attempt cannot leave LIVE permanently blocked. Attempt identity includes
+  engine, shell-escape and preamble-cache settings. `typeset.stopped` exposes explicit Abort.
+- Expanded the displayed-PDF contracts from four to seven: 300 edits mixed with incomplete
+  input, full typesets, pauses, mode and visibility changes; unsaved included files across tab
+  changes; 60 interleaved edits across independent editor sessions. Each batch must display its
+  last marker and current generation, with original generated source files still unsaved.
+  The local/PR/release preview gate now also runs the full engine suite.
+- Gates: fmt; 287 passing results across engine/typeset/UI/i18n/desktop (one measurement
+  ignored); all-target Clippy with warnings denied; desktop build. Only generated test
+  projects were used; no user LaTeX projects accessed. Hosted CI and the user's installed
+  version remain outside this verification; no installation or release performed.
+
+## Preview controller and automatic cache-failure recovery (2026-11-27)
+
+- Reproduced a stale LIVE preview using a generated project and a corrupted real TeX format:
+  the engine failed before opening its log, but the prior PDF/log could be accepted as success
+  (the PDF timestamp had a one-second tolerance and the exit code was ignored). Rejected
+  formats now retire their file farm and retry once uncached, restoring the original Xe/Lua
+  source variant. Later edits rebuild the cache. Results require exit 0 and a PDF changed by
+  that run; failed attempts no longer advance a document's successfully typeset revision.
+- Consolidated scheduling, queuing, catch-up/settling and timeout recovery in engine `live.rs`.
+  Failed passes can settle changed auxiliary files without marking the old PDF current;
+  stable source errors remain bounded. Inspection adds source/typeset revisions, exit code,
+  cached-preamble state and the generation actually rendered for the current page.
+- Added four editor → real TeX → displayed PDF contracts: unsaved paste/typing/Smart Return in
+  both languages; source-error recovery; Chinese auto-switching; corrupt-cache recovery and
+  reuse with pdfLaTeX, XeLaTeX and LuaLaTeX. The error/currentness and cache regressions failed
+  before their fixes. `scripts/check-live-preview.sh` requires prerequisites rather than skips;
+  AGENTS requires it for relevant changes, and a shared CI job gates PRs and release builds.
+- Gates: fmt; 280 passing results across engine/typeset/UI/i18n/desktop (one measurement
+  ignored); all-target Clippy with warnings denied; desktop build. Native control input and
+  viewer text confirmed automatic cache recovery (PDF/displayed generation 2 → 3), then fresh
+  English/light and Chinese/dark previews; inspected both screenshots. Workflow YAML and shell
+  syntax checked; hosted CI has not run here. Validation used generated projects; the reported
+  user project was not modified or reproduced. No release or installation performed.
+
+## Select All preserves the editor viewport (2026-11-27)
+
+- Cmd/Ctrl+A and the existing Select All menu action select the full source without scrolling
+  to EOF. Preload the focused editor's selection before TextEdit handles input; dismiss
+  completion/inline suggestions and leave other focused text fields their own Select All.
+- Replacing a long selection also reveals the new caret when the shrunken text widget is
+  entirely outside the old viewport. Copy, subsequent arrow navigation and deletion still work.
+- Added two regressions, including eight language/wrapping/initial-position combinations,
+  horizontal scroll, repeated Select All and Unicode. The viewport regression failed before
+  the fix. Gates: fmt; 98 passing UI/i18n results (one measurement ignored); all-target UI
+  Clippy with warnings denied; desktop build. Isolated native menu/control screenshots in
+  English/light and zh-Hans/dark confirm all 19,598 characters selected with unchanged text
+  positions and scrollbar bounds. No release or installation performed.
+
 ## Release notes prepared for 0.6.6 (2026-11-24)
 
 - Prepared `texcraft-v0.6.6.md` from the changes since v0.6.5: opt-in iCloud conversation

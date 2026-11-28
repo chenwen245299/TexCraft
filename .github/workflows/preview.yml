@@ -1,0 +1,35 @@
+# The same real preview contract gates pull requests and release builds.
+name: Live preview
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    name: Editor to displayed PDF
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install TeX and native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgtk-3-dev libfontconfig1-dev libxkbcommon-dev \
+            texlive-latex-extra texlive-xetex texlive-luatex texlive-lang-chinese fonts-noto-cjk latexmk
+      - name: Check real editor to displayed PDF updates
+        run: sh scripts/check-live-preview.sh

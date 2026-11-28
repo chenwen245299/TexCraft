@@ -781,6 +781,7 @@ impl App {
                         "pdfPages": self.bench.pdf.page_count(),
                         "pdfCurrentPage": self.bench.pdf.current_page + 1,
                         "pdfRenderedPages": self.bench.pdf.rendered_pages(),
+                        "pdfRenderedGeneration": self.bench.pdf.rendered_generation(self.bench.pdf.current_page),
                         "pdfSelection": self.bench.pdf.inspect_selection(),
                         // Where inverse search landed (characters of a document), while it shows.
                         "sourceFlash": self.bench.editor.flash.map(|f| json!({

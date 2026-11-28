@@ -1,6 +1,12 @@
 //! The workbench (crates/ui/src/lib.rs, toolbar.rs, pdf_view.rs, dialogs.rs, welcome.rs, update.rs, symbols.rs, widgets.rs, menu.rs).
 
 pub(super) const ENTRIES: super::Entries = &[
+    ("Recovering preview…", "正在自动恢复预览…"),
+    (
+        "Preview could not be updated automatically",
+        "预览自动恢复失败",
+    ),
+    ("Preview is out of date", "当前预览尚未更新"),
     // Toolbar (toolbar.rs)
     ("Bibliography", "参考文献"),
     ("Show / Hide Sidebar (⌘1)", "显示/隐藏边栏（⌘1）"),

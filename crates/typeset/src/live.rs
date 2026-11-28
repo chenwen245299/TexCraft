@@ -1,7 +1,7 @@
 //! Live preview typesetting: typesets the editor's **unsaved** buffers, fast.
 //!
-//! * The open buffers are mirrored into `<project>/.texcraft/live/` (same relative paths, same
-//!   folder structure); every other project file is found through `TEXINPUTS`, so nothing is
+//! * The open buffers are mirrored into `<project>/.texcraft/live/root-<hash>/` (same relative
+//!   paths and folder structure); every other project file is found through `TEXINPUTS`, so nothing is
 //!   saved and the user's files are never touched.
 //! * One engine pass, no latexmk: references come from the previous pass's `.aux`, the
 //!   bibliography from the last full typeset's `.bbl`.
@@ -31,6 +31,8 @@ use std::process::Command;
 use texcraft_i18n::{tr, trf};
 use texcraft_project::Engine;
 
+pub mod recovery;
+
 /// What a live typeset needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveRequest {
@@ -54,9 +56,9 @@ pub struct LiveRequest {
 }
 
 impl LiveRequest {
-    /// `<project>/.texcraft/live`.
+    /// This root's isolated cache under `<project>/.texcraft/live/`.
     pub fn live_dir(&self) -> PathBuf {
-        self.project_dir.join(".texcraft").join("live")
+        recovery::cache_dir(&self.project_dir, &self.root_rel)
     }
 
     /// `<project>/.texcraft/build` (where full typesets write the `.bbl`).
@@ -75,6 +77,22 @@ impl LiveRequest {
 
 const MANIFEST: &str = ".texcraft-mirror";
 
+/// Cached formats belong to an engine/runtime, not just the source preamble. A replaced TeX
+/// installation or a truncated cache can reject one before it even opens the document log.
+pub(crate) fn invalid_format(console: &str) -> bool {
+    let console = console.to_ascii_lowercase();
+    console.contains("fatal format file error")
+        || console.contains("format file was written by")
+        || (console.contains("format file") && console.contains("can't find"))
+}
+
+/// Retire the rejected format and its file farm; the next edit can build a clean format.
+pub(crate) fn discard_format(req: &LiveRequest, name: &str) {
+    let live = req.live_dir();
+    let _ = std::fs::remove_file(live.join(format!("{name}.fmt")));
+    let _ = std::fs::remove_dir_all(live.join(FAST_DIR));
+}
+
 /// Writes the buffers into the live folder, removes mirror copies of buffers that were closed,
 /// recreates the project's folder structure and copies the root (if it is not open) and the last
 /// `.bbl`. Returns the root's text.
@@ -92,9 +110,7 @@ pub(crate) fn prepare_mirror_in(
     root_override: impl FnOnce(&str) -> Option<String>,
 ) -> std::io::Result<(String, bool)> {
     std::fs::create_dir_all(live)?;
-    if let Some(temp) = live.parent() {
-        texcraft_project::ignore_temp_folder(temp);
-    }
+    texcraft_project::ignore_temp_folder(&req.project_dir.join(".texcraft"));
     for d in req.dirs.iter().filter(|d| is_safe_rel(d)) {
         let _ = std::fs::create_dir_all(live.join(d));
     }
@@ -349,12 +365,13 @@ pub fn preamble_key(req: &LiveRequest, preamble: &str, extra: &str) -> u64 {
 /// not dump, e.g. it loads system fonts with fontspec). Builds it if needed from the root's copy
 /// in the live folder (for XeLaTeX the [`xe_format_source`] variant, whose code is `extra`);
 /// failures are remembered so they are not retried.
-pub fn ensure_format(
+pub(crate) fn ensure_format(
     req: &LiveRequest,
     root_text: &str,
     tc: &crate::Toolchain,
     env: &[(String, std::ffi::OsString)],
     extra: &str,
+    process: &crate::LiveProcess<'_>,
 ) -> Option<String> {
     let (prog, base) = match req.engine {
         Engine::PdfLatex => (tc.pdftex.clone()?, "&pdflatex"),
@@ -409,7 +426,7 @@ pub fn ensure_format(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let ran = cmd.status().is_ok_and(|s| s.success());
+    let ran = process.build_format(&mut cmd, std::time::Duration::from_secs(20));
     // XeTeX writes a format even after "Can't \dump a format with native fonts": unusable;
     // LuaLaTeX formats fail the Lua-state check in [`format_source`].
     let dumped_fonts = std::fs::read(live.join(format!("{name}.log"))).is_ok_and(|log| {
@@ -424,7 +441,9 @@ pub fn ensure_format(
         Some(name)
     } else {
         let _ = std::fs::remove_file(&fmt);
-        let _ = std::fs::write(&failed, "");
+        if !process.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = std::fs::write(&failed, "");
+        }
         None
     }
 }

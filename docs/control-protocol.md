@@ -88,6 +88,22 @@ Copies run asynchronously and retain the source; the same command retries a fail
 `icloudAvailable`, `usingICloud` (the actual store), `copying`, `path` and `error`.
 These describe storage and copying, not Apple's network sync progress.
 
+For preview diagnostics, `documents[].revision` is the current source revision and
+`typesetRevision` the last successfully typeset revision. `typeset.exitCode` and
+`typeset.preambleCached` describe the last attempt; `typeset.behind` stays true after a failed
+pass keeps the old PDF. `pdf.generation` identifies the published preview, while
+`ui.pdfRenderedGeneration` identifies the texture actually displayed for the current page
+(`null` before it renders). These distinguish an unscheduled edit, a compiler/cache failure,
+and a PDF that is still waiting to render.
+`typeset.automaticRecoveries` counts successful automatic repair passes;
+`typeset.recoveryPending` reports a queued clean rebuild. Cache/load failures can recover
+without another edit; watchdog/renderer rebuilds have one attempt per source/configuration
+stamp, and each failed compilation has at most one clean-cache fallback. Live caches are
+isolated per root below `.texcraft/live/root-<hash>/`.
+`typeset.stopped` records an explicit Abort: queued passes and automatic catch-up stay stopped
+until the next text edit, explicit resume or typesetter configuration change. Choosing LIVE
+or resuming clears the previous failed/stopped attempt so the current revision can run again.
+
 `typeset.quitting` covers both the running exit rebuild and a failed exit waiting for action.
 `typeset.quitError` is `null` or `{root, message}`. `app.retryQuit` retries a failed exit;
 `app.cancelQuit` keeps the app open. Every successful exit rebuild publishes the final PDF

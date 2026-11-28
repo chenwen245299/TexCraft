@@ -368,17 +368,13 @@ fn snippet(s: &mut Session, text: &str) -> Result<(), CommandError> {
 
 fn set_engine(s: &mut Session, e: Engine) -> Result<(), CommandError> {
     s.settings.engine = e;
+    s.preview_configuration_changed();
     s.set_status(trf!("Typesetter: {engine}", engine = e.label()));
     Ok(())
 }
 
 fn set_mode(s: &mut Session, mode: TypesetMode) -> Result<(), CommandError> {
-    s.settings.set_mode(mode);
-    s.live_paused = false;
-    if mode == TypesetMode::Manual {
-        s.typeset.live_due = None;
-        s.typeset.queued_live = false;
-    }
+    s.set_typeset_mode(mode);
     Ok(())
 }
 
@@ -1863,8 +1859,14 @@ static REGISTRY: &[CommandSpec] = &[
         always,
         |s, _| {
             // Manual ⇄ the previous automatic mode (LIVE or AUTO).
-            s.settings.live_typeset = !s.settings.live_typeset;
-            s.live_paused = false;
+            let mode = if s.settings.live_typeset {
+                TypesetMode::Manual
+            } else if s.settings.typesetter == texcraft_project::Typesetter::Live {
+                TypesetMode::Live
+            } else {
+                TypesetMode::Auto
+            };
+            s.set_typeset_mode(mode);
             Ok(())
         }
     ),
@@ -1876,10 +1878,7 @@ static REGISTRY: &[CommandSpec] = &[
         None,
         |s| s.settings.live_typeset,
         |s, _| {
-            s.live_paused = !s.live_paused;
-            if s.live_paused {
-                s.typeset.live_due = None;
-            }
+            s.set_live_paused(!s.live_paused);
             Ok(())
         },
         checked = |s| s.live_paused

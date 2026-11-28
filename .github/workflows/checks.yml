@@ -1,12 +1,11 @@
-# The repository's checks, one run per event: the leak scan (secrets.yml) and the dependency
-# audit (audit.yml) as two jobs of a single run.
+# The repository's checks: leak scan, dependency audit and the live preview contract.
 #
-#   push to main      both
-#   pull request      both (Dependabot's too)
+#   push to main      all
+#   pull request      all (Dependabot's too)
 #   weekly (Monday)   the dependency audit only: new advisories appear without any change here
-#   by hand           both (Actions › Checks › Run workflow)
+#   by hand           all (Actions › Checks › Run workflow)
 #
-# Version tags are not checked here: release.yml runs the same two workflows before it builds.
+# Version tags are not checked here: release.yml runs the same gates before it builds.
 
 name: Checks
 
@@ -30,3 +29,8 @@ jobs:
   dependencies:
     name: Dependency audit
     uses: ./.github/workflows/audit.yml
+
+  preview:
+    name: Live preview contract
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/preview.yml

@@ -83,6 +83,12 @@ cargo test -p <crates you touched>
 cargo clippy -p <crates you touched> --all-targets -- -D warnings
 ```
 
+For editor, project, engine, PDF or desktop changes, also run `scripts/check-live-preview.sh`.
+This drives real editor input through TeX and checks the PDF actually rendered in the viewer,
+including Chinese input and recovery from errors/corrupt caches. It requires pdfLaTeX,
+XeLaTeX, CJK fonts and `mylatexformat`; missing prerequisites fail instead of silently skipping.
+It also runs the engine suite, including pause/abort/resume and compiler-change regressions.
+
 Then add a terse entry to `docs/devlog.md` (what landed, numbers, what is still open).
 
 Never commit secrets or personal data. `scripts/install-hooks.sh` installs a gitleaks

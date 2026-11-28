@@ -31,7 +31,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 | Area | Status | Notes |
 |---|---|---|
-| Live typesetting on edit | 🟡 | external engine on mirrored buffers: ~0.23 s keystroke → PDF on the TikZ demo (pdfLaTeX with preamble, font-map and fast-environment caches); XeLaTeX ~0.35 s and LuaLaTeX ~0.45 s a pass (precompiled preamble, reduced font maps); the target's in-process engine is incremental |
+| Live typesetting on edit | 🟡 | external engine on mirrored buffers: ~0.23 s keystroke → PDF on the TikZ demo (pdfLaTeX with preamble, font-map and fast-environment caches); XeLaTeX ~0.35 s and LuaLaTeX ~0.45 s a pass (precompiled preamble, reduced font maps); per-root caches, bounded automatic repair of formats/auxiliary files, hung processes and failed PDF loads, visible stale/recovery status; real editor-to-viewer tests gate changes/releases; the target's in-process engine is incremental |
 | ⌘T, ⇧⌘L, ⌘K, ⌘. | ✅ | |
 | Engines | 🟡 | pdfLaTeX, XeLaTeX, LuaLaTeX, Tectonic; no dvips/dvipdfmx/pLaTeX/ConTeXt/knitr/Markdown chains |
 | Bibliography auto-sense | ✅ | via latexmk on full typesets; `.bib` edits and changed citation keys trigger a quiet full rebuild after an 800 ms pause, including unsaved buffers; live passes reuse the refreshed `.bbl` |
