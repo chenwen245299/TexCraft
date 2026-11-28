@@ -115,6 +115,46 @@ pub fn is_full_screen(window: &impl HasWindowHandle) -> Option<bool> {
     }
 }
 
+/// AppKit's transition state, shared by window chrome and the egui toolbar. `epoch` changes
+/// on will/did enter/exit so the desktop can redraw after the native animation ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FullScreenState {
+    pub full: bool,
+    pub transitioning: bool,
+    pub epoch: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl FullScreenState {
+    fn from_phase(phase: u8, native_full: bool, epoch: u64) -> Self {
+        Self {
+            full: match phase {
+                1 | 2 => true,
+                0 | 3 => false,
+                _ => native_full,
+            },
+            transitioning: matches!(phase, 1 | 3),
+            epoch,
+        }
+    }
+}
+
+/// Observe both ends of a full-screen transition and wake the renderer when AppKit finishes.
+pub fn watch_full_screen(
+    window: &impl HasWindowHandle,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> Option<FullScreenState> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::watch_full_screen(window, wake)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, wake);
+        None
+    }
+}
+
 /// Enters or leaves full screen the way the green window button does (`toggleFullScreen:`).
 /// Returns whether the window was found.
 pub fn toggle_full_screen(window: &impl HasWindowHandle) -> bool {
@@ -544,6 +584,77 @@ mod imp {
         true
     }
 
+    pub fn watch_full_screen(
+        window: &impl HasWindowHandle,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<super::FullScreenState> {
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        static PHASE: AtomicU8 = AtomicU8::new(u8::MAX);
+        static EPOCH: AtomicU64 = AtomicU64::new(0);
+        let win = ns_window(window)?;
+        if !INSTALLED.load(Ordering::Relaxed) {
+            // SAFETY: AppKit notification constants are static names; registration and every
+            // callback occur on the main thread for this live window only.
+            let events = unsafe {
+                [
+                    (objc2_app_kit::NSWindowWillEnterFullScreenNotification, 1),
+                    (objc2_app_kit::NSWindowDidEnterFullScreenNotification, 2),
+                    (objc2_app_kit::NSWindowWillExitFullScreenNotification, 3),
+                    (objc2_app_kit::NSWindowDidExitFullScreenNotification, 0),
+                ]
+            };
+            for (name, phase) in events {
+                let weak = objc2::rc::Weak::from_retained(&win);
+                let wake = wake.clone();
+                let block = block2::RcBlock::new(
+                    move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                        if MainThreadMarker::new().is_none() {
+                            return;
+                        }
+                        PHASE.store(phase, Ordering::Relaxed);
+                        EPOCH.fetch_add(1, Ordering::Relaxed);
+                        if let Some(win) = weak.load() {
+                            // Never move title-bar views during AppKit's animation. Stable windowed
+                            // chrome is positioned by the next desktop frame before being revealed.
+                            buttons_alpha(&win, if phase == 2 { 1.0 } else { 0.0 });
+                            if let Some(view) = win.contentView() {
+                                // SAFETY: invalidate our own live main-thread content view after
+                                // AppKit changes its backing drawable; rendering stays in wgpu.
+                                unsafe {
+                                    view.setNeedsDisplay(true);
+                                }
+                            }
+                        }
+                        wake();
+                    },
+                );
+                let object: &objc2::runtime::AnyObject = win.as_ref();
+                // SAFETY: valid notification name and main-thread window, with a block that
+                // holds only a weak reference; retained for the one main window's lifetime.
+                let token = unsafe {
+                    objc2_foundation::NSNotificationCenter::defaultCenter()
+                        .addObserverForName_object_queue_usingBlock(
+                            Some(name),
+                            Some(object),
+                            None,
+                            &block,
+                        )
+                };
+                std::mem::forget(token);
+            }
+            INSTALLED.store(true, Ordering::Relaxed);
+        }
+        let native = win
+            .styleMask()
+            .contains(objc2_app_kit::NSWindowStyleMask::FullScreen);
+        Some(super::FullScreenState::from_phase(
+            PHASE.load(Ordering::Relaxed),
+            native,
+            EPOCH.load(Ordering::Relaxed),
+        ))
+    }
+
     pub fn set_alpha(window: &impl HasWindowHandle, alpha: f64) -> bool {
         if !alpha.is_finite() {
             return false;
@@ -828,6 +939,30 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fullscreen_layout_and_chrome_share_the_complete_native_transition() {
+        use super::FullScreenState;
+        for (phase, full, transitioning) in [
+            (0, false, false),
+            (1, true, true),
+            (2, true, false),
+            (3, false, true),
+            (0, false, false),
+        ] {
+            for stale_winit_state in [false, true] {
+                assert_eq!(
+                    FullScreenState::from_phase(phase, stale_winit_state, 4),
+                    FullScreenState {
+                        full,
+                        transitioning,
+                        epoch: 4
+                    }
+                );
+            }
+        }
+        assert!(FullScreenState::from_phase(u8::MAX, true, 0).full);
+    }
+
     /// The edit shortcuts map to AppKit's standard actions; others, and other modifiers, don't.
     #[test]
     fn edit_shortcuts_map_to_standard_actions() {

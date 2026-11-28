@@ -24,8 +24,8 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Editor / PDF 50:50 split, ⌘2/⌘3/⌘4 | ✅ | draggable divider |
 | Native window tabs | 🟡 | in-window tab strip when more than one file is open |
 | No console / status bar | ✅ | log and issues live in the sidebar |
-| Welcome / organiser window | ✅ | separate 780×480 window on the system's translucent material, the only window when no workspace reopens; Documents/About/Licence and Recent Documents/Templates tabs, filter, "Last Modified" dates; Recent lists saved project roots only, with legacy loose-file entries resolved or removed; cancelling Open keeps it open; closing the last tab returns here; no Account or Connect panes (no cloud service) |
-| Workspace restoration | 🟡 | relaunch restores the project folder, saved tabs, active file and cursor/selection; explicit launch paths win; legacy settings reopen the latest existing recent project once. PDF scroll position and unsaved-buffer crash recovery remain open |
+| Welcome / organiser window | ✅ | separate 780×480 window on the system's translucent material, the only window on launches without a selected document; Documents/About/Licence and Recent Documents/Templates tabs, filter, "Last Modified" dates; Recent lists saved project roots only, with legacy loose-file entries resolved or removed; cancelling Open keeps it open; closing the last tab returns here; no Account or Connect panes (no cloud service) |
+| Startup project selection | ✅ | every launch without an explicitly selected document/template shows the start page, including login/reboot and update Restart; no automatic project restoration or blank editor; legacy disabled-welcome/full-screen state cannot bypass it |
 
 ## Typesetting
 

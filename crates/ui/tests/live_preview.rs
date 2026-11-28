@@ -279,10 +279,25 @@ fn a_broken_preamble_cache_cannot_freeze_later_edits() {
         p.idle();
         let last = p.session.typeset.last.as_ref().unwrap();
         assert_eq!(last.exit_code, Some(0), "{}", last.console);
+        assert_eq!(
+            p.session.typeset.console, last.console,
+            "the visible log must describe the final successful attempt"
+        );
+        assert!(
+            !p.session
+                .typeset
+                .console
+                .contains("Fatal format file error")
+        );
         p.shows("RecoveredCachePreview");
         p.paste_source(&source("NextCachedPreview"));
         p.shows("NextCachedPreview");
         assert!(p.session.typeset.last.as_ref().unwrap().preamble_cached);
+        assert!(
+            !p.session.typeset.console.contains("No cnf value"),
+            "{}",
+            p.session.typeset.console
+        );
     }
 }
 

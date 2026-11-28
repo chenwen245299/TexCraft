@@ -110,6 +110,13 @@ or resuming clears the previous failed/stopped attempt so the current revision c
 before the process closes. `ui.nativeQuitRouting` reports whether the macOS Dock/Apple-event
 interception is installed.
 
+`ui.fullscreenTransition` reports a native enter/exit animation; `ui.fullscreenEpoch` advances
+on each will/did notification. `ui.pendingFullscreen` is the last requested target until it
+settles, including requests received during an animation. `ui.fullScreen` is the shared UI
+state, `ui.appKitFullScreen` the native style mask, and `ui.viewportOccluded` the renderer's
+visibility observation. Wait for the transition and pending target to clear before comparing
+screenshots. `ui.welcome {inline:true}` reveals the hidden root for start-page captures.
+
 ## Languages
 
 `texcraft --lang zh-Hans` (or `en`, `system`) starts with that Language setting, so screenshots

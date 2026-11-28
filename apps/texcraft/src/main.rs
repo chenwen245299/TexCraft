@@ -68,7 +68,6 @@ struct Options {
     size: Option<(f32, f32)>,
     theme: Option<String>,
     lang: Option<LanguageChoice>,
-    welcome: bool,
     commands: Vec<String>,
 }
 
@@ -79,14 +78,9 @@ fn open_in_empty_window(session: &mut Session, path: &std::path::Path) -> bool {
         && session.open_path(path).is_ok_and(|result| result.is_here())
 }
 
-/// The most recent project that still exists opens (the welcome window is turned off).
-fn reopen_last_project(session: &mut Session) {
-    let Some(last) = session.recent.iter().find(|p| p.exists()).cloned() else {
-        return;
-    };
-    if let Err(e) = session.open_path(&last) {
-        session.set_status(e.to_string());
-    }
+/// A folder alone is not an editor: with no document or PDF, offer project selection.
+fn needs_start_page(session: &Session) -> bool {
+    session.docs.is_empty() && session.pdf.path.is_none()
 }
 
 /// Only explicit launch paths open documents. Ordinary launches wait for the user to choose
@@ -117,7 +111,6 @@ fn open_startup(session: &mut Session, opts: &Options) {
 
 fn parse_args() -> Result<Options, String> {
     let mut o = Options {
-        welcome: true,
         screenshot_delay: Duration::from_millis(2500),
         ..Options::default()
     };
@@ -167,7 +160,9 @@ fn parse_args() -> Result<Options, String> {
                 }
                 o.template = Some(template);
             }
-            "--no-welcome" => o.welcome = false,
+            // Compatibility with older project-window launchers. It must never permit an
+            // empty editor; explicit files/templates already bypass the start page.
+            "--no-welcome" => {}
             "--write-icon" => {
                 // Used by scripts/bundle-macos.sh to make the .icns.
                 let path = value("--write-icon")?;
@@ -232,6 +227,10 @@ struct App {
     started: Instant,
     /// Dock/Apple-event Quit is routed through the same close gate as the red window button.
     native_quit_routing: bool,
+    fullscreen_epoch: u64,
+    fullscreen_transition: bool,
+    fullscreen_repaints: u8,
+    pending_fullscreen: Option<bool>,
 }
 
 impl App {
@@ -335,26 +334,15 @@ impl App {
         // Before anything shows text: the menu bar, the welcome window, status messages.
         texcraft_i18n::set_language(session.lang());
         open_startup(&mut session, &opts);
-        let nothing_open =
-            |s: &Session| s.docs.is_empty() && s.project_dir.is_none() && s.pdf.path.is_none();
-        if nothing_open(&session)
-            && opts.welcome
-            && !session.view.show_welcome
-            && opts.screenshot.is_none()
-        {
-            // Without the welcome window an ordinary launch reopens the last project (another
-            // window may already show it: it comes forward and this one offers the chooser).
-            reopen_last_project(&mut session);
-        }
-        if session.root_path().is_some() {
+        if needs_start_page(&session) {
+            // Manual launch, login/reboot and update Restart share this rule. Preferences,
+            // a legacy empty workspace or --no-welcome cannot expose a blank editor.
+            bench.welcome.show_window(true);
+        } else if session.root_path().is_some() {
             // Typeset right away so the PDF appears (like opening a project in the target app).
             if let Err(e) = session.typeset() {
                 session.set_status(e.to_string());
             }
-        } else if nothing_open(&session) && opts.welcome && opts.screenshot.is_none() {
-            // The welcome window, or (with it turned off) the project chooser when there was no
-            // last project to reopen: never an empty window.
-            bench.welcome.show_window(true);
         }
         for id in &opts.commands {
             if let Err(e) = session.run(id, &Value::Null) {
@@ -405,6 +393,10 @@ impl App {
             prefs_checked: None,
             updates_wanted,
             native_quit_routing,
+            fullscreen_epoch: 0,
+            fullscreen_transition: false,
+            fullscreen_repaints: 0,
+            pending_fullscreen: None,
             session,
             bench,
             control,
@@ -799,6 +791,10 @@ impl App {
                         "outerRect": ctx.input(|i| i.viewport().outer_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()])),
                         "fullScreen": ctx.input(|i| i.viewport().fullscreen),
                         "appKitFullScreen": texcraft_macos::is_full_screen(frame),
+                        "fullscreenTransition": self.fullscreen_transition,
+                        "fullscreenEpoch": self.fullscreen_epoch,
+                        "pendingFullscreen": self.pending_fullscreen,
+                        "viewportOccluded": ctx.input(|i| i.viewport().occluded),
                         "monitorSize": ctx.input(|i| i.viewport().monitor_size.map(|s| [s.x, s.y])),
                         "trafficLights": texcraft_macos::traffic_light_frames(frame),
                         "windows": texcraft_macos::windows(),
@@ -1004,9 +1000,8 @@ impl App {
                     let was = texcraft_macos::is_full_screen(frame)
                         .unwrap_or_else(|| ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)));
                     let on = p.params.get("on").and_then(Value::as_bool).unwrap_or(!was);
-                    if on != was && !texcraft_macos::toggle_full_screen(frame) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
-                    }
+                    self.pending_fullscreen = Some(on);
+                    ctx.request_repaint();
                     Ok(json!({ "was": was, "on": on }))
                 }
                 "ui.drag" => {
@@ -1307,17 +1302,28 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if cfg!(target_os = "macos") {
-            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-            // Leaving full screen AppKit animates without asking us for frames, from our last
-            // full-screen frame (toolbar at the window's edge), with the buttons at its default
-            // place: over the capsule. So they go transparent the moment the exit begins (the
-            // observer), and the first frame after it puts the toolbar and the buttons back in
-            // place at once and shows them.
-            let _ = texcraft_macos::hide_traffic_lights_on_full_screen_exit(frame);
+        let repaint = ctx.clone();
+        let mode =
+            texcraft_macos::watch_full_screen(frame, Arc::new(move || repaint.request_repaint()));
+        if let Some(mode) = mode {
+            self.fullscreen_transition = mode.transitioning;
+            ctx.input_mut(|i| {
+                if let Some(viewport) = i.raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+                    viewport.fullscreen = Some(mode.full);
+                }
+            });
+            if mode.epoch != self.fullscreen_epoch {
+                self.fullscreen_epoch = mode.epoch;
+                if !mode.transitioning {
+                    self.fullscreen_repaints = 3;
+                    if !self.bench.main_hidden() && !self.bench.welcome.launch {
+                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    }
+                }
+            }
             // Centre the window buttons in our taller toolbar (not in full screen, where AppKit
             // keeps them in its own title bar).
-            if !full {
+            if !mode.full && !mode.transitioning {
                 let _ = texcraft_macos::place_traffic_lights(
                     frame,
                     f64::from(texcraft_ui::theme::TOOLBAR_HEIGHT),
@@ -1325,6 +1331,23 @@ impl eframe::App for App {
                 );
                 let _ = texcraft_macos::set_traffic_lights_alpha(frame, 1.0);
             }
+        }
+        if let Some(wanted) = self.pending_fullscreen {
+            let full = mode.map_or_else(
+                || ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+                |m| m.full,
+            );
+            if mode.is_none_or(|m| !m.transitioning) {
+                if wanted == full {
+                    self.pending_fullscreen = None;
+                } else if !texcraft_macos::toggle_full_screen(frame) {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(wanted));
+                }
+            }
+        }
+        if self.fullscreen_transition || self.fullscreen_repaints > 0 {
+            self.fullscreen_repaints = self.fullscreen_repaints.saturating_sub(1);
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         #[cfg(target_os = "macos")]
         if let Some(m) = &mut self.menu {
@@ -1359,6 +1382,13 @@ impl eframe::App for App {
             }
         }
 
+        if needs_start_page(&self.session)
+            && !self.bench.welcome.open
+            && self.bench.dialog == texcraft_ui::dialogs::Dialog::None
+            && !self.session.typeset.is_quitting()
+        {
+            self.bench.welcome.show_window(true);
+        }
         self.bench.ui(ui, &mut self.session);
         // A language chosen this frame (Settings, a menu, a command) shows from the next one.
         self.apply_language(&ctx);
@@ -1470,6 +1500,11 @@ fn main() -> eframe::Result {
     }
     let native = eframe::NativeOptions {
         viewport,
+        // Applied after eframe reads old window geometry. An empty launch must never restore
+        // an editor's full-screen Space behind the separate start-page window.
+        window_builder: Some(Box::new(|builder: egui::ViewportBuilder| {
+            builder.with_fullscreen(false).with_maximized(false)
+        })),
         persistence_path: std::env::var_os("TEXCRAFT_DATA_DIR")
             .filter(|path| !path.is_empty())
             .map(|path| PathBuf::from(path).join("app.ron")),

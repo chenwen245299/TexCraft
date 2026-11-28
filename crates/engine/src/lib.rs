@@ -364,7 +364,8 @@ pub struct View {
     pub auto_end: bool,
     /// A plain click in the PDF jumps to the source (else ⌘-click).
     pub single_click_sync: bool,
-    /// Show the welcome window when TexCraft starts without a document.
+    /// Legacy serialized preference. Launches without an explicit document always show the
+    /// start page; retain this field so existing settings decode without losing other fields.
     pub show_welcome: bool,
     /// Underline misspelled words.
     pub spellcheck: bool,
@@ -1583,10 +1584,21 @@ impl Session {
         let mut finished = None;
         if let Some(job) = &self.typeset.job {
             while let Some(ev) = job.try_recv() {
-                if matches!(ev, JobEvent::Output(_)) {
+                if matches!(ev, JobEvent::Output(_) | JobEvent::ResetOutput) {
                     self.typeset.last_output_at = Some(Instant::now());
                 }
                 match ev {
+                    JobEvent::ResetOutput
+                        if !self.typeset.bibliography_job
+                            && self
+                                .typeset
+                                .root
+                                .as_deref()
+                                .is_none_or(|root| self.pdf_wanted(root)) =>
+                    {
+                        self.typeset.console.clear()
+                    }
+                    JobEvent::ResetOutput => {}
                     // Another project's output (one closed earlier, rebuilt on quitting) stays
                     // out of this window's log.
                     JobEvent::Output(line)
@@ -1652,7 +1664,8 @@ impl Session {
             .min()
     }
 
-    fn finish_typeset(&mut self, outcome: Outcome) {
+    fn finish_typeset(&mut self, mut outcome: Outcome) {
+        outcome.ensure_failure_issue();
         self.typeset.runs += 1;
         let wanted = self
             .typeset
@@ -1710,6 +1723,9 @@ impl Session {
         }
         self.typeset.finished_at = Some(std::time::SystemTime::now());
         if !quiet {
+            // Streaming may include an abandoned cached/fast attempt. The completed log,
+            // diagnostics and success indicator must all describe the final attempt.
+            self.typeset.console = outcome.console.clone();
             self.typeset.issues = outcome.report.issues.clone();
         }
         let background = !outcome.live && self.typeset.background;

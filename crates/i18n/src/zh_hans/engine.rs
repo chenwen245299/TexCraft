@@ -2,6 +2,18 @@
 //! update.rs, ai.rs, inline.rs) and Source Control progress (crates/git).
 
 pub(super) const ENTRIES: super::Entries = &[
+    (
+        "The preview cache is incompatible with the current TeX engine.",
+        "预览缓存与当前 TeX 引擎不兼容。",
+    ),
+    (
+        "Typesetting failed (exit code {code}).",
+        "排版失败（退出码 {code}）。",
+    ),
+    (
+        "Typesetting did not produce an up-to-date PDF.",
+        "排版未能生成最新的 PDF。",
+    ),
     // Session and commands
     ("Untitled", "未命名"),
     ("unknown command `{id}`", "未知命令 `{id}`"),

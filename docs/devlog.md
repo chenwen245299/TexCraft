@@ -1,5 +1,104 @@
 # TexCraft devlog
 
+## PDF zoom preserves the reading position (2026-11-28)
+
+- Zoom previously changed page sizes while retaining old pixel offsets, moving the reader to
+  unrelated content. Record the visible page and PDF point at the viewport centre; recompute
+  bounded scroll offsets from the new page rectangles. Pinch/command-wheel zoom instead uses
+  the pointer's page point. Retire scrolling animations/momentum targeting the old geometry;
+  explicit page/SyncTeX navigation takes precedence and thumbnails keep their own layout.
+- Added a regression that originally lost page 4 on zoom: repeated zoom in/out and pointer
+  gestures across continuous single/two-page and single-page modes, plus simultaneous explicit
+  navigation. Gates: fmt; 100 UI tests (one measurement ignored); required preview script
+  (nine displayed-PDF contracts and 152 engine tests); all-target UI Clippy with warnings
+  denied; desktop build.
+- Native English/Chinese checks used a generated six-page PDF, twelve actual toolbar clicks
+  and additional two/single-page checks. Maximum measured anchor drift was below 0.313 pt;
+  inspected before/zoomed screenshots in both languages. No user files, installation or release.
+
+## Hanging indent preserves the first display row's width (2026-11-28)
+
+- Reproduced `As` sitting alone above a long LaTeX reference in an isolated native window.
+  The TextEdit caller subtracted the hanging indent before the layout routine subtracted it
+  again for continuation rows. Pass the full width so the first row stays full width and
+  continuation rows reserve the indent only once. Also retain a fitting next word when only
+  its trailing whitespace overflows, rather than pushing the word down too. Reassemble fitted
+  rows without rewrapping them; source text is unchanged.
+- Added an actual-editor regression comparing first-row capacity with hanging indent off/on
+  at three font sizes, three widths and three indentation settings, for LaTeX references and
+  mixed CJK/English. It failed before the fix and also checks that layout preserves all text.
+  A second regression covers overflowing trailing spaces at EOF/newlines and checks every
+  character's cursor-position round trip, with indentation on/off.
+- Gates: fmt; 99 UI tests (one measurement ignored); required preview script (nine displayed-PDF
+  contracts and 152 engine tests); all-target UI Clippy with warnings denied; desktop build.
+  Compared native before/after screenshots in English and inspected the Chinese result using
+  only generated files/settings. No installation or release.
+
+## Editor drag scrolling stays in its pane (2026-11-28)
+
+- Reproduced source edge-dragging moving a zoomed sibling PDF: the wrapped editor's vertical
+  ScrollArea left horizontal drag deltas unconsumed, and the PDF consumed them later in the
+  frame. Emit drag scrolling only on enabled editor axes; consume captured wheel input even
+  when its horizontal component is disabled. Unwrapped source horizontal scrolling stays intact.
+- Added an actual split-workbench/PDF regression for left/right edge drags and wheel input
+  during a drag, with wrapping on/off. The original moved the PDF 150 pt; the fixed version
+  preserves both PDF coordinates and still scrolls unwrapped source horizontally.
+- Gates: fmt; 97 UI tests (one measurement ignored); required preview script (nine displayed-PDF
+  contracts and 152 engine tests); all-target UI Clippy with warnings denied; desktop build.
+  Native English/Chinese checks repeated six edge drags each with an already horizontally
+  scrolled PDF, plus an unwrapped drag; PDF page coordinates stayed identical. Inspected the
+  screenshots. Only generated projects/settings were used; no installation or release.
+
+## Editor caret fits its visual row (2026-11-28)
+
+- TextEdit used its font's default height plus cursor padding despite the editor's explicit
+  line height. Fit its emitted cursor strokes, including their end caps, to the actual
+  layout row; keep native widget blinking, focus, selection and IME handling.
+- Added a regression measuring painted cursor geometry on empty/blank, wrapped and mixed
+  Unicode rows at 10/16/28 pt, 1×/2× scale and light/dark appearances. It failed before the fix.
+- Gates: fmt; 96 UI tests (one measurement ignored); required preview script (nine real
+  displayed-PDF contracts and 152 engine tests); all-target UI Clippy with warnings denied;
+  desktop build. Inspected isolated native English/Chinese screenshots at 16/28 pt, including
+  a CJK caret. Only generated test files/settings were used; no installation or release.
+
+## Consistent preview logs and engine-bound format caches (2026-11-28)
+
+- Reproduced a successful recovered preview retaining the abandoned attempt's fatal console.
+  Reset streamed output between live attempts and replace the displayed log with the final
+  outcome. Failed processes without a parsed log now produce an error issue; fatal outcomes
+  cannot be successful, and the toolbar requires explicit success for its green check.
+- Include both builder and reader binary identity in format-cache keys so a TeX replacement
+  invalidates incompatible formats. Retain bounded uncached recovery for corrupt formats.
+  Use a nonempty `TEXMFDBS` setting to eliminate the generated configuration warning.
+- Gates: fmt; 26 typeset and 152 engine tests; required preview script (nine real displayed-PDF
+  contracts, now also checking recovered logs and the fast configuration); UI/desktop/i18n
+  suites; all-target Clippy with warnings denied; desktop build. An isolated native window
+  recovered a deliberately corrupted format, displayed the latest PDF, reported a real source
+  error, then recovered again. English/Chinese successful and failed log PNGs were inspected.
+  Only generated projects/settings were used; no user documents, installation or release.
+
+## Start-page invariant and full-screen redraw lifecycle (2026-11-28)
+
+- Every launch without an explicitly selected document/template now shows the start page,
+  including login/reboot and update Restart. Removed recent-project auto-opening and the
+  welcome opt-out control; the old serialized preference remains readable. The legacy
+  `--no-welcome` flag cannot expose an empty editor. A rootless folder or an invalid path
+  also offers project selection, and empty live windows return there.
+- Ignore saved full-screen/maximized editor state at startup, preventing an empty native
+  full-screen Space behind the organiser. Inline start-page capture now reveals and focuses
+  the hidden root correctly, then hides it again when native organiser mode resumes.
+- Share AppKit's will/did enter/exit state between toolbar layout and window chrome. Stop
+  repositioning title-bar views during animations; invalidate the content view and request
+  fresh frames on completion. Controlled reversals queue the last target until the transition
+  settles. Added transition/epoch/pending/occlusion control-channel diagnostics.
+- Gates: fmt; 279 passing tests across desktop/engine/UI/macOS/i18n (one measurement ignored),
+  including 150 engine tests and nine real displayed-PDF contracts; required preview script;
+  all-target Clippy with warnings denied; desktop build. Inspected English/Chinese start-page,
+  full-screen and windowed PNGs. Isolated native checks covered three full-screen round trips,
+  a rapid reversal, subsequent typing/current rendered PDF, and four fresh-launch variants
+  (ordinary, legacy flag, empty folder, missing file), each exiting normally. Only generated
+  projects/settings were used; no real machine shutdown, installed-app replacement or release.
+
 ## Linux preview-gate dependencies and rename event ordering (2026-11-28)
 
 - The preview workflow used `--no-install-recommends` without the font package providing

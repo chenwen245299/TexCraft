@@ -347,6 +347,41 @@ impl Mirror {
 }
 
 impl Outcome {
+    /// A process can fail before opening its log, leaving no parsed TeX error. Keep that
+    /// failure visible instead of allowing an empty issue list to look like success.
+    pub fn ensure_failure_issue(&mut self) {
+        self.success &= !self.cancelled
+            && self.error.is_none()
+            && !self.report.fatal
+            && self.exit_code.is_none_or(|code| code == 0)
+            && self.report.errors() == 0;
+        if self.success || self.cancelled || self.report.errors() > 0 {
+            return;
+        }
+        let message = if let Some(error) = &self.error {
+            error.clone()
+        } else if live::invalid_format(&self.console) {
+            tr("The preview cache is incompatible with the current TeX engine.").into()
+        } else if let Some(code) = self.exit_code {
+            trf!("Typesetting failed (exit code {code}).", code = code)
+        } else {
+            tr("Typesetting did not produce an up-to-date PDF.").into()
+        };
+        let mut context: Vec<_> = self.console.lines().rev().take(24).collect();
+        context.reverse();
+        self.report.issues.insert(
+            0,
+            Issue {
+                severity: texcraft_log::Severity::Error,
+                file: None,
+                line: None,
+                message,
+                detail: context.join("\n"),
+                log_line: 0,
+            },
+        );
+    }
+
     /// Issues worth listing (errors first, then warnings, then bad boxes).
     pub fn issues(&self) -> &[Issue] {
         &self.report.issues
@@ -356,6 +391,8 @@ impl Outcome {
 /// Events from a running job.
 #[derive(Debug, Clone)]
 pub enum JobEvent {
+    /// A fresh live attempt supersedes the previous attempt's streamed output.
+    ResetOutput,
     /// A line of console output.
     Output(String),
     /// The run finished (or failed to start, or was cancelled).
@@ -393,7 +430,7 @@ impl Job {
     /// Next event, if any. A run whose thread ended without reporting (it panicked) finishes
     /// with an error, so callers never wait for it forever.
     pub fn try_recv(&self) -> Option<JobEvent> {
-        let event = match self.rx.try_recv() {
+        let mut event = match self.rx.try_recv() {
             Ok(e) => Some(e),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) if !self.finished.get() => {
@@ -406,7 +443,8 @@ impl Job {
             }
             Err(TryRecvError::Disconnected) => None,
         };
-        if matches!(event, Some(JobEvent::Finished(_))) {
+        if let Some(JobEvent::Finished(outcome)) = &mut event {
+            outcome.ensure_failure_issue();
             self.finished.set(true);
         }
         event
@@ -425,8 +463,12 @@ impl Job {
     pub fn wait(self, mut on_output: impl FnMut(&str)) -> Outcome {
         loop {
             match self.rx.recv() {
+                Ok(JobEvent::ResetOutput) => {}
                 Ok(JobEvent::Output(line)) => on_output(&line),
-                Ok(JobEvent::Finished(o)) => return *o,
+                Ok(JobEvent::Finished(mut o)) => {
+                    o.ensure_failure_issue();
+                    return *o;
+                }
                 Err(_) => {
                     return Outcome {
                         error: Some(tr("the typesetting thread stopped unexpectedly").into()),
@@ -657,8 +699,10 @@ fn run(
         }
     }
     outcome.success = !outcome.cancelled
+        && outcome.error.is_none()
         && outcome.exit_code == Some(0)
         && outcome.pdf.is_some()
+        && !outcome.report.fatal
         && outcome.report.errors() == 0;
     if !outcome.success {
         for (path, bytes) in previous_outputs {
@@ -728,6 +772,9 @@ fn run_process(
         cmd.process_group(0);
     }
     let header = format!("$ {} {}", prog.display(), args.join(" "));
+    if outcome.live {
+        let _ = tx.send(JobEvent::ResetOutput);
+    }
     outcome.console.push_str(&header);
     outcome.console.push('\n');
     let _ = tx.send(JobEvent::Output(header));
@@ -1204,6 +1251,7 @@ fn run_live_once(
         && outcome.error.is_none()
         && outcome.exit_code == Some(0)
         && outcome.pdf.is_some()
+        && !outcome.report.fatal
         && outcome.report.errors() == 0;
     outcome
 }
@@ -1235,6 +1283,46 @@ fn spawn_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_or_fatal_processes_without_log_errors_never_have_success_diagnostics() {
+        for (code, fatal) in [(Some(1), false), (Some(0), true), (None, false)] {
+            let mut outcome = Outcome {
+                success: true,
+                exit_code: code,
+                report: LogReport {
+                    fatal,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if code.is_none() {
+                outcome.success = false;
+            }
+            outcome.ensure_failure_issue();
+            assert!(!outcome.success);
+            assert_eq!(outcome.report.errors(), 1);
+            outcome.ensure_failure_issue();
+            assert_eq!(
+                outcome.report.errors(),
+                1,
+                "do not duplicate an existing error"
+            );
+        }
+        let mut stopped = Outcome {
+            cancelled: true,
+            ..Default::default()
+        };
+        stopped.ensure_failure_issue();
+        assert_eq!(stopped.report.errors(), 0);
+        let mut success = Outcome {
+            success: true,
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        success.ensure_failure_issue();
+        assert_eq!(success.report.errors(), 0);
+    }
 
     #[cfg(unix)]
     #[test]

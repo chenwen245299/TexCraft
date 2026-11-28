@@ -655,6 +655,11 @@ impl Workbench {
             update::show(ctx, &t, session, &mut self.update_window);
         }
         // The welcome window; at launch the main window waits hidden behind it.
+        if self.welcome.open && self.welcome.inline && self.main_hidden {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            self.main_hidden = false;
+        }
         if self.welcome.open && self.welcome.launch && !self.welcome.inline && !self.main_hidden {
             ctx.send_viewport_cmd_to(
                 egui::ViewportId::ROOT,
@@ -792,6 +797,38 @@ pub fn key_matches(name: &str, key: egui::Key) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_start_page_reveals_the_hidden_capture_window_and_native_mode_hides_it_again() {
+        let ctx = Context::default();
+        let mut bench = Workbench::new(&ctx);
+        let mut session = Session::empty(std::sync::Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.update.enabled = false;
+        bench.welcome.show_window(true);
+        let mut frame = |bench: &mut Workbench| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1388.0, 824.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| bench.ui(ui, &mut session),
+            );
+            output.textures_delta.clear();
+        };
+        frame(&mut bench);
+        assert!(bench.main_hidden());
+        bench.welcome.inline = true;
+        frame(&mut bench);
+        assert!(!bench.main_hidden());
+        assert!(bench.welcome.open && bench.welcome.launch);
+        bench.welcome.inline = false;
+        frame(&mut bench);
+        assert!(bench.main_hidden());
+    }
 
     /// ⌘C (the Edit menu's Copy) copies the PDF's selection after a click in the PDF, else the
     /// text widget's; inverse search flashes the source and gives ⌘C back to the editor.
@@ -1149,6 +1186,144 @@ mod tests {
         };
         assert_eq!(y, pdf_y, "{lines:?}");
         assert_eq!(menu.center().y, y - theme::HEADER_HEIGHT / 2.0);
+    }
+
+    /// Drag auto-scroll belongs to the source pane, including axes disabled by soft wrap.
+    /// A zoomed PDF beside it must retain its horizontal and vertical position.
+    #[test]
+    fn dragging_past_editor_edges_never_scrolls_the_pdf() {
+        for wrap in [true, false] {
+            let ctx = Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut bench = Workbench::new(&ctx);
+            let mut session = Session::new(std::sync::Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            session.update.enabled = false;
+            session.view.wrap_lines = wrap;
+            session.view.spellcheck = false;
+            session.view.auto_complete = false;
+            session.view.sidebar = true;
+            session.view.assistant = false;
+            session.view.zoom = texcraft_engine::Zoom::Fixed(2.0);
+            let text = format!(
+                "{}\n",
+                "Source selection stays in its own pane. ".repeat(20)
+            )
+            .repeat(20);
+            session
+                .run("edit.setText", &serde_json::json!({"text": text}))
+                .unwrap();
+            session.show_pdf(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../pdf/tests/data/select-en.pdf"),
+            );
+            let id = editor::editor_id(session.doc().and_then(|d| d.typeset_path()));
+            let mut time = 0.0;
+            let mut frame = |bench: &mut Workbench, session: &mut Session, events| {
+                time += 1.0 / 60.0;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(1000.0, 600.0),
+                        )),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| bench.ui(ui, session),
+                );
+                output.textures_delta.clear();
+            };
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while bench.pdf.rendered_generation(0) != Some(session.pdf.generation)
+                && Instant::now() < deadline
+            {
+                frame(&mut bench, &mut session, Vec::new());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(
+                bench.pdf.rendered_generation(0),
+                Some(session.pdf.generation)
+            );
+            let wheel = |delta| egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta,
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            };
+            // Move the PDF away from both scroll origins so leaks in either direction show.
+            frame(
+                &mut bench,
+                &mut session,
+                vec![
+                    egui::Event::PointerMoved(pos2(850.0, 300.0)),
+                    wheel(vec2(-150.0, -80.0)),
+                ],
+            );
+            for _ in 0..30 {
+                frame(&mut bench, &mut session, Vec::new());
+            }
+            let pdf_position =
+                |bench: &Workbench| bench.pdf.inspect_selection()["pageRects"]["1"].clone();
+            let before = pdf_position(&bench);
+            assert!(before.is_array());
+            assert!(
+                before[0].as_f64().unwrap() < 600.0,
+                "the PDF has scrolled horizontally: {before}"
+            );
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for left in [true, false] {
+                let rect = ctx.read_response(id).unwrap().rect;
+                let start = pos2(450.0, 160.0);
+                frame(
+                    &mut bench,
+                    &mut session,
+                    vec![egui::Event::PointerMoved(start)],
+                );
+                frame(&mut bench, &mut session, vec![button(start, true)]);
+                let edge = pos2(if left { 150.0 } else { 660.0 }, start.y);
+                frame(
+                    &mut bench,
+                    &mut session,
+                    vec![egui::Event::PointerMoved(edge)],
+                );
+                for _ in 0..30 {
+                    frame(&mut bench, &mut session, Vec::new());
+                }
+                assert_eq!(
+                    pdf_position(&bench),
+                    before,
+                    "wrap={wrap}, left={left}: edge drag moved the PDF"
+                );
+                if !wrap && !left {
+                    assert!(
+                        ctx.read_response(id).unwrap().rect.left() < rect.left() - 30.0,
+                        "unwrapped source must still scroll horizontally during its drag: before={rect:?}, after={:?}, selection={:?}, dragging={}",
+                        ctx.read_response(id).unwrap().rect,
+                        session.doc().unwrap().selection,
+                        ctx.is_being_dragged(id)
+                    );
+                }
+                assert!(!session.doc().unwrap().selection.is_empty());
+                // A horizontal wheel gesture during the captured drag must not reach the PDF.
+                frame(&mut bench, &mut session, vec![wheel(vec2(-40.0, -20.0))]);
+                for _ in 0..15 {
+                    frame(&mut bench, &mut session, Vec::new());
+                }
+                assert_eq!(
+                    pdf_position(&bench),
+                    before,
+                    "wrap={wrap}, left={left}: drag wheel moved the PDF"
+                );
+                frame(&mut bench, &mut session, vec![button(edge, false)]);
+            }
+        }
     }
 
     /// The Assistant header's model menu is as wide as the model's name, its chevron right

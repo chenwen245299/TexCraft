@@ -350,7 +350,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             errors = errors_text,
             warnings = warnings_text
         )
-    } else if session.typeset.last.is_some() {
+    } else if session
+        .typeset
+        .last
+        .as_ref()
+        .is_some_and(|last| last.success)
+    {
         icons::check_thin(&p, st, t.success);
         // The last full typeset's summary ("Typeset in 0.4 s — 0 errors, 0 warnings").
         session
@@ -359,6 +364,14 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, rect: Rect, left_ins
             .map(|(m, _)| m.as_str())
             .filter(|m| is_typeset_summary(m))
             .map_or_else(|| tr("Typeset successfully").to_string(), str::to_string)
+    } else if session
+        .typeset
+        .last
+        .as_ref()
+        .is_some_and(|last| last.cancelled)
+    {
+        icons::check_thin(&p, st, t.chain_weak);
+        tr("Typesetting stopped").to_string()
     } else {
         icons::check_thin(&p, st, t.chain_weak);
         tr("Not typeset yet").to_string()

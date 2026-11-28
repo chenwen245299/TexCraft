@@ -417,6 +417,33 @@ fn build_job(
     job
 }
 
+/// TextEdit uses its font's default height and extends cursors above/below the row. Our
+/// explicit line heights can be shorter. Fit only its emitted cursor strokes to the actual
+/// layout rows, keeping TextEdit's blinking, focus and IME behaviour intact.
+fn fit_text_cursors_to_rows(ui: &Ui, galley: &Galley, galley_pos: Pos2, shapes_from: usize) {
+    let cursor_stroke = ui.visuals().text_cursor.stroke;
+    let origin = galley_pos.to_vec2() - vec2(galley.rect.left(), 0.0);
+    ui.ctx().graphics_mut(|graphics| {
+        let list = graphics.entry(ui.layer_id());
+        for i in shapes_from..list.next_idx().0 {
+            list.mutate_shape(egui::layers::ShapeIdx(i), |shape| {
+                if let egui::Shape::LineSegment { points, stroke } = &mut shape.shape
+                    && *stroke == cursor_stroke
+                    && points[0].x == points[1].x
+                {
+                    let cursor =
+                        galley.cursor_from_pos(points[0].lerp(points[1], 0.5).to_vec2() - origin);
+                    let row = galley.pos_from_cursor(cursor).translate(origin);
+                    // Include the stroke's end caps in the row bounds.
+                    let inset = (stroke.width / 2.0).min(row.height() / 2.0);
+                    points[0].y = row.top() + inset;
+                    points[1].y = row.bottom() - inset;
+                }
+            });
+        }
+    });
+}
+
 /// Paints the selection the way the target does: a neutral tint under the text that runs to
 /// the right edge of the text area on every line it covers to the end (one block, no gaps), the
 /// syntax colours unchanged. egui recolours selected glyphs and draws its own highlight into
@@ -486,17 +513,55 @@ fn paint_selection(
 fn layout_hanging(ui: &Ui, job: LayoutJob, indent: f32) -> Arc<Galley> {
     let width = job.wrap.max_width;
     let whole = ui.fonts_mut(|f| f.layout_job(job.clone()));
-    if indent <= 0.0 || !width.is_finite() || whole.rows.len() < 2 {
+    if !width.is_finite() || whole.rows.len() < 2 {
         return whole;
     }
     // (first row's end, line's end) of every line that wraps, in characters.
     let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut repaired = false;
     let (mut at, mut first_row, mut open) = (0usize, true, None);
     let last = whole.rows.len().saturating_sub(1);
     for (i, row) in whole.rows.iter().enumerate() {
         let end = at.saturating_add(row.glyphs.len());
         if first_row && !row.ends_with_newline && i < last {
-            open = Some(end);
+            // egui may reject a whole fitting word when only its trailing space overflows,
+            // e.g. leaving "As " alone before a long reference. Keep that fitting word on
+            // this row. It must end here; never pull a fragment of an overflowing word up.
+            let extra = whole
+                .rows
+                .get(i.saturating_add(1))
+                .and_then(|next| {
+                    if !row.glyphs.last()?.chr.is_whitespace() {
+                        return None;
+                    }
+                    let n = next
+                        .glyphs
+                        .iter()
+                        .take_while(|g| !g.chr.is_whitespace())
+                        .count();
+                    if n == 0
+                        || (n == next.glyphs.len()
+                            && !next.ends_with_newline
+                            && i.saturating_add(1) < last)
+                    {
+                        return None;
+                    }
+                    let word_width =
+                        next.glyphs.get(n.saturating_sub(1))?.max_x() - next.glyphs.first()?.pos.x;
+                    if row.glyphs.last()?.max_x() + word_width > width {
+                        return None;
+                    }
+                    let spaces = next
+                        .glyphs
+                        .iter()
+                        .skip(n)
+                        .take_while(|g| g.chr.is_whitespace())
+                        .count();
+                    Some(n.saturating_add(spaces))
+                })
+                .unwrap_or(0);
+            repaired |= extra > 0;
+            open = Some(end.saturating_add(extra));
         }
         if row.ends_with_newline || i == last {
             if let Some(c) = open.take() {
@@ -509,7 +574,7 @@ fn layout_hanging(ui: &Ui, job: LayoutJob, indent: f32) -> Arc<Galley> {
             first_row = false;
         }
     }
-    if cuts.is_empty() {
+    if cuts.is_empty() || (indent <= 0.0 && !repaired) {
         return whole;
     }
     // The cuts in bytes.
@@ -537,7 +602,9 @@ fn layout_hanging(ui: &Ui, job: LayoutJob, indent: f32) -> Arc<Galley> {
             return whole;
         };
         parts.push((from..b1, false));
-        parts.push((b1..be, true));
+        if b1 < be {
+            parts.push((b1..be, true));
+        }
         from = be.saturating_add(1);
     }
     if from <= text.len() {
@@ -550,7 +617,9 @@ fn layout_hanging(ui: &Ui, job: LayoutJob, indent: f32) -> Arc<Galley> {
             let w = if *rest {
                 (width - indent).max(20.0)
             } else {
-                width
+                // These rows already fit. Rewrapping here would repeat the trailing-space
+                // bug and strand the same fitting word again.
+                f32::INFINITY
             };
             let sub = sections.sub_job(&job, range.clone(), w);
             ui.fonts_mut(|f| f.layout_job(sub))
@@ -1794,7 +1863,9 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                         Arc::new(highlight(text))
                     };
                     let w = if wrap {
-                        (width - hang).max(40.0)
+                        // layout_hanging reserves the indent for continuation rows only.
+                        // Subtracting it here too prematurely wraps the first row.
+                        width.max(40.0)
                     } else {
                         f32::INFINITY
                     };
@@ -1850,6 +1921,7 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                     })
                     .layouter(&mut layouter)
                     .show(ui);
+                fit_text_cursors_to_rows(ui, &out.galley, out.galley_pos, shapes_from);
                 // egui's text widget moves the caret on any button's press: a right-click inside
                 // the selection keeps it for the menu's Cut and Copy, as in a macOS text view
                 // (outside it, the caret moves there).
@@ -1903,15 +1975,20 @@ fn text_area(ui: &mut Ui, t: &Tokens, session: &mut Session, st: &mut EditorStat
                     };
                     let auto = pointer.map_or(Vec2::ZERO, |p| {
                         vec2(
-                            past(p.x, view.left(), view.right()),
+                            if wrap {
+                                0.0
+                            } else {
+                                past(p.x, view.left(), view.right())
+                            },
                             past(p.y, view.top(), view.bottom()),
                         )
                     });
                     if auto != Vec2::ZERO || wheel != Vec2::ZERO {
-                        ui.scroll_with_delta_animation(
-                            auto + wheel,
-                            egui::style::ScrollAnimation::none(),
-                        );
+                        let delta = auto + wheel;
+                        // A vertical ScrollArea does not consume horizontal delta requests;
+                        // they would leak into the sibling PDF's ScrollArea later this frame.
+                        let delta = if wrap { vec2(0.0, delta.y) } else { delta };
+                        ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
                         ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
                     }
                     if auto != Vec2::ZERO {
@@ -2510,6 +2587,96 @@ fn completion_popup(ui: &Ui, t: &Tokens, c: &Completion, caret: Rect, font: &egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measure the cursor TextEdit actually paints, including empty rows, wrapped text and
+    /// fallback fonts. Its stroke must stay inside the row rather than overlap its neighbours.
+    #[test]
+    fn painted_caret_stays_inside_its_layout_row() {
+        for dark in [false, true] {
+            let t = if dark {
+                Tokens::dark()
+            } else {
+                Tokens::light()
+            };
+            for scale in [1.0, 2.0] {
+                for size in [10.0, 16.0, 28.0] {
+                    let ctx = egui::Context::default();
+                    crate::theme::install_fonts(&ctx);
+                    ctx.set_visuals(t.visuals());
+                    ctx.set_pixels_per_point(scale);
+                    let mut session = Session::new(Arc::new(|| {}));
+                    session.settings.live_typeset = false;
+                    session.view.editor_font_size = size;
+                    session.view.spellcheck = false;
+                    session.view.auto_complete = false;
+                    let mut time = 0.0;
+                    for text in [
+                        "",
+                        "\n\n",
+                        "The macro-benchmark examines how frameworks invoke callbacks in production code. ",
+                        "中文、café 和 emoji 🙂\n下一行\n",
+                    ] {
+                        session
+                            .run("edit.setText", &serde_json::json!({"text": text}))
+                            .unwrap();
+                        for at in [0, text.chars().count()] {
+                            session.doc_mut().unwrap().selection = Selection::caret(at);
+                            let mut st = EditorState {
+                                focus: true,
+                                push_selection: Some(0),
+                                ..Default::default()
+                            };
+                            for _ in 0..3 {
+                                time += 0.01;
+                                let mut out = ctx.run_ui(
+                                    egui::RawInput {
+                                        screen_rect: Some(Rect::from_min_size(
+                                            Pos2::ZERO,
+                                            vec2(450.0, 700.0),
+                                        )),
+                                        time: Some(time),
+                                        ..Default::default()
+                                    },
+                                    |ui| text_area(ui, &t, &mut session, &mut st, 0),
+                                );
+                                out.textures_delta.clear();
+                                let row = st.caret_rect.unwrap();
+                                let stroke = t.visuals().text_cursor.stroke;
+                                let carets: Vec<_> = out
+                                    .shapes
+                                    .iter()
+                                    .filter_map(|s| match s.shape {
+                                        egui::Shape::LineSegment {
+                                            points,
+                                            stroke: painted,
+                                        } if painted == stroke
+                                            && (points[0].x - points[1].x).abs() < 0.01
+                                            && (points[0].x - row.center().x).abs() < 0.1 =>
+                                        {
+                                            Some(points)
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    carets.len(),
+                                    1,
+                                    "size={size}, scale={scale}, {text:?} at {at}"
+                                );
+                                for p in carets[0] {
+                                    assert!(
+                                        p.y - stroke.width / 2.0 >= row.top() - 0.01
+                                            && p.y + stroke.width / 2.0 <= row.bottom() + 0.01,
+                                        "size={size}, scale={scale}, {text:?} at {at}: painted {p:?} extends beyond row {row:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Select All changes the range without moving either scroll axis, including when the
     /// caret is far from the end. Copy and the next navigation/edit still use the whole range.
@@ -3577,6 +3744,116 @@ mod tests {
         assert_eq!(waiting(&session), Some(true));
         frame(&mut session, &mut st, Vec::new(), Some(false));
         assert_eq!(waiting(&session), Some(false), "the keys went elsewhere");
+    }
+
+    /// Hanging indentation changes continuation rows only. Exercise the actual TextEdit
+    /// layouter, so its caller cannot reserve that indent from the first row a second time.
+    #[test]
+    fn hanging_indent_preserves_the_editors_first_row_capacity() {
+        for size in [12.0, 16.0, 24.0] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut session = Session::new(Arc::new(|| {}));
+            session.settings.live_typeset = false;
+            session.view.editor_font_size = size;
+            session.view.spellcheck = false;
+            session.view.auto_complete = false;
+            for text in [
+                "As Table~\\ref{tab:sample-long-diagnostic} shows, none of the methods recovered the call to the wrapper. Further text makes this paragraph wrap over several rows.",
+                "中文与 English 混排的一行，也应当充分利用首行宽度；后续显示行再应用悬挂缩进。测试更长的句子并保持原始文字。",
+            ] {
+                session
+                    .run("edit.setText", &serde_json::json!({"text": text}))
+                    .unwrap();
+                for width in [360.0, 460.0, 620.0] {
+                    let mut st = EditorState::default();
+                    let frame = |session: &mut Session, st: &mut EditorState| {
+                        let mut out = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    vec2(width, 700.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| text_area(ui, &Tokens::light(), session, st, 0),
+                        );
+                        out.textures_delta.clear();
+                        out.shapes
+                            .iter()
+                            .find_map(|s| match &s.shape {
+                                egui::Shape::Text(t) if t.galley.text() == text => {
+                                    Some(t.galley.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap()
+                    };
+                    session.view.hanging_indent = false;
+                    frame(&mut session, &mut st);
+                    let plain = frame(&mut session, &mut st);
+                    if size == 16.0 && width == 460.0 && text.starts_with("As ") {
+                        let first: String = plain.rows[0].glyphs.iter().map(|g| g.chr).collect();
+                        assert!(
+                            first.starts_with("As Table~\\ref{tab:sample-long-diagnostic}"),
+                            "the reference fits beside the short prefix at this width: {first:?}"
+                        );
+                    }
+                    for indent in [2, 4, 8] {
+                        session.view.hanging_indent = true;
+                        session.view.hanging_chars = indent;
+                        frame(&mut session, &mut st);
+                        let hanging = frame(&mut session, &mut st);
+                        assert_eq!(
+                            hanging.rows[0].glyphs.len(),
+                            plain.rows[0].glyphs.len(),
+                            "size={size}, width={width}, indent={indent}: first row must use the same width as without hanging indent"
+                        );
+                        let laid_out: String = hanging
+                            .rows
+                            .iter()
+                            .flat_map(|r| r.glyphs.iter().map(|g| g.chr))
+                            .collect();
+                        assert_eq!(laid_out, text);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitting_words_before_overflowing_spaces_keep_text_and_cursor_mapping() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let t = Tokens::light();
+            let font = editor_font(16.0);
+            let prefix = "As Table~\\ref{tab:sample-long-diagnostic}";
+            let full = ui.fonts_mut(|f| f.layout_job(build_job(prefix, &highlight(prefix), &[], &t, &font, f32::INFINITY)));
+            let space = ui.fonts_mut(|f| f.glyph_width(&font, ' '));
+            let width = full.rows[0].glyphs.last().unwrap().max_x() + space / 2.0;
+            for suffix in [" ", " \nNext line.\n", " shows the result. 中文 follows in the same source line."] {
+                let text = format!("{prefix}{suffix}");
+                for indent in [0.0, 4.0 * space] {
+                    let g = layout_hanging(ui, build_job(&text, &highlight(&text), &[], &t, &font, width), indent);
+                    let first: String = g.rows[0].glyphs.iter().map(|g| g.chr).collect();
+                    assert!(first.starts_with(prefix), "{first:?}");
+                    let mut laid_out = String::new();
+                    for row in &g.rows {
+                        laid_out.extend(row.glyphs.iter().map(|g| g.chr));
+                        if row.ends_with_newline { laid_out.push('\n'); }
+                    }
+                    assert_eq!(laid_out, text, "no lost characters or invented newlines");
+                    for at in 0..=text.chars().count() {
+                        let cursor = CCursor::new(at);
+                        let point = g.pos_from_cursor(cursor).center().to_vec2();
+                        assert_eq!(g.cursor_from_pos(point).index.0, at,
+                            "indent={indent}, {text:?}: cursor at {at} must map back to the same character");
+                    }
+                }
+            }
+        });
+        output.textures_delta.clear();
     }
 
     /// Soft wrap with a hanging indent: first rows as wide as unwrapped text allows, the rest

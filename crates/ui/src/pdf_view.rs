@@ -42,6 +42,13 @@ struct Reload {
 const RELOAD_LIMIT: u8 = 2;
 const LOAD_WATCHDOG: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Copy)]
+struct ZoomAnchor {
+    at: PagePoint,
+    /// Position within the viewport, independent of its size and screen location.
+    position: egui::Vec2,
+}
+
 /// PDF viewer state.
 #[derive(Default)]
 pub struct PdfView {
@@ -69,6 +76,10 @@ pub struct PdfView {
     pub current_page: usize,
     last_scale: f32,
     last_render_scale: f32,
+    last_body: Option<Rect>,
+    viewport: Option<Rect>,
+    last_thumbnails: bool,
+    zoom_anchor: Option<ZoomAnchor>,
     /// The edit the document being loaded reflects.
     edit_at: Option<Instant>,
     /// Keystroke-to-pixels time of the last live update.
@@ -156,6 +167,10 @@ impl PdfView {
             self.error = None;
             self.current_page = 0;
             self.reload = None;
+            self.shown.clear();
+            self.last_body = None;
+            self.viewport = None;
+            self.zoom_anchor = None;
             return;
         };
         match std::fs::read(path) {
@@ -517,12 +532,23 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
     if !matches!(session.view.zoom, Zoom::Fixed(_)) {
         session.pdf_fit_scale = Some(scale / fit_w);
     }
+    let pending_anchor = view.zoom_anchor.take();
+    let changed = (scale - view.last_scale).abs() > f32::EPSILON
+        || view.last_body.is_some_and(|old| old.size() != body.size());
+    let anchor = if changed && !thumbs && !view.last_thumbnails {
+        pending_anchor.or_else(|| view.viewport.and_then(|r| view.anchor_at(r.center())))
+    } else {
+        None
+    };
     view.last_scale = scale;
     let zoom_pct = scale / fit_w * 100.0;
 
     header_bar(ui, t, session, view, header, zoom_pct);
 
     if view.pages.is_empty() {
+        view.shown.clear();
+        view.viewport = None;
+        view.last_body = None;
         empty_state(ui, t, session, view, body);
         recovery_notice(ui, t, session, view, body);
         return;
@@ -582,12 +608,38 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
     let mut want: Vec<usize> = Vec::new();
     let mut inverse: Option<(u32, f32, f32, Option<texcraft_engine::sync::SyncHint>)> = None;
     let mut copy = false;
-    let mut zoom_by: Option<f32> = None;
+    let mut zoom_by: Option<(f32, Pos2)> = None;
     let mut thumb_pick: Option<usize> = None;
 
     let mut scroll = egui::ScrollArea::both()
         .id_salt("pdf-scroll")
         .auto_shrink([false, false]);
+    // A zoom changes content coordinates, so preserving raw pixel offsets changes the
+    // paragraph being viewed. Map the previous page/point into the new layout instead.
+    // An explicit page/SyncTeX navigation takes precedence over zoom anchoring.
+    if view.goto_page.is_none()
+        && view.scroll_to.is_none()
+        && let Some(anchor) = anchor
+        && let Some(page) = rects.get(anchor.at.page).filter(|r| **r != Rect::NOTHING)
+    {
+        let bars = view
+            .last_body
+            .zip(view.viewport)
+            .map_or(egui::Vec2::ZERO, |(old, inner)| {
+                (old.size() - inner.size()).max(egui::Vec2::ZERO)
+            });
+        let size = (body.size() - bars).max(vec2(1.0, 1.0));
+        let content_point = page.min.to_vec2() + vec2(anchor.at.x, anchor.at.y) * scale;
+        let offset = (content_point - anchor.position * size).clamp(
+            egui::Vec2::ZERO,
+            (vec2(content_w, content_h) - size).max(egui::Vec2::ZERO),
+        );
+        // Retire old scroll animations/momentum, which target the old coordinate system.
+        let mut state = egui::scroll_area::State::default();
+        state.offset = offset;
+        state.store(&ctx, child.make_persistent_id("pdf-scroll"));
+        scroll = scroll.scroll_offset(offset);
+    }
     if let Some(p) = view.goto_page.take() {
         if single {
             view.current_page = p.min(view.pages.len() - 1);
@@ -847,8 +899,10 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
         // ⌘-scroll / pinch zoom.
         if resp.hovered() {
             let z = ui.input(|i| i.zoom_delta());
-            if (z - 1.0).abs() > 0.001 {
-                zoom_by = Some(z);
+            if (z - 1.0).abs() > 0.001
+                && let Some(pointer) = pointer
+            {
+                zoom_by = Some((z, pointer));
             }
         }
         // Current page: the first page whose bottom is below the top quarter of the view.
@@ -861,13 +915,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, session: &mut Session, view: &mut PdfView) 
             view.current_page = k;
         }
     });
-    let _ = out;
+    view.viewport = Some(out.inner_rect);
+    view.last_body = Some(body);
+    view.last_thumbnails = thumbs;
 
     if let Some(k) = thumb_pick {
         view.thumbnails = false;
         view.goto_page = Some(k);
     }
-    if let Some(z) = zoom_by {
+    if let Some((z, pointer)) = zoom_by {
+        view.zoom_anchor = view.anchor_at(pointer);
         session.view.zoom = Zoom::Fixed((scale * z / fit_w).clamp(0.1, 8.0));
     }
     if let Some((page, x, y, hint)) = inverse
@@ -1595,6 +1652,27 @@ impl PdfView {
         self.last_scale
     }
 
+    fn anchor_at(&self, screen: Pos2) -> Option<ZoomAnchor> {
+        let viewport = self.viewport?;
+        if self.last_scale <= 0.0 {
+            return None;
+        }
+        let &(page, rect) = self.shown.iter().min_by(|(_, a), (_, b)| {
+            a.distance_to_pos(screen)
+                .total_cmp(&b.distance_to_pos(screen))
+        })?;
+        let screen = rect.clamp(screen);
+        let point = (screen - rect.min) / self.last_scale;
+        Some(ZoomAnchor {
+            at: PagePoint {
+                page,
+                x: point.x,
+                y: point.y,
+            },
+            position: (screen - viewport.min) / viewport.size().max(vec2(1.0, 1.0)),
+        })
+    }
+
     /// The rectangle of point `p` (unused helper kept for symmetry with tests).
     pub fn point(p: Pos2) -> Pos2 {
         p
@@ -1604,6 +1682,120 @@ impl PdfView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_keeps_the_current_pdf_region_in_place() {
+        for mode in [
+            PageMode::SingleContinuous,
+            PageMode::TwoContinuous,
+            PageMode::Single,
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            crate::theme::install_style(&ctx);
+            let mut session = Session::empty(Arc::new(|| {}));
+            session.view.page_mode = mode;
+            session.view.zoom = Zoom::Fixed(2.0);
+            let mut view = PdfView {
+                pages: vec![
+                    PageSize {
+                        width: 600.0,
+                        height: 800.0
+                    };
+                    8
+                ],
+                ..Default::default()
+            };
+            let body = Rect::from_min_max(pos2(0.0, HEADER_HEIGHT), pos2(600.0, 500.0));
+            let mut time = 0.0;
+            let mut frame = |view: &mut PdfView, session: &mut Session, events| {
+                time += 1.0 / 60.0;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 500.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| show(ui, &Tokens::light(), session, view),
+                );
+                output.textures_delta.clear();
+            };
+            frame(&mut view, &mut session, Vec::new());
+            view.goto_page(4);
+            for _ in 0..3 {
+                frame(&mut view, &mut session, Vec::new());
+            }
+            frame(
+                &mut view,
+                &mut session,
+                vec![
+                    egui::Event::PointerMoved(body.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(-180.0, -120.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..30 {
+                frame(&mut view, &mut session, Vec::new());
+            }
+            let pdf_point = |view: &PdfView, screen: Pos2| {
+                let &(page, rect) = view.shown.iter().find(|(_, r)| r.contains(screen)).unwrap();
+                (page, (screen - rect.min) / view.last_scale)
+            };
+            let check = |view: &PdfView, (page, point): (usize, egui::Vec2), screen: Pos2| {
+                let rect = view
+                    .shown
+                    .iter()
+                    .find(|(k, _)| *k == page)
+                    .map(|(_, r)| *r)
+                    .unwrap_or_else(|| panic!("{mode:?}: zoom lost the current page {page}"));
+                let actual = rect.min + point * view.last_scale;
+                assert!(
+                    actual.distance(screen) < 1.0,
+                    "{mode:?}: zoom moved the viewed PDF point from {screen:?} to {actual:?}"
+                );
+            };
+            for command in ["pdf.zoomIn", "pdf.zoomOut", "pdf.zoomOut", "pdf.zoomIn"] {
+                let at = pdf_point(&view, body.center());
+                session.run(command, &serde_json::Value::Null).unwrap();
+                for _ in 0..3 {
+                    frame(&mut view, &mut session, Vec::new());
+                    check(&view, at, body.center());
+                }
+            }
+            // A pinch/command-wheel gesture stays under its pointer, rather than the centre.
+            let pointer = body.center() + vec2(90.0, 70.0);
+            let at = pdf_point(&view, pointer);
+            frame(
+                &mut view,
+                &mut session,
+                vec![egui::Event::PointerMoved(pointer), egui::Event::Zoom(1.25)],
+            );
+            for _ in 0..3 {
+                frame(&mut view, &mut session, Vec::new());
+                check(&view, at, pointer);
+            }
+            // Deliberate navigation wins even when it arrives together with a zoom.
+            view.goto_page(6);
+            session.run("pdf.zoomIn", &serde_json::Value::Null).unwrap();
+            for _ in 0..3 {
+                frame(&mut view, &mut session, Vec::new());
+            }
+            let expected = if mode == PageMode::TwoContinuous {
+                4
+            } else {
+                5
+            };
+            assert_eq!(
+                view.current_page, expected,
+                "{mode:?}: explicit page navigation must win"
+            );
+        }
+    }
 
     #[test]
     fn failed_pdf_reads_and_invalid_bytes_reload_automatically_without_a_new_generation() {

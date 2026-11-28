@@ -159,10 +159,10 @@ fn invalid_explicit_launch_path_reports_an_error_without_opening_a_recent_projec
     assert!(session.status.is_some());
 }
 
-/// With the welcome window turned off, an ordinary launch reopens the most recent project that
-/// still exists (as other editors reopen the last workspace), never an empty window.
+/// Every launch without an explicit document starts at project selection, even with a legacy
+/// disabled welcome preference and a valid recent project. A rootless folder is no editor.
 #[test]
-fn without_the_welcome_window_the_last_project_reopens() {
+fn empty_launches_always_offer_the_start_page_instead_of_reopening_or_showing_a_blank_editor() {
     let dir = std::env::temp_dir().join(format!("texcraft-reopen-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("main.tex");
@@ -171,19 +171,30 @@ fn without_the_welcome_window_the_last_project_reopens() {
         "\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n",
     )
     .unwrap();
-    let mut session = Session::empty(Arc::new(|| {}));
-    session.settings.live_typeset = false;
-    session.recent = vec![dir.join("gone.tex"), file.clone()];
-    reopen_last_project(&mut session);
-    assert_eq!(session.docs.len(), 1);
-    assert_eq!(
-        session.docs[0].path.as_deref(),
-        Some(file.canonicalize().unwrap().as_path())
+    for old_preference in [true, false] {
+        let mut session = Session::empty(Arc::new(|| {}));
+        session.settings.live_typeset = false;
+        session.view.show_welcome = old_preference;
+        session.recent = vec![dir.join("gone.tex"), file.clone()];
+        open_startup(&mut session, &Options::default());
+        assert!(session.docs.is_empty());
+        assert!(needs_start_page(&session));
+        session.project_dir = Some(dir.clone());
+        assert!(
+            needs_start_page(&session),
+            "an empty folder must not bypass project selection"
+        );
+    }
+    let mut explicit = Session::empty(Arc::new(|| {}));
+    explicit.settings.live_typeset = false;
+    open_startup(
+        &mut explicit,
+        &Options {
+            paths: vec![file],
+            ..Default::default()
+        },
     );
-    // Nothing to reopen: nothing opens (the chooser shows instead).
-    let mut fresh = Session::empty(Arc::new(|| {}));
-    reopen_last_project(&mut fresh);
-    assert!(fresh.docs.is_empty());
+    assert!(!needs_start_page(&explicit));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

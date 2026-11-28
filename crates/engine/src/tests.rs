@@ -28,6 +28,38 @@ fn starts_with_an_untitled_article() {
 }
 
 #[test]
+fn a_recovered_preview_replaces_the_failed_attempts_streamed_log() {
+    let mut s = session();
+    s.typeset.console = "(Fatal format file error; I'm stymied)\n".into();
+    let final_log = "Output written on preview.pdf (1 page).\n";
+    s.finish_typeset(Outcome {
+        live: true,
+        success: true,
+        exit_code: Some(0),
+        recovery_attempted: true,
+        console: final_log.into(),
+        ..Default::default()
+    });
+    assert_eq!(s.typeset.console, final_log);
+    assert!(s.typeset.last.as_ref().unwrap().success);
+    assert_eq!(s.issue_counts().0, 0);
+}
+
+#[test]
+fn an_engine_failure_before_it_writes_its_log_is_an_error_in_the_toolbar() {
+    let mut s = session();
+    s.finish_typeset(Outcome {
+        live: true,
+        exit_code: Some(1),
+        console: "(Fatal format file error; I'm stymied)\n".into(),
+        ..Default::default()
+    });
+    assert!(!s.typeset.last.as_ref().unwrap().success);
+    assert_eq!(s.issue_counts().0, 1);
+    assert!(s.typeset.console.contains("Fatal format file error"));
+}
+
+#[test]
 fn unknown_and_disabled_commands_are_errors() {
     let mut s = session();
     assert!(matches!(

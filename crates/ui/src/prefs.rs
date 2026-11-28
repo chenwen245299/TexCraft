@@ -958,11 +958,6 @@ fn general_pane(f: &mut Form<'_>, session: &mut Session) {
         ]),
     );
     f.checkbox(
-        tr("Show the welcome window with recent documents and templates when TexCraft starts without a document."),
-        tr("Show welcome window at startup"),
-        &mut session.view.show_welcome,
-    );
-    f.checkbox(
         tr("Show the issues list in the sidebar when a typeset ends with errors."),
         tr("Show issues after a failed typeset"),
         &mut session.view.show_issues_after_error,

@@ -29,10 +29,12 @@ A crate depends only on lower layers. Nothing below `ui` knows about egui.
   editor, flash rectangles in the PDF, open a panel…) that `Workbench::apply_effects` turns into UI
   state or platform `Request`s for the app (file panels, Finder, quit, native edit actions).
 
-The desktop app starts with `Session::empty`. Ordinary launches show the welcome window for
-the user to choose a project; with "Show welcome window at startup" off they reopen the most
-recent project that still exists instead (the chooser shows if there is none), never an empty
-window. Settings and the recent-documents list still load, and explicit launch paths
+The desktop app starts with `Session::empty`. Every launch without an explicit document or
+template shows the start page for project selection, including login/reboot and update Restart.
+The old welcome preference and any saved workspace never reopen the previous project. An empty
+folder is not an editor; a window with neither documents nor a PDF returns to the start page.
+Native startup ignores an old editor's full-screen/maximized state so no empty full-screen
+Space hides the start page. Settings and the recent-documents list still load, and explicit launch paths
 open the selected files or folders directly. Untitled documents are created by New/template
 commands; edited unsaved documents must pass the save prompt before quitting. Quit prompts
 keep saved tabs available for the final typeset, while closing the last tab clears the
@@ -145,6 +147,11 @@ placeholders, `trf!` arguments match them, keys have one translation and none is
 
 Engines run in their own process group so ⌘. (abort) kills latexmk and its children.
 
+Full-screen chrome and toolbar layout share AppKit's will/did enter/exit state. Title-bar
+views are positioned only when stably windowed. Transition completion invalidates the native
+content view and requests fresh egui frames; controlled toggles during an animation queue the
+last requested state. They never replace the session or reset editor/PDF state.
+
 ## Live preview pipeline
 
 1. An edit bumps the document revision and starts a live pass at once (`live_delay_ms`, default
@@ -159,14 +166,18 @@ Engines run in their own process group so ⌘. (abort) kills latexmk and its chi
    deletes mirror copies of closed buffers, copies the root if it is not open and the `.bbl` of the
    last full typeset. Everything else is found through `TEXINPUTS=.:<project>:`.
 4. pdfLaTeX: `ensure_format` precompiles the preamble with `mylatexformat` into
-   `texcraft-<hash>.fmt` (hash of the preamble and project-local packages); failures are remembered.
+   `texcraft-<hash>.fmt`; the key covers the preamble, project-local packages and the canonical
+   paths/size/modification time of both the format builder and reader binaries. Replacing a TeX
+   binary invalidates its old formats without spawning a version probe on each edit. Failed
+   builds are remembered for that key.
 5. pdfLaTeX: after a pass with the full font map, a trimmed `pdftex.map` (base families + families
    embedded by the document) is written into the live folder, where pdfTeX looks first. Passes with
    it run with `MKTEXPK=0`; a missing font fails fast and the pass is rerun with the full map.
 6. pdfLaTeX, fast environment: after a normal pass (run with `-recorder`) the system files it
    opened are linked into `.texcraft-fast/farm`, next to a generated `texmf.cnf` that searches
    only the live folder, the project and the farm and copies the engine's memory settings
-   (`kpsewhich -expand-var`). Fast passes set `TEXMFCNF` to it and skip the ~110 ms of TeX Live
+   (`kpsewhich -expand-var`). Its `TEXMFDBS = .` avoids an empty-value kpathsea warning.
+   Fast passes set `TEXMFCNF` to it and skip the ~110 ms of TeX Live
    configuration parsing; the format is stored uncompressed (another ~50 ms). A fast pass that
    reports a missing file or font a normal pass did not is rerun normally and the farm rebuilt —
    including pdfTeX's `(file cmti10.pfb): cannot open Type 1 font file` when the document starts
@@ -197,6 +208,12 @@ Rejected precompiled formats are discarded together with their file farm. That p
 once without the format, restoring the original Xe/Lua source variant when needed; later edits
 can rebuild the cache. A live result needs exit status 0 and a PDF changed by that run. A stale
 PDF/log left by a failed engine cannot count as a successful update.
+
+Each retried live engine process resets the displayed output; completion replaces it with
+the final outcome's console so the log, diagnostics and status describe the same attempt.
+An unsuccessful non-cancelled outcome without parsed errors gets a process/cache failure
+issue, including when TeX aborts before opening its log. A fatal log cannot count as success,
+and the toolbar shows a green check only for an explicitly successful outcome.
 
 Other failed live passes get one retry without precompiled formats after removing only that
 root's generated auxiliary files, font maps and fast-file farm. Source snapshots and the last
@@ -246,6 +263,11 @@ so entries first cited after a `.bib` rebuild also appear correctly. Ordinary te
 citation line-number changes keep using fast live passes. This refresh does not animate the
 toolbar, change diagnostics/status, open the issues list or move either view. `typeset.wait`
 includes its debounce and queued work.
+
+PDF zoom preserves the page and PDF point at the viewport centre for buttons, shortcuts and
+percentage changes, or under the pointer for pinch/command-wheel gestures. New page rectangles
+determine bounded offsets; old scrolling animations/momentum are retired. Explicit page and
+SyncTeX navigation take precedence. Thumbnails do not reuse reading-mode zoom anchors.
 
 PDF refreshes keep the reader's current page, horizontal/vertical offsets and zoom. Automatic
 scrolling to the source caret after typesetting is opt-in (`View::sync_after_typeset`, false

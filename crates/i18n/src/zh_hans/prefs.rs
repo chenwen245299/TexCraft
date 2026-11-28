@@ -25,11 +25,6 @@ pub(super) const ENTRIES: super::Entries = &[
     ),
     ("Language", "语言"),
     (
-        "Show the welcome window with recent documents and templates when TexCraft starts without a document.",
-        "启动时若没有打开文稿，显示列出最近文稿和模板的欢迎窗口。",
-    ),
-    ("Show welcome window at startup", "启动时显示欢迎窗口"),
-    (
         "Show the issues list in the sidebar when a typeset ends with errors.",
         "排版以错误结束时，在边栏中显示问题列表。",
     ),
