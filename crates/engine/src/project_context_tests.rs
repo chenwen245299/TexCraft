@@ -258,6 +258,21 @@ fn legacy_history_survives_repeated_project_directory_renames_and_cleanup() {
         session.ai.messages[0].source.as_ref().unwrap().project,
         Some(base.join("again"))
     );
+    // Startup storage cleanup merges the old directory history into the current root's
+    // history. Neither that merge nor a fresh session may lose the ordered rename chain.
+    store
+        .prepare(&[], &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    let mut reopened = Session::empty(Arc::new(|| {}));
+    reopened.settings.live_typeset = false;
+    reopened.update.enabled = false;
+    reopened.open_path(&base.join("again/main.tex")).unwrap();
+    reopened.set_chat_store(base.join("chats"));
+    reopened.ai_open_chat("legacy").unwrap();
+    let source = reopened.ai.messages[0].source.as_ref().unwrap();
+    assert_eq!(source.project, Some(base.join("again")));
+    assert_eq!(source.file, Some(base.join("again/main.tex")));
+    assert_eq!(source.root, Some(base.join("again/main.tex")));
     std::fs::remove_dir_all(base).unwrap();
 }
 

@@ -30,6 +30,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libgtk-3-dev libfontconfig1-dev libxkbcommon-dev \
-            texlive-latex-extra texlive-xetex texlive-luatex texlive-lang-chinese fonts-noto-cjk latexmk
+            texlive-latex-extra texlive-xetex texlive-luatex texlive-lang-chinese \
+            texlive-fonts-recommended fonts-noto-cjk latexmk
+      - name: Check font metrics required by XeLaTeX and hyperref
+        run: kpsewhich pzdr.tfm
       - name: Check real editor to displayed PDF updates
         run: sh scripts/check-live-preview.sh

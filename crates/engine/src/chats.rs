@@ -15,7 +15,7 @@
 //! conversations.
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use texcraft_ai::{Image, Role};
@@ -60,7 +60,7 @@ enum Alias {
     Timed {
         from: PathBuf,
         to: PathBuf,
-        /// When (milliseconds since 1970).
+        /// Event timestamp (milliseconds since 1970, strictly ordered within this process).
         at: u64,
     },
     /// Recorded before renames had times: only for conversations saved before saves had them.
@@ -124,7 +124,8 @@ struct StoredChat {
     /// When it was saved (seconds since 1970; older files have none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated: Option<u64>,
-    /// The same in milliseconds: which renames came after it ([`Alias::applies_to`]).
+    /// The strictly ordered millisecond event stamp: which renames came after it
+    /// ([`Alias::applies_to`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     saved: Option<u64>,
     messages: Vec<StoredMessage>,
@@ -188,9 +189,24 @@ fn valid_attachment(name: &str) -> bool {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let wall = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    ordered_ms(&LAST, wall)
+}
+
+/// Saves and renames need a strict order: equal wall-clock milliseconds would either skip
+/// a rename of an older answer or apply it to a newer answer about a reused file name.
+fn ordered_ms(clock: &AtomicU64, wall: u64) -> u64 {
+    let mut previous = clock.load(Ordering::Relaxed);
+    loop {
+        let next = wall.max(previous.saturating_add(1));
+        match clock.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -658,6 +674,7 @@ impl ChatStore {
             }
         }
         let mut legacy = Vec::new();
+        let at = now_ms();
         for directory in directories {
             if directory.exists() && directory != new_dir {
                 if let Some(name) = directory.file_name().and_then(|name| name.to_str()) {
@@ -672,7 +689,7 @@ impl ChatStore {
                 file.aliases.push(Alias::Timed {
                     from: from.to_path_buf(),
                     to: to.to_path_buf(),
-                    at: now_ms(),
+                    at,
                 });
                 self.write_project_file(&directory, &file)?;
             }
@@ -690,7 +707,7 @@ impl ChatStore {
         file.aliases.push(Alias::Timed {
             from: from.to_path_buf(),
             to: to.to_path_buf(),
-            at: now_ms(),
+            at,
         });
         for key in legacy {
             if !file.legacy.contains(&key) {
@@ -1027,6 +1044,35 @@ impl ChatStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_saves_and_renames_have_distinct_ordered_timestamps() {
+        let mut previous = now_ms();
+        for _ in 0..64 {
+            let next = now_ms();
+            assert!(
+                next > previous,
+                "save and rename share timestamp {previous}"
+            );
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn a_coarse_or_backward_clock_preserves_which_answers_a_rename_applies_to() {
+        let clock = AtomicU64::new(0);
+        let saved_before = ordered_ms(&clock, 42);
+        let alias = Alias::Timed {
+            from: "old.tex".into(),
+            to: "new.tex".into(),
+            at: ordered_ms(&clock, 42),
+        };
+        let saved_after = ordered_ms(&clock, 41);
+        assert!(alias.applies_to(Some(saved_before)));
+        assert!(!alias.applies_to(Some(saved_after)));
+        assert_eq!(ordered_ms(&clock, 100), 100);
+        assert_eq!(ordered_ms(&clock, u64::MAX), u64::MAX);
+    }
 
     fn message(role: Role, text: &str) -> ChatMessage {
         ChatMessage {

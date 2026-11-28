@@ -1,5 +1,21 @@
 # TexCraft devlog
 
+## Linux preview-gate dependencies and rename event ordering (2026-11-28)
+
+- The preview workflow used `--no-install-recommends` without the font package providing
+  `pzdr.tfm`, required by XeLaTeX/hyperref. Install `texlive-fonts-recommended` explicitly and
+  check the metric with `kpsewhich` before compiling the tests.
+- Reproduced equal save/rename millisecond stamps with a failing regression. The strict
+  alias comparison skipped those renames on the fast Linux runner. Use an atomic, strictly
+  ordered event clock, including when wall time stalls or moves backward within the process;
+  one rename shares its stamp across linked history folders. The stored format stays compatible.
+- Added two timestamp regressions and extended the legacy-history regression through startup
+  cleanup and a fresh session, checking project/root/file paths. Removed unused workspace
+  declarations for `egui_kittest` and `notify` reported by the newer Cargo version.
+- Gates: fmt; 150 engine tests; required preview script (9 displayed-PDF contracts and all
+  150 engine tests); all-target engine Clippy with warnings denied; workflow YAML and local
+  font lookup. Ubuntu hosted CI has not been rerun; all project data used here was generated.
+
 ## Bounded automatic LIVE self-repair (2026-11-27)
 
 - Isolated live mirrors/formats/auxiliary state by root, preventing projects in one folder
